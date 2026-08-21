@@ -79,6 +79,36 @@ def test_encoder_has_registered_cnn_and_returns_64_dimensional_embedding():
     assert out.shape == (2, 64)
 
 
+def test_encoder_mixed_mask_ignores_extreme_padding_in_output_and_batch_norm_buffers():
+    torch.manual_seed(11)
+    reference = OrderSpectrumEncoder()
+    extreme_padding = deepcopy(reference)
+    mask = torch.tensor([[True, False, False], [True, True, False]])
+    ordinary = torch.randn(2, 3, 3, 361)
+    ordinary[~mask] = 0.0
+    extreme = ordinary.clone()
+    extreme[~mask] = 1e6
+
+    reference.train()
+    extreme_padding.train()
+    ordinary_output = reference(ordinary, mask)
+    extreme_output = extreme_padding(extreme, mask)
+
+    torch.testing.assert_close(extreme_output, ordinary_output)
+    reference_norms = [
+        module for module in reference.modules() if isinstance(module, nn.BatchNorm1d)
+    ]
+    extreme_norms = [
+        module for module in extreme_padding.modules() if isinstance(module, nn.BatchNorm1d)
+    ]
+    for reference_norm, extreme_norm in zip(reference_norms, extreme_norms, strict=True):
+        torch.testing.assert_close(extreme_norm.running_mean, reference_norm.running_mean)
+        torch.testing.assert_close(extreme_norm.running_var, reference_norm.running_var)
+        assert torch.equal(
+            extreme_norm.num_batches_tracked, reference_norm.num_batches_tracked
+        )
+
+
 def test_registered_models_return_model_output_contract():
     spectrum, mask, process, quality = _inputs()
     encoder = OrderSpectrumEncoder()
@@ -121,6 +151,29 @@ def test_gated_model_uses_exact_80_to_16_to_1_gate():
     assert _module_types(model.gate) == [nn.Linear, nn.ReLU, nn.Linear, nn.Sigmoid]
     assert (model.gate[0].in_features, model.gate[0].out_features) == (80, 16)
     assert (model.gate[2].in_features, model.gate[2].out_features) == (16, 1)
+
+
+def test_gate_first_layer_receives_process_then_embedding_then_quality():
+    model = SelectiveGatedModel(ProcessMLP(), ResidualExpert(OrderSpectrumEncoder()))
+    model.eval()
+    spectrum, mask, _, _ = _inputs(batch_size=1, windows=2)
+    process = torch.arange(1.0, 10.0).reshape(1, 9)
+    quality = torch.arange(101.0, 108.0).reshape(1, 7)
+    captured: list[torch.Tensor] = []
+    handle = model.gate[0].register_forward_pre_hook(
+        lambda _module, inputs: captured.append(inputs[0].detach().clone())
+    )
+    try:
+        output = model(spectrum, mask, process, quality)
+    finally:
+        handle.remove()
+
+    assert output.embedding is not None
+    expected = torch.cat([process, output.embedding, quality], dim=1)
+    assert captured[0].shape == (1, 80)
+    torch.testing.assert_close(captured[0], expected)
+    torch.testing.assert_close(captured[0][:, :9], process)
+    torch.testing.assert_close(captured[0][:, 73:], quality)
 
 
 def test_gated_model_has_exact_fallback_boundaries():
