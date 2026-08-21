@@ -74,7 +74,8 @@ def load_sgrpn_config(path: str | Path) -> SGRPNConfig:
     seeds = tuple(int(seed) for seed in raw["seeds"])
     if seeds != (20260723,):
         raise ValueError("Phase A requires exactly seed 20260723")
-    if int(raw["sample_rate_hz"]) != 25600:
+    sample_rate_hz = raw["sample_rate_hz"]
+    if type(sample_rate_hz) is not int or sample_rate_hz != 25600:
         raise ValueError("Phase A sample_rate_hz must be exactly 25600")
 
     order_min = float(raw["order_min"])
@@ -96,7 +97,7 @@ def load_sgrpn_config(path: str | Path) -> SGRPNConfig:
     return SGRPNConfig(
         **inputs,
         output_dir=_resolve(base, raw["output_dir"]),
-        sample_rate_hz=int(raw["sample_rate_hz"]),
+        sample_rate_hz=25600,
         window_samples=int(raw["window_samples"]),
         order_min=order_min,
         order_max=order_max,

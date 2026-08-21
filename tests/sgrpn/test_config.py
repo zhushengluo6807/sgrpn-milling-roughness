@@ -35,3 +35,21 @@ def test_rejects_non_fixed_phase_a_sample_rate(tmp_path):
 
     with pytest.raises(ValueError, match="sample_rate_hz.*25600"):
         load_sgrpn_config(path)
+
+
+@pytest.mark.parametrize(
+    "sample_rate",
+    ["25600.5", '"25600"', "true", ".inf"],
+)
+def test_rejects_non_integral_or_non_numeric_phase_a_sample_rate(
+    tmp_path, sample_rate
+):
+    text = Path("configs/sgrpn_phase_a.yaml").read_text(encoding="utf-8")
+    path = tmp_path / "bad-rate.yaml"
+    path.write_text(
+        text.replace("sample_rate_hz: 25600", f"sample_rate_hz: {sample_rate}"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="sample_rate_hz.*25600"):
+        load_sgrpn_config(path)
