@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 import json
 
 import pytest
@@ -57,7 +58,11 @@ def test_config_rejects_source_output_as_destination(tmp_path: Path):
         load_scheme1_physics_config(path)
 
 
-def test_protocol_checkpoint_records_isolation(tmp_path: Path):
+def test_protocol_checkpoint_records_isolation(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "roughness.scheme1_physics.config.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
     config = load_scheme1_physics_config(
         _write_config(tmp_path, output_dir=tmp_path / "physics")
     )

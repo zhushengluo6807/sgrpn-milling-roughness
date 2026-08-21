@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,7 +23,7 @@ def test_scheme1_config_resolves_paths_from_config_directory(monkeypatch, tmp_pa
     assert config.segments_dir.is_dir()
     assert config.manifest_path.is_file()
     assert config.folds_path.is_file()
-    assert config.output_dir == PROJECT_ROOT / "outputs" / "scheme1"
+    assert config.output_dir.samefile(PROJECT_ROOT / "outputs" / "scheme1")
 
 
 def test_scheme1_config_exposes_frozen_protocol():
@@ -71,7 +72,11 @@ def test_scheme1_config_rejects_invalid_welch_overlap(tmp_path):
         load_scheme1_config(path)
 
 
-def test_write_protocol_checkpoint_records_fold_audit_and_config(tmp_path):
+def test_write_protocol_checkpoint_records_fold_audit_and_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "roughness.scheme1.config.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
     config = load_scheme1_config(CONFIG_PATH)
 
     checkpoint = write_protocol_checkpoint(
