@@ -63,12 +63,9 @@ def _require_fixed_sample_rate(sample_rate_hz: object) -> int:
 
 
 def _require_integral_bound(value: object, name: str) -> int:
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
         raise ValueError(f"{name} must be a finite, non-boolean integer")
-    number = float(value)
-    if not np.isfinite(number) or not number.is_integer():
-        raise ValueError(f"{name} must be a finite, non-boolean integer")
-    return int(number)
+    return int(value)
 
 
 def window_to_order_spectrum(

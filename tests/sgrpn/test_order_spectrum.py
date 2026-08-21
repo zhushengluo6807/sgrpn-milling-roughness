@@ -210,19 +210,50 @@ def test_cache_rejects_empty_bags_and_builder_rejects_missing_segment_windows(tm
         build_order_cache(bundle, _config(tmp_path, manifest_path, windows_path))
 
 
-@pytest.mark.parametrize("bad_value", [0.5, 25600.5, True])
-def test_builder_rejects_non_integral_or_boolean_window_bounds(tmp_path: Path, bad_value: object):
+@pytest.mark.parametrize(
+    ("start_sample", "end_sample"),
+    [
+        (0.5, 25600),
+        (25600.5, 25600),
+        (True, 25600),
+        (0.0, 25600),
+        (0, 25600.0),
+        ("0", 25600),
+        (0, "25600"),
+    ],
+)
+def test_builder_rejects_non_integral_boolean_float_and_string_window_bounds(
+    tmp_path: Path, start_sample: object, end_sample: object
+):
     signal_path = tmp_path / "signal.csv"
     pd.DataFrame({"Ch9_g": np.ones(25600), "Ch10_g": np.ones(25600), "Ch11_g": np.ones(25600)}).to_csv(signal_path, index=False)
     manifest_path = tmp_path / "manifest.csv"
     manifest = pd.DataFrame({"sample_id": ["s1"], "signal_path": [str(signal_path)], "n_rpm": [4000.0], "duration_s": [1.0]})
     manifest.to_csv(manifest_path, index=False)
     windows_path = tmp_path / "windows.csv"
-    windows = pd.DataFrame({"segment_id": ["s1"], "start_sample": [bad_value], "end_sample": [25600]})
+    windows = pd.DataFrame({"segment_id": ["s1"], "start_sample": [start_sample], "end_sample": [end_sample]})
     windows.to_csv(windows_path, index=False)
     bundle = DataBundle(manifest=manifest, folds=pd.DataFrame(), windows=windows, fold_audit={}, duration_audit=pd.DataFrame())
 
     with pytest.raises(ValueError, match="integer"):
+        build_order_cache(bundle, _config(tmp_path, manifest_path, windows_path))
+
+
+@pytest.mark.parametrize(("start_sample", "end_sample"), [(-1, 25599), (0, 25601)])
+def test_builder_rejects_out_of_range_window_bounds(
+    tmp_path: Path, start_sample: int, end_sample: int
+):
+    signal_path = tmp_path / "signal.csv"
+    pd.DataFrame({"Ch9_g": np.ones(25600), "Ch10_g": np.ones(25600), "Ch11_g": np.ones(25600)}).to_csv(signal_path, index=False)
+    manifest_path = tmp_path / "manifest.csv"
+    manifest = pd.DataFrame({"sample_id": ["s1"], "signal_path": [str(signal_path)], "n_rpm": [4000.0], "duration_s": [1.0]})
+    manifest.to_csv(manifest_path, index=False)
+    windows_path = tmp_path / "windows.csv"
+    windows = pd.DataFrame({"segment_id": ["s1"], "start_sample": [start_sample], "end_sample": [end_sample]})
+    windows.to_csv(windows_path, index=False)
+    bundle = DataBundle(manifest=manifest, folds=pd.DataFrame(), windows=windows, fold_audit={}, duration_audit=pd.DataFrame())
+
+    with pytest.raises(ValueError, match="complete"):
         build_order_cache(bundle, _config(tmp_path, manifest_path, windows_path))
 
 
