@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 import inspect
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
@@ -52,10 +52,59 @@ class ProcessOOFResult:
     inner_fold: np.ndarray
 
 
-ProcessTrainer = Callable[
-    [np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    tuple[np.ndarray, int],
-]
+class ProcessTrainer(Protocol):
+    def __call__(
+        self,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        w_train: np.ndarray,
+        x_valid: np.ndarray,
+        train_groups: np.ndarray,
+        valid_groups: np.ndarray,
+    ) -> tuple[np.ndarray, int]: ...
+
+
+class ProcessValidationTrainer(Protocol):
+    def __call__(
+        self,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        w_train: np.ndarray,
+        x_valid: np.ndarray,
+        train_groups: np.ndarray,
+        valid_groups: np.ndarray,
+        *,
+        y_valid: np.ndarray,
+        w_valid: np.ndarray,
+    ) -> tuple[np.ndarray, int]: ...
+
+
+@dataclass(frozen=True)
+class ValidationAwareTrainer:
+    """Explicitly authorize a trainer to receive inner-validation labels."""
+
+    callback: ProcessValidationTrainer
+
+    def __post_init__(self) -> None:
+        if not callable(self.callback):
+            raise ValueError("validation-aware trainer callback must be callable")
+        try:
+            parameters = inspect.signature(self.callback).parameters
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "validation-aware trainer must expose an inspectable signature"
+            ) from error
+        keyword_capable = {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+        for name in ("y_valid", "w_valid"):
+            parameter = parameters.get(name)
+            if parameter is None or parameter.kind not in keyword_capable:
+                raise ValueError(
+                    "validation-aware trainer must explicitly declare keyword-capable "
+                    "y_valid and w_valid parameters"
+                )
 
 
 def _finite_process_matrix(values: Any, *, name: str) -> np.ndarray:
@@ -109,7 +158,9 @@ def fit_process_scaler(values: np.ndarray, train_index: np.ndarray) -> ProcessSc
     return ProcessScaler(mean=mean, scale=scale)
 
 
-def _validate_frame(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _validate_frame(
+    frame: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         raise ValueError("frame must be a non-empty pandas DataFrame")
     required = {"group_id", "ra_mean", "sample_weight"}
@@ -131,11 +182,13 @@ def _validate_frame(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.nda
             raise ValueError("frame contains missing sample_id values")
         if audit_ids.duplicated().any():
             raise ValueError("Duplicate frame sample_id values")
+        ordered_ids = audit_ids.to_numpy()
     else:
         if frame.index.hasnans:
             raise ValueError("frame index contains missing audit identifiers")
         if frame.index.duplicated().any():
             raise ValueError("Duplicate frame index audit identifiers")
+        ordered_ids = frame.index.map(str).to_numpy()
 
     target = _finite_vector(frame["ra_mean"], name="ra_mean", length=len(frame))
     weight = _finite_vector(
@@ -152,21 +205,28 @@ def _validate_frame(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.nda
             raise ValueError("split_count must be positive")
         if not np.allclose(weight, 1.0 / split_count, rtol=0.0, atol=1e-12):
             raise ValueError("sample_weight must equal 1/split_count")
-    return groups, target, weight
+    return groups, target, weight, ordered_ids
 
 
-def _supports_validation_labels(trainer: ProcessTrainer) -> bool:
-    try:
-        parameters = inspect.signature(trainer).parameters
-    except (TypeError, ValueError):
-        return False
-    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return True
-    has_target = "y_valid" in parameters
-    has_weight = "w_valid" in parameters
-    if has_target != has_weight:
-        raise ValueError("trainer must accept both y_valid and w_valid or neither")
-    return has_target and has_weight
+def _validate_feature_sample_ids(
+    feature_sample_ids: Any,
+    *,
+    expected: np.ndarray,
+) -> None:
+    values = np.asarray(feature_sample_ids)
+    if values.ndim != 1 or len(values) != len(expected):
+        raise ValueError("feature_sample_ids must align one-to-one with feature rows")
+    if pd.isna(values).any():
+        raise ValueError("feature_sample_ids must not contain missing values")
+    normalized = values.astype(str)
+    if np.any(np.char.str_len(normalized) == 0):
+        raise ValueError("feature_sample_ids must not contain empty values")
+    if len(np.unique(normalized)) != len(normalized):
+        raise ValueError("feature_sample_ids must be unique")
+    if not np.array_equal(normalized, expected):
+        raise ValueError(
+            "feature_sample_ids ordered IDs must exactly match the validated frame order"
+        )
 
 
 def _positive_epoch(value: Any) -> int:
@@ -179,7 +239,7 @@ def _positive_epoch(value: Any) -> int:
 
 
 def _call_trainer(
-    trainer: ProcessTrainer,
+    trainer: ProcessTrainer | ValidationAwareTrainer,
     x_train: np.ndarray,
     y_train: np.ndarray,
     w_train: np.ndarray,
@@ -190,8 +250,8 @@ def _call_trainer(
     w_valid: np.ndarray,
 ) -> tuple[np.ndarray, int]:
     arguments = (x_train, y_train, w_train, x_valid, train_groups, valid_groups)
-    if _supports_validation_labels(trainer):
-        result = trainer(*arguments, y_valid=y_valid, w_valid=w_valid)
+    if isinstance(trainer, ValidationAwareTrainer):
+        result = trainer.callback(*arguments, y_valid=y_valid, w_valid=w_valid)
     else:
         result = trainer(*arguments)
     if not isinstance(result, tuple) or len(result) != 2:
@@ -203,7 +263,9 @@ def _call_trainer(
 def generate_process_oof(
     frame: pd.DataFrame,
     process_features: np.ndarray,
-    trainer: ProcessTrainer,
+    trainer: ProcessTrainer | ValidationAwareTrainer,
+    *,
+    feature_sample_ids: Sequence[Any],
     n_splits: int = _PHASE_A_INNER_SPLITS,
     seed: int = _PHASE_A_SEED,
 ) -> ProcessOOFResult:
@@ -212,21 +274,22 @@ def generate_process_oof(
         raise ValueError("Phase A requires exactly four inner splits")
     if isinstance(seed, bool) or seed != _PHASE_A_SEED:
         raise ValueError("Phase A requires seed 20260723")
-    if not callable(trainer):
+    if not isinstance(trainer, ValidationAwareTrainer) and not callable(trainer):
         raise ValueError("trainer must be callable")
-    groups, target, weight = _validate_frame(frame)
+    groups, target, weight, ordered_ids = _validate_frame(frame)
     features = _finite_process_matrix(process_features, name="process_features")
     if len(features) != len(frame):
         raise ValueError("process_features rows must match frame length")
+    _validate_feature_sample_ids(feature_sample_ids, expected=ordered_ids)
 
     splits = make_group_inner_splits(frame, n_splits=n_splits, seed=seed)
     if len(splits) != _PHASE_A_INNER_SPLITS:
         raise ValueError("Phase A split generator must return four inner splits")
 
-    prediction = np.full(len(frame), np.nan, dtype=np.float64)
-    assignment_count = np.zeros(len(frame), dtype=np.int64)
-    inner_fold = np.full(len(frame), -1, dtype=np.int64)
-    best_epochs: list[int] = []
+    normalized_splits: list[
+        tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] = []
+    preflight_assignment_count = np.zeros(len(frame), dtype=np.int64)
     for fold_number, (raw_train, raw_valid) in enumerate(splits):
         train_index = _validated_indices(
             raw_train, name="inner train index", row_count=len(frame)
@@ -244,8 +307,25 @@ def generate_process_oof(
         valid_groups = groups[valid_index]
         overlap = sorted(set(train_groups) & set(valid_groups))
         if overlap:
-            raise ValueError(f"Inner group leakage between train and validation: {overlap[:10]}")
+            raise ValueError(
+                f"Inner group leakage between train and validation: {overlap[:10]}"
+            )
+        preflight_assignment_count[valid_index] += 1
+        normalized_splits.append(
+            (fold_number, train_index, valid_index, train_groups, valid_groups)
+        )
+    if not np.all(preflight_assignment_count == 1):
+        bad = np.flatnonzero(preflight_assignment_count != 1)
+        raise ValueError(
+            "Every row must be assigned exactly once; invalid row positions: "
+            f"{bad[:10].tolist()}"
+        )
 
+    prediction = np.full(len(frame), np.nan, dtype=np.float64)
+    assignment_count = np.zeros(len(frame), dtype=np.int64)
+    inner_fold = np.full(len(frame), -1, dtype=np.int64)
+    best_epochs: list[int] = []
+    for fold_number, train_index, valid_index, train_groups, valid_groups in normalized_splits:
         scaler = fit_process_scaler(features, train_index)
         fold_prediction, best_epoch = _call_trainer(
             trainer,
@@ -414,6 +494,8 @@ __all__ = [
     "ProcessOOFResult",
     "ProcessScaler",
     "ProcessTrainer",
+    "ProcessValidationTrainer",
+    "ValidationAwareTrainer",
     "fit_process_inner_fold",
     "fit_process_scaler",
     "generate_process_oof",

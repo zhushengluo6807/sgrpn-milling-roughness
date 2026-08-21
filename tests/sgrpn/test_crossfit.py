@@ -3,11 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+import torch
+from torch import nn
 
+import roughness.sgrpn.crossfit as crossfit
 from roughness.sgrpn.crossfit import (
     fit_process_inner_fold,
     fit_process_scaler,
-    generate_process_oof,
+    generate_process_oof as _generate_process_oof,
     median_best_epoch,
 )
 from roughness.sgrpn.data import build_process_features
@@ -40,6 +43,41 @@ def _mean_trainer(
 ):
     del x_train, w_train, train_groups, valid_groups
     return np.full(len(x_valid), y_train.mean()), 7
+
+
+def generate_process_oof(frame, process_features, trainer, **kwargs):
+    if "sample_id" in frame:
+        feature_sample_ids = frame["sample_id"].tolist()
+    else:
+        feature_sample_ids = frame.index.tolist()
+    return _generate_process_oof(
+        frame,
+        process_features,
+        trainer,
+        feature_sample_ids=feature_sample_ids,
+        **kwargs,
+    )
+
+
+def test_rejects_independently_permuted_feature_rows_and_ordered_ids():
+    frame = make_frame(groups=8, rows_per_group=1)
+    features = build_process_features(frame)
+    permutation = np.roll(np.arange(len(frame)), 1)
+    calls = 0
+
+    def trainer(*args):
+        nonlocal calls
+        calls += 1
+        return np.zeros(len(args[3])), 1
+
+    with pytest.raises(ValueError, match="feature_sample_ids|ordered.*ID|order"):
+        _generate_process_oof(
+            frame,
+            features[permutation],
+            trainer,
+            feature_sample_ids=frame["sample_id"].to_numpy()[permutation],
+        )
+    assert calls == 0
 
 
 def test_each_group_receives_one_prediction_from_unseen_groups():
@@ -95,7 +133,7 @@ def test_fold_assignment_is_deterministic_and_stays_aligned_to_sample_ids():
     assert mapping == dict(zip(frame["sample_id"], expected, strict=True))
 
 
-def test_changed_held_out_labels_do_not_change_that_groups_predictions():
+def test_fit_only_callback_does_not_train_on_its_held_out_group_labels():
     frame = make_frame(groups=8, rows_per_group=2)
     original = generate_process_oof(frame, build_process_features(frame), _mean_trainer)
     changed = frame.copy()
@@ -134,9 +172,61 @@ def test_extended_trainer_receives_only_matching_inner_validation_labels():
         np.testing.assert_allclose(y_valid, expected)
         return np.zeros(len(x_valid)), 3
 
-    generate_process_oof(frame, build_process_features(frame), trainer)
+    generate_process_oof(
+        frame,
+        build_process_features(frame),
+        crossfit.ValidationAwareTrainer(trainer),
+    )
 
     assert calls == 4
+
+
+def test_generic_kwargs_trainer_is_not_silently_given_validation_labels():
+    frame = make_frame(groups=8, rows_per_group=1)
+    received_kwargs = []
+
+    def trainer(
+        x_train,
+        y_train,
+        w_train,
+        x_valid,
+        train_groups,
+        valid_groups,
+        **kwargs,
+    ):
+        del x_train, y_train, w_train, train_groups, valid_groups
+        received_kwargs.append(kwargs)
+        return np.zeros(len(x_valid)), 1
+
+    generate_process_oof(frame, build_process_features(frame), trainer)
+
+    assert received_kwargs == [{}, {}, {}, {}]
+
+
+def test_validation_aware_adapter_rejects_kwargs_only_label_capability():
+    def generic_trainer(*args, **kwargs):
+        return np.zeros(len(args[3])), 1
+
+    with pytest.raises(ValueError, match="explicit.*y_valid.*w_valid|keyword"):
+        crossfit.ValidationAwareTrainer(generic_trainer)
+
+
+def test_validation_aware_adapter_rejects_positional_only_validation_labels():
+    def positional_only_trainer(
+        x_train,
+        y_train,
+        w_train,
+        x_valid,
+        train_groups,
+        valid_groups,
+        y_valid,
+        w_valid,
+        /,
+    ):
+        return np.zeros(len(x_valid)), 1
+
+    with pytest.raises(ValueError, match="keyword-capable"):
+        crossfit.ValidationAwareTrainer(positional_only_trainer)
 
 
 @pytest.mark.parametrize(
@@ -259,6 +349,31 @@ def test_rejects_inner_fold_that_does_not_partition_all_outer_train_rows(monkeyp
         generate_process_oof(frame, features, _mean_trainer)
 
 
+def test_preflights_every_fold_before_any_trainer_callback(monkeypatch):
+    frame = make_frame(groups=8, rows_per_group=1)
+    features = build_process_features(frame)
+    malformed_last_fold = [
+        (np.array([2, 3, 4, 5, 6, 7]), np.array([0, 1])),
+        (np.array([0, 1, 4, 5, 6, 7]), np.array([2, 3])),
+        (np.array([0, 1, 2, 3, 6, 7]), np.array([4, 5])),
+        (np.array([0, 1, 2, 3, 4, 5, 6]), np.array([6, 7])),
+    ]
+    monkeypatch.setattr(
+        "roughness.sgrpn.crossfit.make_group_inner_splits",
+        lambda *_args, **_kwargs: malformed_last_fold,
+    )
+    calls = 0
+
+    def trainer(*args):
+        nonlocal calls
+        calls += 1
+        return np.zeros(len(args[3])), 1
+
+    with pytest.raises(ValueError, match="overlap|leakage"):
+        generate_process_oof(frame, features, trainer)
+    assert calls == 0
+
+
 @pytest.mark.parametrize(
     ("epochs", "expected"),
     [
@@ -315,3 +430,72 @@ def test_real_process_fold_trainer_requires_validation_targets_for_selection():
             np.array(["g0", "g1"]),
             np.array(["g2"]),
         )
+
+
+class _ScalarProcessMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, process: torch.Tensor) -> torch.Tensor:
+        return self.bias.expand(len(process))
+
+
+def test_real_trainer_keeps_validation_labels_out_of_optimizer_loss(monkeypatch):
+    optimizer_targets = []
+    selection_targets = []
+    registered_weighted_huber = crossfit.weighted_huber
+
+    def recording_weighted_huber(prediction, target, weight, delta):
+        destination = optimizer_targets if torch.is_grad_enabled() else selection_targets
+        destination.append(target.detach().cpu().numpy().copy())
+        return registered_weighted_huber(prediction, target, weight, delta)
+
+    monkeypatch.setattr(crossfit, "ProcessMLP", _ScalarProcessMLP)
+    monkeypatch.setattr(crossfit, "weighted_huber", recording_weighted_huber)
+    y_train = np.array([0.25, 0.75])
+    y_valid = np.array([100.0, 200.0])
+
+    fit_process_inner_fold(
+        np.zeros((2, 9)),
+        y_train,
+        np.ones(2),
+        np.zeros((2, 9)),
+        np.array(["train-0", "train-1"]),
+        np.array(["valid-0", "valid-1"]),
+        y_valid=y_valid,
+        w_valid=np.ones(2),
+    )
+
+    assert optimizer_targets
+    assert selection_targets
+    for target in optimizer_targets:
+        np.testing.assert_array_equal(target, y_train.astype(np.float32))
+    for target in selection_targets:
+        np.testing.assert_array_equal(target, y_valid.astype(np.float32))
+
+
+def test_validation_labels_can_change_selected_best_epoch(monkeypatch):
+    monkeypatch.setattr(crossfit, "ProcessMLP", _ScalarProcessMLP)
+    common = (
+        np.zeros((2, 9)),
+        np.ones(2),
+        np.ones(2),
+        np.zeros((1, 9)),
+        np.array(["train-0", "train-1"]),
+        np.array(["valid-0"]),
+    )
+
+    prediction_near_zero, epoch_near_zero = fit_process_inner_fold(
+        *common,
+        y_valid=np.zeros(1),
+        w_valid=np.ones(1),
+    )
+    prediction_near_target, epoch_near_target = fit_process_inner_fold(
+        *common,
+        y_valid=np.ones(1),
+        w_valid=np.ones(1),
+    )
+
+    assert epoch_near_zero < epoch_near_target
+    assert prediction_near_zero[0] < prediction_near_target[0]
