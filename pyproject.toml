@@ -11,6 +11,7 @@ requires-python = ">=3.12,<3.13"
 roughness-first-round = "roughness.cli:main"
 roughness-scheme1 = "roughness.scheme1.cli:main"
 roughness-scheme1-physics = "roughness.scheme1_physics.cli:main"
+roughness-sgrpn = "roughness.sgrpn.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
