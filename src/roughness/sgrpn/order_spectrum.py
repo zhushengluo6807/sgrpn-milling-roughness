@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import numbers
 from pathlib import Path
 from typing import Sequence
 
@@ -55,6 +56,21 @@ def _validate_window(window: np.ndarray) -> np.ndarray:
     return values
 
 
+def _require_fixed_sample_rate(sample_rate_hz: object) -> int:
+    if type(sample_rate_hz) is not int or sample_rate_hz != _WINDOW_SAMPLES:
+        raise ValueError("Phase A sample_rate_hz must be a real int exactly 25600")
+    return sample_rate_hz
+
+
+def _require_integral_bound(value: object, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a finite, non-boolean integer")
+    number = float(value)
+    if not np.isfinite(number) or not number.is_integer():
+        raise ValueError(f"{name} must be a finite, non-boolean integer")
+    return int(number)
+
+
 def window_to_order_spectrum(
     window: np.ndarray,
     n_rpm: float,
@@ -68,14 +84,13 @@ def window_to_order_spectrum(
     rpm = float(n_rpm)
     if not np.isfinite(rpm) or rpm <= 0:
         raise ValueError("n_rpm must be finite and positive")
-    if int(sample_rate_hz) != _WINDOW_SAMPLES:
-        raise ValueError("Phase A sample_rate_hz must be exactly 25600")
+    fixed_sample_rate_hz = _require_fixed_sample_rate(sample_rate_hz)
     grid = _require_phase_a_grid(order_min, order_max, order_step)
 
     centered = values - values.mean(axis=0, keepdims=True)
     tapered = centered * np.hanning(_WINDOW_SAMPLES)[:, None]
     power = np.abs(np.fft.rfft(tapered, axis=0)) ** 2
-    frequencies_hz = np.fft.rfftfreq(_WINDOW_SAMPLES, d=1.0 / sample_rate_hz)
+    frequencies_hz = np.fft.rfftfreq(_WINDOW_SAMPLES, d=1.0 / fixed_sample_rate_hz)
     orders = frequencies_hz / (rpm / 60.0)
     log_power = np.log1p(power)
     spectra = np.empty((_CHANNEL_COUNT, grid.size), dtype=np.float32)
@@ -84,27 +99,52 @@ def window_to_order_spectrum(
     return spectra
 
 
-def signal_quality_features(signal: np.ndarray) -> np.ndarray:
+def _normalized_spectral_entropy(values: np.ndarray) -> np.ndarray:
+    """Return per-channel rFFT-power entropy normalized to the range [0, 1]."""
+    power = np.abs(np.fft.rfft(values, axis=0)) ** 2
+    totals = power.sum(axis=0)
+    entropy = np.zeros(values.shape[1], dtype=np.float64)
+    bin_count = power.shape[0]
+    if bin_count <= 1:
+        return entropy
+    nonzero = totals > 0.0
+    if np.any(nonzero):
+        probabilities = power[:, nonzero] / totals[nonzero]
+        log_probabilities = np.zeros_like(probabilities)
+        positive = probabilities > 0.0
+        log_probabilities[positive] = np.log(probabilities[positive])
+        entropy[nonzero] = -np.sum(probabilities * log_probabilities, axis=0) / np.log(bin_count)
+    return np.clip(entropy, 0.0, 1.0)
+
+
+def signal_quality_features(
+    signal: np.ndarray, valid_window_fraction: float = 1.0
+) -> np.ndarray:
     """Return seven finite, horizontal-channel exchange-invariant quality features."""
     values = np.asarray(signal, dtype=np.float64)
     if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] != _CHANNEL_COUNT:
         raise ValueError("signal must have shape [samples, 3] with at least one sample")
     if not np.isfinite(values).all():
         raise ValueError("signal contains non-finite values")
+    if isinstance(valid_window_fraction, (bool, np.bool_)) or not isinstance(valid_window_fraction, numbers.Real):
+        raise ValueError("valid_window_fraction must be finite and between 0 and 1")
+    valid_fraction = float(valid_window_fraction)
+    if not np.isfinite(valid_fraction) or not 0.0 <= valid_fraction <= 1.0:
+        raise ValueError("valid_window_fraction must be finite and between 0 and 1")
 
     horizontal = values[:, :2]
     vertical = values[:, 2]
-    horizontal_rms = np.sqrt(np.mean(horizontal**2, axis=0))
-    horizontal_std = horizontal.std(axis=0)
+    horizontal_log_rms = np.log1p(np.sqrt(np.mean(horizontal**2, axis=0)))
+    entropy = _normalized_spectral_entropy(values)
     features = np.array(
         [
-            np.mean(np.abs(horizontal)),
-            np.mean(horizontal_std),
-            np.mean(horizontal_rms),
-            np.sqrt(np.mean((horizontal[:, 0] - horizontal[:, 1]) ** 2)),
-            np.max(np.abs(horizontal)),
-            np.sqrt(np.mean(vertical**2)),
-            vertical.std(),
+            np.mean(horizontal_log_rms),
+            np.max(horizontal_log_rms),
+            np.mean(entropy[:2]),
+            np.max(entropy[:2]),
+            np.log1p(np.sqrt(np.mean(vertical**2))),
+            entropy[2],
+            valid_fraction,
         ],
         dtype=np.float32,
     )
@@ -133,8 +173,8 @@ class OrderSpectrumCache:
             raise ValueError("spectra must have shape [all_windows, 3, 361]")
         if offsets.shape != (len(segment_ids) + 1,) or offsets[0] != 0:
             raise ValueError("offsets must start at zero and have one row per segment")
-        if np.any(np.diff(offsets) < 0) or offsets[-1] != len(spectra):
-            raise ValueError("offsets must be non-decreasing and end at all_windows")
+        if np.any(np.diff(offsets) <= 0) or offsets[-1] != len(spectra):
+            raise ValueError("offsets must be strictly positive per segment and end at all_windows")
         if quality.shape != (len(segment_ids), _QUALITY_WIDTH):
             raise ValueError("quality must have shape [n_segments, 7]")
         if durations_s.shape != (len(segment_ids),):
@@ -192,10 +232,7 @@ def _nonzero_scale(values: np.ndarray) -> np.ndarray:
 def fit_spectrum_scaler(cache: OrderSpectrumCache, train_segment_ids: Sequence[str]) -> SpectrumScaler:
     indices = _requested_indices(cache, train_segment_ids)
     bags = [cache.spectra[cache.offsets[index] : cache.offsets[index + 1]] for index in indices]
-    nonempty = [bag for bag in bags if len(bag)]
-    if not nonempty:
-        raise ValueError("requested training segments contain no windows")
-    values = np.concatenate(nonempty, axis=0)
+    values = np.concatenate(bags, axis=0)
     return SpectrumScaler(
         mean=values.mean(axis=0, dtype=np.float64).astype(np.float32),
         scale=_nonzero_scale(values),
@@ -222,11 +259,46 @@ def _manifest_index(bundle: DataBundle) -> pd.DataFrame:
     return indexed
 
 
+def _validate_config(config: SGRPNConfig) -> None:
+    _require_fixed_sample_rate(config.sample_rate_hz)
+    if type(config.window_samples) is not int or config.window_samples != _WINDOW_SAMPLES:
+        raise ValueError("Phase A window_samples must be a real int exactly 25600")
+    _require_phase_a_grid(config.order_min, config.order_max, config.order_step)
+
+
+def _validated_segment_windows(
+    rows: pd.DataFrame, segment_id: str, signal_length: int
+) -> list[tuple[int, int]]:
+    if rows.empty:
+        raise ValueError(f"Window index has no windows for segment {segment_id}")
+    windows: list[tuple[int, int]] = []
+    for row in rows.loc[:, ["start_sample", "end_sample"]].itertuples(index=False):
+        start = _require_integral_bound(row.start_sample, "start_sample")
+        end = _require_integral_bound(row.end_sample, "end_sample")
+        if not 0 <= start < end <= signal_length or end - start != _WINDOW_SAMPLES:
+            raise ValueError(
+                f"Window index must select a complete [25600, 3] window for {segment_id}"
+            )
+        windows.append((start, end))
+    return windows
+
+
+def _valid_window_fraction(windows: Sequence[tuple[int, int]], signal_length: int) -> float:
+    covered = 0
+    previous_start, previous_end = sorted(windows)[0]
+    for start, end in sorted(windows)[1:]:
+        if start > previous_end:
+            covered += previous_end - previous_start
+            previous_start, previous_end = start, end
+        else:
+            previous_end = max(previous_end, end)
+    covered += previous_end - previous_start
+    return min(1.0, covered / signal_length)
+
+
 def build_order_cache(bundle: DataBundle, config: SGRPNConfig) -> OrderSpectrumCache:
     """Build one spectrum bag per manifest segment using only indexed windows."""
-    if config.sample_rate_hz != _WINDOW_SAMPLES or config.window_samples != _WINDOW_SAMPLES:
-        raise ValueError("Phase A windows and sample rate must be exactly 25600")
-    _require_phase_a_grid(config.order_min, config.order_max, config.order_step)
+    _validate_config(config)
     required_windows = {"segment_id", "start_sample", "end_sample"}
     missing = sorted(required_windows - set(bundle.windows.columns))
     if missing:
@@ -246,14 +318,11 @@ def build_order_cache(bundle: DataBundle, config: SGRPNConfig) -> OrderSpectrumC
     for segment_id in segment_ids:
         row = manifest.loc[segment_id]
         signal = load_signal_csv(Path(row["signal_path"]))
-        quality.append(signal_quality_features(signal))
-        durations.append(float(row["duration_s"]))
         rows = indexed_windows.loc[indexed_windows["segment_id"] == segment_id]
-        for window_row in rows.itertuples(index=False):
-            start = int(getattr(window_row, "start_sample"))
-            end = int(getattr(window_row, "end_sample"))
-            if start < 0 or end - start != _WINDOW_SAMPLES or end > len(signal):
-                raise ValueError(f"Window index must select a complete [25600, 3] window for {segment_id}")
+        windows = _validated_segment_windows(rows, segment_id, len(signal))
+        quality.append(signal_quality_features(signal, _valid_window_fraction(windows, len(signal))))
+        durations.append(len(signal) / _WINDOW_SAMPLES)
+        for start, end in windows:
             all_spectra.append(
                 window_to_order_spectrum(
                     signal[start:end],
@@ -295,7 +364,32 @@ def _mismatch_count(bundle: DataBundle) -> int:
     return int(bundle.duration_audit["mismatch_over_1ms"].sum())
 
 
+def _bundle_binding(bundle: DataBundle) -> tuple[tuple[str, ...], tuple[int, ...], str]:
+    manifest = _manifest_index(bundle)
+    if "segment_id" not in bundle.windows.columns:
+        raise ValueError("Window index missing columns: ['segment_id']")
+    segment_ids = tuple(manifest.index.tolist())
+    window_ids = bundle.windows["segment_id"].astype(str)
+    unknown = sorted(set(window_ids) - set(segment_ids))
+    if unknown:
+        raise ValueError(f"Window index contains unknown segment IDs: {unknown[:10]}")
+    counts = tuple(int((window_ids == segment_id).sum()) for segment_id in segment_ids)
+    payload = {"segment_ids": list(segment_ids), "window_counts": list(counts)}
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return segment_ids, counts, fingerprint
+
+
+def _validate_cache_binding(cache: OrderSpectrumCache, bundle: DataBundle) -> tuple[tuple[str, ...], tuple[int, ...], str]:
+    segment_ids, counts, fingerprint = _bundle_binding(bundle)
+    if cache.segment_ids != segment_ids or tuple(np.diff(cache.offsets).tolist()) != counts:
+        raise ValueError("Order spectrum cache binding does not match manifest order and window counts")
+    return segment_ids, counts, fingerprint
+
+
 def _metadata(cache: OrderSpectrumCache, bundle: DataBundle, config: SGRPNConfig, cache_sha256: str) -> dict:
+    segment_ids, window_counts, binding_fingerprint = _validate_cache_binding(cache, bundle)
     return {
         "grid": order_grid(config.order_min, config.order_max, config.order_step).tolist(),
         "sample_rate_hz": int(config.sample_rate_hz),
@@ -303,6 +397,9 @@ def _metadata(cache: OrderSpectrumCache, bundle: DataBundle, config: SGRPNConfig
         "window_index_sha256": _sha256_file(Path(config.window_index_path)),
         "segment_count": len(cache.segment_ids),
         "window_count": int(cache.spectra.shape[0]),
+        "segment_ids": list(segment_ids),
+        "window_counts": list(window_counts),
+        "segment_window_fingerprint": binding_fingerprint,
         "mismatch_count": _mismatch_count(bundle),
         "cache_sha256": cache_sha256,
     }
@@ -310,7 +407,8 @@ def _metadata(cache: OrderSpectrumCache, bundle: DataBundle, config: SGRPNConfig
 
 def save_order_cache(cache: OrderSpectrumCache, bundle: DataBundle, config: SGRPNConfig) -> tuple[Path, Path]:
     """Persist the cache and source fingerprints beneath ``output_dir/features``."""
-    _require_phase_a_grid(config.order_min, config.order_max, config.order_step)
+    _validate_config(config)
+    _validate_cache_binding(cache, bundle)
     npz_path, json_path = _feature_paths(config)
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -328,7 +426,9 @@ def save_order_cache(cache: OrderSpectrumCache, bundle: DataBundle, config: SGRP
 
 def load_order_cache(bundle: DataBundle, config: SGRPNConfig) -> OrderSpectrumCache:
     """Load a cache only when its grid, source fingerprints, and bytes match."""
+    _validate_config(config)
     expected_grid = _require_phase_a_grid(config.order_min, config.order_max, config.order_step)
+    expected_ids, expected_counts, expected_binding = _bundle_binding(bundle)
     npz_path, json_path = _feature_paths(config)
     if not npz_path.is_file() or not json_path.is_file():
         raise ValueError("Order spectrum cache files are missing")
@@ -342,6 +442,12 @@ def load_order_cache(bundle: DataBundle, config: SGRPNConfig) -> OrderSpectrumCa
         raise ValueError("Order spectrum cache source fingerprint does not match")
     if metadata.get("cache_sha256") != _sha256_file(npz_path):
         raise ValueError("Order spectrum cache fingerprint does not match cache bytes")
+    if (
+        metadata.get("segment_ids") != list(expected_ids)
+        or metadata.get("window_counts") != list(expected_counts)
+        or metadata.get("segment_window_fingerprint") != expected_binding
+    ):
+        raise ValueError("Order spectrum cache binding metadata does not match bundle")
     with np.load(npz_path, allow_pickle=False) as archive:
         cache = OrderSpectrumCache(
             segment_ids=tuple(archive["segment_ids"].tolist()),
@@ -350,6 +456,7 @@ def load_order_cache(bundle: DataBundle, config: SGRPNConfig) -> OrderSpectrumCa
             quality=archive["quality"],
             durations_s=archive["durations_s"],
         )
+    _validate_cache_binding(cache, bundle)
     if metadata.get("segment_count") != len(cache.segment_ids) or metadata.get("window_count") != len(cache.spectra) or metadata.get("mismatch_count") != _mismatch_count(bundle):
         raise ValueError("Order spectrum cache metadata does not match bundle")
     return cache
