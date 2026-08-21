@@ -52,9 +52,9 @@ class DataBundle:
 def recompute_duration(row_count: int, sample_rate_hz: int) -> float:
     if row_count < 0:
         raise ValueError("row_count must be non-negative")
-    if sample_rate_hz <= 0:
-        raise ValueError("sample_rate_hz must be positive")
-    return float(row_count) / float(sample_rate_hz)
+    if sample_rate_hz != 25600:
+        raise ValueError("Phase A sample_rate_hz must be exactly 25600")
+    return float(row_count) / 25600.0
 
 
 def _require_columns(frame: pd.DataFrame, required: set[str], name: str) -> None:
@@ -120,7 +120,9 @@ def _validate_manifest(manifest: pd.DataFrame) -> None:
 
 def _validate_windows(manifest: pd.DataFrame, windows: pd.DataFrame) -> None:
     _require_columns(windows, _WINDOW_COLUMNS, "Window index")
-    manifest_groups = manifest.set_index("sample_id")["group_id"].astype(str)
+    manifest_groups = manifest.assign(
+        sample_id=manifest["sample_id"].astype(str)
+    ).set_index("sample_id")["group_id"].astype(str)
     segment_ids = windows["segment_id"].astype(str)
     unknown = sorted(set(segment_ids) - set(manifest_groups.index.astype(str)))
     if unknown:
@@ -131,12 +133,12 @@ def _validate_windows(manifest: pd.DataFrame, windows: pd.DataFrame) -> None:
         raise ValueError("Window group_id does not match manifest")
 
 
-def _build_duration_audit(manifest: pd.DataFrame, sample_rate_hz: int) -> pd.DataFrame:
+def _build_duration_audit(manifest: pd.DataFrame) -> pd.DataFrame:
     records = []
     for row in manifest.itertuples(index=False):
         signal_path = Path(row.signal_path)
         row_count = int(len(load_signal_csv(signal_path)))
-        recomputed = recompute_duration(row_count, sample_rate_hz)
+        recomputed = recompute_duration(row_count, 25600)
         source = float(row.duration_s)
         difference = abs(source - recomputed)
         records.append(
@@ -153,13 +155,15 @@ def _build_duration_audit(manifest: pd.DataFrame, sample_rate_hz: int) -> pd.Dat
 
 
 def load_data_bundle(config: SGRPNConfig) -> DataBundle:
+    if config.sample_rate_hz != 25600:
+        raise ValueError("Phase A sample_rate_hz must be exactly 25600")
     manifest = pd.read_csv(config.manifest_path)
     folds = pd.read_csv(config.folds_path)
     windows = pd.read_csv(config.window_index_path)
     _validate_manifest(manifest)
     _validate_windows(manifest, windows)
     fold_audit = validate_outer_folds(manifest, folds)
-    duration_audit = _build_duration_audit(manifest, config.sample_rate_hz)
+    duration_audit = _build_duration_audit(manifest)
     return DataBundle(
         manifest=manifest,
         folds=folds,

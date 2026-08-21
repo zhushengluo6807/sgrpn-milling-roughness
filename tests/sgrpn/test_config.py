@@ -23,3 +23,15 @@ def test_rejects_phase_a_with_multiple_seeds(tmp_path):
     path.write_text(text.replace("seeds: [20260723]", "seeds: [1, 2]"), encoding="utf-8")
     with pytest.raises(ValueError, match="exactly seed 20260723"):
         load_sgrpn_config(path)
+
+
+def test_rejects_non_fixed_phase_a_sample_rate(tmp_path):
+    text = Path("configs/sgrpn_phase_a.yaml").read_text(encoding="utf-8")
+    path = tmp_path / "bad-rate.yaml"
+    path.write_text(
+        text.replace("sample_rate_hz: 25600", "sample_rate_hz: 12800"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="sample_rate_hz.*25600"):
+        load_sgrpn_config(path)

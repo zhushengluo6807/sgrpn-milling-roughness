@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -110,6 +111,11 @@ def test_duration_uses_row_count_not_metadata():
     assert recompute_duration(row_count=25600, sample_rate_hz=25600) == 1.0
 
 
+def test_duration_rejects_non_fixed_sample_rate():
+    with pytest.raises(ValueError, match="sample_rate_hz.*25600"):
+        recompute_duration(row_count=25600, sample_rate_hz=12800)
+
+
 def test_group_overlap_fails_fast():
     with pytest.raises(ValueError, match="group leakage"):
         validate_group_split(np.array(["g1", "g2"]), np.array(["g2", "g3"]))
@@ -130,6 +136,33 @@ def test_load_records_duration_mismatch_and_preserves_manifest(tmp_path: Path):
     assert test.tolist() == [0]
     audit_path = write_data_audit(bundle, tmp_path / "audit" / "duration.csv")
     assert pd.read_csv(audit_path).shape == (5, 6)
+
+
+def test_load_rejects_directly_constructed_non_fixed_sample_rate(tmp_path: Path):
+    config, _ = _fixture_paths(tmp_path)
+
+    with pytest.raises(ValueError, match="sample_rate_hz.*25600"):
+        load_data_bundle(replace(config, sample_rate_hz=12800))
+
+
+def test_load_matches_windows_when_sample_ids_are_numeric(tmp_path: Path):
+    config, _ = _fixture_paths(tmp_path)
+    manifest = pd.read_csv(config.manifest_path)
+    folds = pd.read_csv(config.folds_path)
+    windows = pd.read_csv(config.window_index_path)
+    numeric_ids = list(range(5))
+    manifest["sample_id"] = numeric_ids
+    folds["sample_id"] = numeric_ids
+    windows["segment_id"] = numeric_ids
+    manifest.to_csv(config.manifest_path, index=False)
+    folds.to_csv(config.folds_path, index=False)
+    windows.to_csv(config.window_index_path, index=False)
+
+    bundle = load_data_bundle(config)
+
+    train, test = outer_indices(bundle, fold=0)
+    assert set(train) == {1, 2, 3, 4}
+    assert test.tolist() == [0]
 
 
 @pytest.mark.parametrize(
