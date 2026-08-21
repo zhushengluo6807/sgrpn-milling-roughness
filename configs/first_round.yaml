@@ -1,0 +1,7 @@
+labels: ../切削实验/粗糙度测量记录表_按切分片段.xlsx
+v3_records: ../切削实验/实验记录表_改进版_v3.xlsx
+v4_records: ../切削实验/实验记录表_改进版_v4.xlsx
+segments_root: ../切削实验/预处理并切分后实验数据_不扩展剔除/segments
+output_dir: ../outputs/first_round_baseline
+seed: 20260723
+n_splits: 5

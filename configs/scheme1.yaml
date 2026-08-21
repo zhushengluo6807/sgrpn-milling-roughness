@@ -1,0 +1,20 @@
+segments_dir: ../切削实验/预处理并切分后实验数据_不扩展剔除/segments
+manifest_path: ../outputs/first_round_baseline/manifest.csv
+folds_path: ../outputs/first_round_baseline/folds.csv
+output_dir: ../outputs/scheme1
+sample_rate_hz: 25600
+window_samples: 25600
+stride_samples: 25600
+re_candidates_mm: [0.075, 0.10, 0.20, 0.40, 0.80]
+seeds: [20260723, 20260724, 20260725]
+inner_splits: 4
+welch_nperseg: 8192
+welch_noverlap: 4096
+nominal_band_min_halfwidth_hz: 5.0
+nominal_band_relative_halfwidth: 0.05
+hf_band_hz: [1000.0, 10000.0]
+max_epochs: 200
+patience: 20
+learning_rate: 0.001
+weight_decay: 0.0001
+bootstrap_repetitions: 10000

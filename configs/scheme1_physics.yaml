@@ -1,0 +1,7 @@
+scheme1_config_path: scheme1.yaml
+output_dir: ../outputs/scheme1_physics
+models: [PW0, PW1, PW2, PE0, PE1, PE2]
+batch_size: 4
+validation_fraction: 0.2
+residual_dropout: 0.3
+
