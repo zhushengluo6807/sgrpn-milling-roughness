@@ -80,6 +80,44 @@ def test_rejects_independently_permuted_feature_rows_and_ordered_ids():
     assert calls == 0
 
 
+def test_rejects_permuted_feature_values_with_unchanged_audit_ids(monkeypatch):
+    frame = make_frame(groups=8, rows_per_group=1)
+    features = build_process_features(frame)
+    permutation = np.roll(np.arange(len(frame)), 1)
+    registered_splitter = crossfit.make_group_inner_splits
+    split_calls = 0
+    trainer_calls = 0
+
+    def split_spy(*args, **kwargs):
+        nonlocal split_calls
+        split_calls += 1
+        return registered_splitter(*args, **kwargs)
+
+    def trainer(*args):
+        nonlocal trainer_calls
+        trainer_calls += 1
+        return np.zeros(len(args[3])), 1
+
+    monkeypatch.setattr(crossfit, "make_group_inner_splits", split_spy)
+    with pytest.raises(ValueError, match="canonical|manifest|process_features"):
+        generate_process_oof(frame, features[permutation], trainer)
+    assert split_calls == 0
+    assert trainer_calls == 0
+
+
+def test_canonical_features_accept_swaps_of_identical_process_rows():
+    frame = make_frame(groups=8, rows_per_group=1)
+    process_columns = ["n_rpm", "fz_mm_per_tooth", "ap_mm"]
+    frame.loc[1, process_columns] = frame.loc[0, process_columns].to_numpy()
+    features = build_process_features(frame)
+    swapped = features.copy()
+    swapped[[0, 1]] = swapped[[1, 0]]
+
+    result = generate_process_oof(frame, swapped, _mean_trainer)
+
+    assert result.assignment_count.tolist() == [1] * len(frame)
+
+
 def test_each_group_receives_one_prediction_from_unseen_groups():
     frame = make_frame(groups=8, rows_per_group=2)
     seen = []

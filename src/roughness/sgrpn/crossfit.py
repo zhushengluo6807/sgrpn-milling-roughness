@@ -14,6 +14,7 @@ import torch
 
 from roughness.scheme1.crossfit import make_group_inner_splits
 
+from .data import build_process_features
 from .models import ProcessMLP, weighted_huber
 
 
@@ -281,6 +282,11 @@ def generate_process_oof(
     if len(features) != len(frame):
         raise ValueError("process_features rows must match frame length")
     _validate_feature_sample_ids(feature_sample_ids, expected=ordered_ids)
+    canonical_features = build_process_features(frame)
+    if not np.array_equal(features, canonical_features):
+        raise ValueError(
+            "process_features must exactly match canonical manifest features row-for-row"
+        )
 
     splits = make_group_inner_splits(frame, n_splits=n_splits, seed=seed)
     if len(splits) != _PHASE_A_INNER_SPLITS:
