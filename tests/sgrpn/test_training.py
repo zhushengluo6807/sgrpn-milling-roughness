@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import csv
 import json
@@ -18,6 +19,12 @@ from roughness.scheme1.crossfit import make_group_inner_splits
 from roughness.sgrpn.config import SGRPNConfig
 from roughness.sgrpn.data import DataBundle
 from roughness.sgrpn.order_spectrum import OrderSpectrumCache
+from roughness.sgrpn.models import (
+    ModelOutput,
+    average_swap_predictions,
+    sgrpn_loss,
+    weighted_huber,
+)
 from roughness.sgrpn.training import (
     ComponentFoldData,
     ComponentRefitData,
@@ -161,6 +168,8 @@ class RecordingBackend:
         del patience, learning_rate, weight_decay, loss_name, seed
         train_batches = list(train_loader)
         valid_batches = [] if validation_loader is None else list(validation_loader)
+        if stage != "P1" and validation_loader is not None:
+            assert validation_loader.dataset.augment_horizontal_swap is False
         train_ids = [item for batch in train_batches for item in batch["sample_id"]]
         valid_ids = [item for batch in valid_batches for item in batch["sample_id"]]
         train_targets = torch.cat([batch["target"] for batch in train_batches]).numpy()
@@ -322,6 +331,139 @@ class VariableRngBackend:
                 [{"epoch": 1, "train_loss": loss, "validation_loss": loss}]
             ),
         )
+
+
+def _validation_batch() -> dict:
+    spectrum = torch.zeros(2, 1, 3, 361)
+    spectrum[0, :, 0] = 0.0
+    spectrum[0, :, 1] = 2.0
+    spectrum[1, :, 0] = 4.0
+    spectrum[1, :, 1] = 10.0
+    return {
+        "spectrum": spectrum,
+        "window_mask": torch.ones(2, 1, dtype=torch.bool),
+        "process": torch.tensor(
+            [[1.0] + [0.0] * 8, [3.0] + [0.0] * 8]
+        ),
+        "quality": torch.zeros(2, 7),
+        "target": torch.tensor([0.0, 5.0]),
+        "sample_weight": torch.tensor([1.0, 3.0]),
+        "sample_id": ["s0", "s1"],
+        "group_id": ["g0", "g1"],
+    }
+
+
+def _assert_batch_unchanged(batch: dict, original: dict) -> None:
+    for key in batch:
+        if isinstance(batch[key], torch.Tensor):
+            assert torch.equal(batch[key], original[key])
+        else:
+            assert batch[key] == original[key]
+
+
+class _ChannelOrderSensitiveSignal(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, spectrum, window_mask, process=None, quality=None):
+        del window_mask, process, quality
+        self.calls += 1
+        return ModelOutput(prediction=spectrum[:, :, 0].mean(dim=(1, 2)))
+
+
+@pytest.mark.parametrize("stage", ["V1", "F1", "R1"])
+def test_signal_validation_loss_uses_swap_averaged_prediction(stage):
+    import roughness.sgrpn.training as training
+
+    batch = _validation_batch()
+    original = deepcopy(batch)
+    model = _ChannelOrderSensitiveSignal()
+    expected_prediction = torch.tensor([1.0, 7.0])
+    expected = weighted_huber(
+        expected_prediction, batch["target"], batch["sample_weight"], 0.5
+    )
+
+    actual = training._validation_loss(stage, model, [batch], torch.device("cpu"), 0.5)
+
+    assert actual == pytest.approx(float(expected))
+    assert model.calls == 2
+    _assert_batch_unchanged(batch, original)
+
+
+def test_g1_validation_loss_applies_registered_loss_to_one_averaged_output():
+    import roughness.sgrpn.training as training
+
+    class AntiCorrelatedGateResidual(nn.Module):
+        def forward(self, spectrum, window_mask, process, quality):
+            del window_mask, process, quality
+            channel = spectrum[:, :, 0].mean(dim=(1, 2))
+            return ModelOutput(
+                prediction=channel + 1.0,
+                gate=0.1 + 0.4 * channel,
+                residual=10.0 - 10.0 * channel,
+            )
+
+    batch = _validation_batch()
+    single = {
+        key: value[:1]
+        for key, value in batch.items()
+    }
+    original = deepcopy(single)
+    averaged = average_swap_predictions(AntiCorrelatedGateResidual(), single)
+    expected_huber = weighted_huber(
+        averaged.prediction, single["target"], single["sample_weight"], 0.5
+    )
+    expected_gate_penalty = 1e-3 * averaged.gate.square().mean()
+    expected_correction_penalty = 1e-2 * (
+        averaged.gate * averaged.residual
+    ).square().mean()
+    expected = sgrpn_loss(
+        averaged, single["target"], single["sample_weight"], 0.5
+    )
+
+    actual = training._validation_loss(
+        "G1", AntiCorrelatedGateResidual(), [single], torch.device("cpu"), 0.5
+    )
+
+    torch.testing.assert_close(averaged.prediction, torch.tensor([2.0]))
+    torch.testing.assert_close(averaged.gate, torch.tensor([0.5]))
+    torch.testing.assert_close(averaged.residual, torch.tensor([0.0]))
+    assert float(expected_huber) == pytest.approx(0.875)
+    assert float(expected_gate_penalty) == pytest.approx(0.00025)
+    assert float(expected_correction_penalty) == 0.0
+    # Averaging orientation-wise products would yield a nonzero 0.16 penalty;
+    # the registered protocol first averages gate and residual fields.
+    assert 1e-2 * ((0.1 * 10.0 + 0.9 * -10.0) / 2.0) ** 2 == pytest.approx(0.16)
+    assert float(expected) == pytest.approx(0.87525)
+    assert actual == pytest.approx(float(expected))
+    _assert_batch_unchanged(single, original)
+
+
+def test_p1_validation_is_single_process_only_call_and_does_not_mutate_batch():
+    import roughness.sgrpn.training as training
+
+    class ProcessOnly(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, process):
+            self.calls += 1
+            return process[:, 0]
+
+    batch = _validation_batch()
+    original = deepcopy(batch)
+    model = ProcessOnly()
+    expected = weighted_huber(
+        torch.tensor([1.0, 3.0]), batch["target"], batch["sample_weight"], 0.5
+    )
+
+    actual = training._validation_loss("P1", model, [batch], torch.device("cpu"), 0.5)
+
+    assert actual == pytest.approx(float(expected))
+    assert model.calls == 1
+    _assert_batch_unchanged(batch, original)
 
 
 def test_epoch_selection_uses_rounded_median_inner_best_epoch():

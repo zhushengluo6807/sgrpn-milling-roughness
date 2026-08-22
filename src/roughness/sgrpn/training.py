@@ -432,7 +432,11 @@ def _validation_loss(
     with torch.no_grad():
         for raw_batch in loader:
             batch = _move_batch(raw_batch, device)
-            outputs.append(_model_output(stage, model, batch))
+            outputs.append(
+                _model_output(stage, model, batch)
+                if stage == "P1"
+                else average_swap_predictions(model, batch)
+            )
             targets.append(batch["target"])
             weights.append(batch["sample_weight"])
     if not outputs:
