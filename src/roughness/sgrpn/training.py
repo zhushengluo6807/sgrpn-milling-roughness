@@ -11,6 +11,7 @@ import io
 import json
 from pathlib import Path
 import random
+from numbers import Real
 from typing import Any, Protocol
 import uuid
 
@@ -575,6 +576,8 @@ def select_epochs_group_cv(
         result = _factory_call(
             train_step, model, fold_data, validation_step, fold_number
         )
+        if isinstance(result, TrainingResult) and result.model is not model:
+            raise ValueError("selection callback substituted the exact seeded model instance")
         epoch = result.best_epoch if isinstance(result, TrainingResult) else result
         if isinstance(epoch, (bool, np.bool_)) or not isinstance(epoch, (int, np.integer)) or int(epoch) < 1:
             raise ValueError("train_step must return a positive best epoch")
@@ -621,8 +624,12 @@ def refit_component(
         train_step, model, payload.train_data, epoch_selection.refit_epochs
     )
     if isinstance(result, TrainingResult):
+        if result.model is not model:
+            raise ValueError("refit callback substituted the exact seeded model instance")
         return result.model
     if isinstance(result, nn.Module):
+        if result is not model:
+            raise ValueError("refit callback substituted the exact seeded model instance")
         return result
     raise ValueError("refit train_step must return TrainingResult or nn.Module")
 
@@ -737,9 +744,64 @@ def _fit_backend(
     )
     if not isinstance(result, TrainingResult):
         raise ValueError("training backend must return TrainingResult")
+    if result.model is not model:
+        raise ValueError("training backend substituted the exact seeded model instance")
     if result.best_epoch < 1 or result.best_epoch > max_epochs:
         raise ValueError("training backend returned an invalid best epoch")
+    _validate_backend_history(result.history, result.best_epoch, max_epochs)
     return result
+
+
+def _validate_backend_history(
+    history: pd.DataFrame, best_epoch: int, max_epochs: int
+) -> None:
+    required = {"epoch", "train_loss", "validation_loss"}
+    if not isinstance(history, pd.DataFrame) or history.empty or not required.issubset(history):
+        raise ValueError("training backend history schema is incompatible")
+    raw_epochs = history["epoch"].to_numpy(copy=False)
+    epochs: list[int] = []
+    for value in raw_epochs:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Real)
+            or not np.isfinite(value)
+            or not float(value).is_integer()
+        ):
+            raise ValueError("training backend history epoch must be integral")
+        epochs.append(int(value))
+    losses = history.loc[:, ["train_loss", "validation_loss"]].to_numpy(
+        dtype=np.float64
+    )
+    if (
+        len(set(epochs)) != len(epochs)
+        or epochs != list(range(1, len(epochs) + 1))
+        or epochs[-1] > int(max_epochs)
+        or int(best_epoch) not in epochs
+        or not np.isfinite(losses).all()
+    ):
+        raise ValueError("training backend history epochs/losses are inconsistent")
+
+
+def _normalize_inner_index(raw: Any, *, name: str, row_count: int) -> np.ndarray:
+    values = np.asarray(raw)
+    if values.ndim != 1 or not len(values):
+        raise ValueError(f"inner {name} indices must be a nonempty vector")
+    normalized: list[int] = []
+    for value in values:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Real)
+            or not np.isfinite(value)
+            or not float(value).is_integer()
+        ):
+            raise ValueError(f"inner {name} indices must be finite integral non-boolean values")
+        index = int(value)
+        if index < 0 or index >= row_count:
+            raise ValueError(f"inner {name} index is outside row bounds")
+        normalized.append(index)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"inner {name} indices must be unique")
+    return np.asarray(normalized, dtype=np.int64)
 
 
 def _validate_inner_splits(
@@ -751,15 +813,18 @@ def _validate_inner_splits(
     normalized: list[tuple[np.ndarray, np.ndarray]] = []
     groups = frame["group_id"].astype(str).to_numpy()
     for raw_train, raw_valid in splits:
-        train_index = np.asarray(raw_train, dtype=np.int64)
-        valid_index = np.asarray(raw_valid, dtype=np.int64)
+        train_index = _normalize_inner_index(
+            raw_train, name="train", row_count=len(frame)
+        )
+        valid_index = _normalize_inner_index(
+            raw_valid, name="validation", row_count=len(frame)
+        )
         if (
-            train_index.ndim != 1
-            or valid_index.ndim != 1
-            or not len(train_index)
-            or not len(valid_index)
-            or np.intersect1d(train_index, valid_index).size
-            or np.union1d(train_index, valid_index).size != len(frame)
+            np.intersect1d(train_index, valid_index).size
+            or not np.array_equal(
+                np.sort(np.concatenate((train_index, valid_index))),
+                np.arange(len(frame), dtype=np.int64),
+            )
         ):
             raise ValueError("each inner split must be a disjoint complete partition")
         validate_group_split(groups[train_index], groups[valid_index])
@@ -1519,6 +1584,23 @@ def _persist_stage(
             json.dumps(metadata, sort_keys=True, separators=(",", ":"))
         ),
     )
+    checkpoint_payload = _validate_checkpoint(
+        checkpoint,
+        stage=stage,
+        fingerprint=fingerprint,
+        fold=fold,
+        seed=seed,
+    )
+    persisted_metadata = _artifact_metadata(
+        fingerprint=fingerprint,
+        fold=fold,
+        seed=seed,
+        stage=stage,
+        best_epochs=checkpoint_payload["best_epochs"],
+        refit_epochs=checkpoint_payload["refit_epochs"],
+    )
+    _validate_history(history_path, stage, persisted_metadata)
+    _validate_scalers(scaler_path, stage, persisted_metadata)
     completed.append(stage)
     _atomic_write_json(
         fold_dir / "state.json",
@@ -1820,15 +1902,13 @@ def _validate_protocol(
     return train_index, test_index
 
 
-def _load_completed_fold(
+def _load_and_validate_persisted_oof(
     fold_dir: Path,
-    fingerprint: RunFingerprint,
+    marker: dict[str, Any],
     fold: int,
     seed: int,
     expected_frame: pd.DataFrame,
-) -> FoldArtifacts:
-    marker = json.loads((fold_dir / "complete.json").read_text(encoding="utf-8"))
-    _validate_completed_artifacts(fold_dir, marker, fingerprint, fold, seed)
+) -> pd.DataFrame:
     predictions_path = fold_dir / "oof_predictions.csv"
     if (
         not predictions_path.is_file()
@@ -1851,6 +1931,21 @@ def _load_completed_fold(
         predictions[column] = pd.to_numeric(
             predictions[column], errors="raise"
         ).astype(np.float64)
+    return predictions
+
+
+def _load_completed_fold(
+    fold_dir: Path,
+    fingerprint: RunFingerprint,
+    fold: int,
+    seed: int,
+    expected_frame: pd.DataFrame,
+) -> FoldArtifacts:
+    marker = json.loads((fold_dir / "complete.json").read_text(encoding="utf-8"))
+    _validate_completed_artifacts(fold_dir, marker, fingerprint, fold, seed)
+    predictions = _load_and_validate_persisted_oof(
+        fold_dir, marker, fold, seed, expected_frame
+    )
     checkpoints = {stage: _stage_paths(fold_dir, stage)[0] for stage in MODEL_SEQUENCE}
     histories = {stage: _stage_paths(fold_dir, stage)[1] for stage in MODEL_SEQUENCE}
     if not all(path.is_file() for path in (*checkpoints.values(), *histories.values())):
@@ -2345,6 +2440,19 @@ def run_phase_a_fold(
         relative: _sha256_file(path)
         for relative, path in _expected_artifact_paths(fold_dir).items()
     }
+    # Treat completion as a commit boundary: validate the exact persisted
+    # candidate with the same deep checks used by resume before publishing the
+    # atomic marker that makes the fold reusable.
+    _validate_completed_artifacts(fold_dir, marker, fingerprint, fold, seed)
+    _load_and_validate_persisted_oof(
+        fold_dir,
+        marker,
+        fold,
+        seed,
+        outer_label_frame.loc[
+            :, ["sample_id", "group_id", "version", "sample_weight", "ra_mean"]
+        ],
+    )
     _atomic_write_json(marker_path, marker)
     _atomic_write_json(
         fold_dir / "state.json",

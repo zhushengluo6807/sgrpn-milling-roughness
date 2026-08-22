@@ -443,6 +443,86 @@ def test_public_selection_rejects_invalid_splits_before_dataset_side_effects(kin
     assert factory.calls == 0
 
 
+@pytest.mark.parametrize(
+    "kind",
+    ["fractional", "boolean", "negative", "out_of_range", "duplicate_train", "duplicate_valid"],
+)
+def test_public_selection_rejects_raw_invalid_indices_without_side_effects(kind):
+    frame = pd.DataFrame(
+        {"sample_id": [f"s{i}" for i in range(8)], "group_id": [f"g{i}" for i in range(8)]}
+    )
+    splits = [
+        (train.copy(), valid.copy())
+        for train, valid in make_group_inner_splits(frame, n_splits=4, seed=20260723)
+    ]
+    train, valid = splits[0]
+    if kind == "fractional":
+        train = train.astype(np.float64)
+        train[0] = 0.75
+    elif kind == "boolean":
+        train = train.astype(object)
+        train[0] = True
+    elif kind == "negative":
+        train[0] = -1
+    elif kind == "out_of_range":
+        valid[0] = len(frame)
+    elif kind == "duplicate_train":
+        train = np.append(train, train[0])
+    else:
+        valid = np.append(valid, valid[0])
+    splits[0] = (train, valid)
+    factory = _AuditedFactory(frame)
+
+    with pytest.raises(ValueError, match="index|indices|integral|bounds|unique|partition"):
+        select_epochs_group_cv(
+            lambda _fold: nn.Linear(1, 1), factory, splits, lambda *_args: 1, None
+        )
+    assert factory.calls == 0
+
+
+def test_public_callbacks_cannot_substitute_the_seeded_fresh_model():
+    frame = pd.DataFrame(
+        {"sample_id": [f"s{i}" for i in range(8)], "group_id": [f"g{i}" for i in range(8)]}
+    )
+    splits = make_group_inner_splits(frame, n_splits=4, seed=20260723)
+    datasets = _AuditedFactory(frame)
+    substitute = nn.Linear(1, 1)
+
+    with pytest.raises(ValueError, match="model|substitut|exact|identity"):
+        select_epochs_group_cv(
+            lambda _fold: nn.Linear(1, 1),
+            datasets,
+            splits,
+            lambda *_args: TrainingResult(
+                substitute,
+                1,
+                pd.DataFrame([{"epoch": 1, "train_loss": 0.0, "validation_loss": 0.0}]),
+            ),
+            None,
+        )
+
+    selection = EpochSelection((1, 1, 1, 1))
+
+    class RefitFactory:
+        audit_frame = frame
+
+        def __call__(self):
+            ids = tuple(frame["sample_id"])
+            return ComponentRefitData("all", ids, ids)
+
+    with pytest.raises(ValueError, match="model|substitut|exact|identity"):
+        refit_component(
+            lambda: nn.Linear(1, 1),
+            RefitFactory(),
+            selection,
+            lambda *_args: TrainingResult(
+                substitute,
+                1,
+                pd.DataFrame([{"epoch": 1, "train_loss": 0.0, "validation_loss": 0.0}]),
+            ),
+        )
+
+
 def test_public_refit_requires_fresh_full_outer_train_scaler_boundary():
     frame = pd.DataFrame(
         {"sample_id": [f"s{i}" for i in range(8)], "group_id": [f"g{i}" for i in range(8)]}
@@ -715,6 +795,50 @@ def test_fold_checkpoint_is_atomic_and_exact_completed_fold_is_reused(tmp_path: 
             backend=FailIfCalled(),
             output_root=config.output_dir,
         )
+
+
+def test_formal_backend_cannot_substitute_model_and_never_marks_complete(tmp_path: Path):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+
+    class SubstitutingBackend(RecordingBackend):
+        def fit(self, **kwargs):
+            result = super().fit(**kwargs)
+            return TrainingResult(nn.Linear(1, 1), result.best_epoch, result.history)
+
+    with pytest.raises(ValueError, match="model|substitut|exact|identity"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu",
+            backend=SubstitutingBackend(), output_root=config.output_dir,
+        )
+    assert not (
+        config.output_dir / "folds" / "fold_0" / "seed_20260723" / "complete.json"
+    ).exists()
+
+
+@pytest.mark.parametrize("malformation", ["fractional", "inconsistent"])
+def test_malformed_backend_history_fails_before_completion_marker(
+    tmp_path: Path, malformation: str
+):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+
+    class MalformedHistoryBackend(RecordingBackend):
+        def fit(self, **kwargs):
+            result = super().fit(**kwargs)
+            history = result.history.copy()
+            if malformation == "fractional":
+                history["epoch"] = 0.75
+            else:
+                history["epoch"] = result.best_epoch + 1
+            return TrainingResult(result.model, result.best_epoch, history)
+
+    with pytest.raises(ValueError, match="history|epoch|integral|inconsistent"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu",
+            backend=MalformedHistoryBackend(), output_root=config.output_dir,
+        )
+    assert not (
+        config.output_dir / "folds" / "fold_0" / "seed_20260723" / "complete.json"
+    ).exists()
 
 
 def test_resume_deeply_validates_all_stage_artifacts(tmp_path: Path):
