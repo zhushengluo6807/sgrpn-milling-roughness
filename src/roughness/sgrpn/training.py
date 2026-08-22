@@ -24,6 +24,7 @@ from roughness.scheme1.crossfit import make_group_inner_splits
 
 from .config import SGRPNConfig
 from .crossfit import (
+    ProcessOOFResult,
     ProcessScaler,
     ValidationAwareTrainer,
     fit_process_scaler,
@@ -58,6 +59,9 @@ OOF_COLUMNS = (
     "sample_id", "group_id", "version", "fold", "seed", "model",
     "target", "prediction", "sample_weight", "process_mean", "residual", "gate",
 )
+_PROJECT_PHASE_A_OUTPUT = (
+    Path(__file__).resolve().parents[3] / "outputs" / "sgrpn" / "phase_a"
+).resolve()
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,22 @@ class FoldArtifacts:
 
 class TrainingBackend(Protocol):
     def fit(self, **kwargs: Any) -> TrainingResult: ...
+
+
+@dataclass(frozen=True)
+class ComponentFoldData:
+    train_data: Any
+    validation_data: Any
+    train_sample_ids: Sequence[str]
+    validation_sample_ids: Sequence[str]
+    scaler_source_ids: Sequence[str]
+
+
+@dataclass(frozen=True)
+class ComponentRefitData:
+    train_data: Any
+    sample_ids: Sequence[str]
+    scaler_source_ids: Sequence[str]
 
 
 def _jsonable(value: Any) -> Any:
@@ -140,15 +160,20 @@ def build_run_fingerprint(
     config_sha = _sha256_bytes(
         json.dumps(_jsonable(asdict(config)), sort_keys=True, ensure_ascii=False).encode("utf-8")
     )
-    manifest_sha = (
+    # Scientific identity follows the canonical in-memory frames actually
+    # consumed. Source bytes are bound separately as provenance, never used as
+    # a substitute for the consumed state.
+    manifest_sha = _frame_sha256(bundle.manifest)
+    folds_sha = _frame_sha256(bundle.folds)
+    manifest_source_sha = (
         _sha256_file(Path(config.manifest_path))
         if Path(config.manifest_path).is_file()
-        else _frame_sha256(bundle.manifest)
+        else None
     )
-    folds_sha = (
+    folds_source_sha = (
         _sha256_file(Path(config.folds_path))
         if Path(config.folds_path).is_file()
-        else _frame_sha256(bundle.folds)
+        else None
     )
     cache_sha = _cache_sha256(cache)
     value = _sha256_bytes(
@@ -158,6 +183,8 @@ def build_run_fingerprint(
                 "config": config_sha,
                 "manifest": manifest_sha,
                 "folds": folds_sha,
+                "manifest_source": manifest_source_sha,
+                "folds_source": folds_source_sha,
                 "cache": cache_sha,
             },
             sort_keys=True,
@@ -234,7 +261,7 @@ def set_global_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.use_deterministic_algorithms(True, warn_only=False)
 
 
 def _device(value: str | torch.device | None) -> torch.device:
@@ -415,30 +442,35 @@ def select_epochs_group_cv(
     train_step: Callable[..., TrainingResult | int],
     validation_step: Callable[..., Any] | None,
 ) -> EpochSelection:
-    """Select a component epoch count on four preflighted group folds.
-
-    ``dataset_factory`` receives train index, validation index, and fold number;
-    it owns scaler fitting so the only IDs it may use are the supplied train IDs.
-    The compact callback form keeps injected tests on the production path.
-    """
-    if len(inner_splits) != 4:
-        raise ValueError("Phase A requires exactly four inner splits")
+    """Own split preflight and audited scaler boundaries for four group folds."""
+    frame = getattr(dataset_factory, "audit_frame", None)
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError("dataset_factory must expose an audit_frame DataFrame")
+    splits = _validate_inner_splits(frame, inner_splits)
+    if "sample_id" not in frame or frame["sample_id"].isna().any():
+        raise ValueError("audit_frame must contain non-missing sample_id")
+    sample_ids = frame["sample_id"].astype(str).to_numpy()
     epochs: list[int] = []
-    for fold_number, (raw_train, raw_valid) in enumerate(inner_splits):
-        train_index = np.asarray(raw_train, dtype=np.int64)
-        valid_index = np.asarray(raw_valid, dtype=np.int64)
-        if train_index.ndim != 1 or valid_index.ndim != 1:
-            raise ValueError("inner split indices must be one-dimensional")
-        if not len(train_index) or not len(valid_index):
-            raise ValueError("inner train and validation indices must not be empty")
-        if np.intersect1d(train_index, valid_index).size:
-            raise ValueError("inner train and validation indices overlap")
-        train_data, valid_data = _factory_call(
+    for fold_number, (train_index, valid_index) in enumerate(splits):
+        fold_data = _factory_call(
             dataset_factory, train_index, valid_index, fold_number
         )
+        if not isinstance(fold_data, ComponentFoldData):
+            raise ValueError("dataset_factory must return ComponentFoldData")
+        expected_train = tuple(sample_ids[train_index])
+        expected_valid = tuple(sample_ids[valid_index])
+        if (
+            tuple(map(str, fold_data.train_sample_ids)) != expected_train
+            or tuple(map(str, fold_data.validation_sample_ids)) != expected_valid
+            or tuple(map(str, fold_data.scaler_source_ids)) != expected_train
+            or len(set(map(str, fold_data.scaler_source_ids))) != len(expected_train)
+        ):
+            raise ValueError("dataset/scaler source IDs must exactly match the inner-train boundary")
         model = _factory_call(component_factory, fold_number)
+        if not isinstance(model, nn.Module):
+            raise ValueError("component_factory must return a fresh nn.Module")
         result = _factory_call(
-            train_step, model, train_data, valid_data, validation_step, fold_number
+            train_step, model, fold_data, validation_step, fold_number
         )
         epoch = result.best_epoch if isinstance(result, TrainingResult) else result
         if isinstance(epoch, (bool, np.bool_)) or not isinstance(epoch, (int, np.integer)) or int(epoch) < 1:
@@ -454,9 +486,25 @@ def refit_component(
     train_step: Callable[..., TrainingResult | nn.Module],
 ) -> nn.Module:
     """Train a fresh component on complete outer-train data for median epochs."""
+    frame = getattr(dataset_factory, "audit_frame", None)
+    if not isinstance(frame, pd.DataFrame) or "sample_id" not in frame:
+        raise ValueError("dataset_factory must expose an audit_frame with sample_id")
+    expected_ids = tuple(frame["sample_id"].astype(str))
+    payload = _factory_call(dataset_factory)
+    if not isinstance(payload, ComponentRefitData):
+        raise ValueError("refit dataset_factory must return ComponentRefitData")
+    if (
+        tuple(map(str, payload.sample_ids)) != expected_ids
+        or tuple(map(str, payload.scaler_source_ids)) != expected_ids
+        or len(set(map(str, payload.scaler_source_ids))) != len(expected_ids)
+    ):
+        raise ValueError("refit data and fresh scaler must use every outer-train row exactly once")
     model = _factory_call(component_factory)
-    dataset = _factory_call(dataset_factory)
-    result = _factory_call(train_step, model, dataset, epoch_selection.refit_epochs)
+    if not isinstance(model, nn.Module):
+        raise ValueError("component_factory must return a fresh nn.Module")
+    result = _factory_call(
+        train_step, model, payload.train_data, epoch_selection.refit_epochs
+    )
     if isinstance(result, TrainingResult):
         return result.model
     if isinstance(result, nn.Module):
@@ -522,6 +570,16 @@ class _SignalFit:
     process_scaler: ProcessScaler
     spectrum_scaler: SpectrumScaler
     quality_scaler: QualityScaler
+    history: pd.DataFrame
+
+
+@dataclass
+class _P1Fit:
+    oof: ProcessOOFResult
+    selection: EpochSelection
+    inner_models: list[ProcessMLP]
+    model: ProcessMLP
+    scaler: ProcessScaler
     history: pd.DataFrame
 
 
@@ -634,6 +692,132 @@ def _assert_experts_unchanged(
         raise RuntimeError("G1 training changed a frozen expert state tensor")
 
 
+def _fit_p1_subset(
+    *,
+    config: SGRPNConfig,
+    frame: pd.DataFrame,
+    features: np.ndarray,
+    inner_splits: Sequence[tuple[np.ndarray, np.ndarray]],
+    backend: TrainingBackend,
+    device: torch.device,
+    seed: int,
+    batch_size: int,
+) -> _P1Fit:
+    """Cross-fit and refit P1 using only the supplied group-confined frame."""
+    splits = _validate_inner_splits(frame, inner_splits)
+    inner_models: list[ProcessMLP] = []
+    histories: list[pd.DataFrame] = []
+    call_number = 0
+
+    def callback(
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        w_train: np.ndarray,
+        x_valid: np.ndarray,
+        train_groups: np.ndarray,
+        valid_groups: np.ndarray,
+        *,
+        y_valid: np.ndarray,
+        w_valid: np.ndarray,
+    ) -> tuple[np.ndarray, int]:
+        nonlocal call_number
+        train_rows, valid_rows = splits[call_number]
+        train_frame = frame.iloc[train_rows].copy()
+        valid_frame = frame.iloc[valid_rows].copy()
+        if not np.array_equal(train_frame["group_id"].astype(str), train_groups.astype(str)):
+            raise ValueError("P1 inner train group order is incompatible")
+        if not np.array_equal(valid_frame["group_id"].astype(str), valid_groups.astype(str)):
+            raise ValueError("P1 inner validation group order is incompatible")
+        train_frame.loc[:, "sample_weight"] = w_train
+        valid_frame.loc[:, "sample_weight"] = w_valid
+        result = _fit_backend(
+            backend,
+            stage="P1",
+            model=ProcessMLP(),
+            train_loader=_loader(
+                _ProcessDataset(train_frame, x_train, y_train),
+                batch_size=batch_size, shuffle=True, seed=seed,
+            ),
+            validation_loader=_loader(
+                _ProcessDataset(valid_frame, x_valid, y_valid),
+                batch_size=batch_size, shuffle=False, seed=seed,
+            ),
+            max_epochs=config.max_epochs,
+            config=config,
+            device=device,
+            seed=seed,
+        )
+        result.model.to(device).eval()
+        with torch.no_grad():
+            prediction = result.model(
+                torch.as_tensor(x_valid, dtype=torch.float32, device=device)
+            ).detach().cpu().numpy()
+        inner_models.append(result.model)
+        history = result.history.copy()
+        history.insert(0, "inner_fold", call_number)
+        history.insert(0, "phase", "selection")
+        histories.append(history)
+        call_number += 1
+        return prediction.astype(np.float64, copy=False), result.best_epoch
+
+    oof = generate_process_oof(
+        frame,
+        features,
+        ValidationAwareTrainer(callback),
+        feature_sample_ids=frame["sample_id"].astype(str).to_numpy(),
+        n_splits=4,
+        seed=seed,
+    )
+    selection = EpochSelection(tuple(oof.best_epochs))
+    all_rows = np.arange(len(frame), dtype=np.int64)
+    scaler = fit_process_scaler(features, all_rows)
+    refit = _fit_backend(
+        backend,
+        stage="P1",
+        model=ProcessMLP(),
+        train_loader=_loader(
+            _ProcessDataset(
+                frame, scaler.transform(features),
+                frame["ra_mean"].to_numpy(dtype=np.float64, copy=True),
+            ),
+            batch_size=batch_size, shuffle=True, seed=seed,
+        ),
+        validation_loader=None,
+        max_epochs=selection.refit_epochs,
+        config=config,
+        device=device,
+        seed=seed,
+    )
+    refit_history = refit.history.copy()
+    refit_history.insert(0, "inner_fold", -1)
+    refit_history.insert(0, "phase", "refit")
+    histories.append(refit_history)
+    return _P1Fit(
+        oof=oof,
+        selection=selection,
+        inner_models=inner_models,
+        model=refit.model,
+        scaler=scaler,
+        history=pd.concat(histories, ignore_index=True),
+    )
+
+
+def _process_prediction_array(
+    model: nn.Module,
+    scaler: ProcessScaler,
+    features: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
+    model.to(device).eval()
+    with torch.no_grad():
+        values = model(
+            torch.as_tensor(scaler.transform(features), dtype=torch.float32, device=device)
+        ).detach().cpu().numpy().astype(np.float64, copy=False)
+    if values.shape != (len(features),) or not np.isfinite(values).all():
+        raise ValueError("P1 subset prediction must be a finite vector")
+    return values
+
+
 def _fit_signal_stage(
     *,
     stage: str,
@@ -653,23 +837,37 @@ def _fit_signal_stage(
     process_scalers: list[ProcessScaler] = []
     spectrum_scalers: list[SpectrumScaler] = []
     quality_scalers: list[QualityScaler] = []
-    epochs: list[int] = []
     histories: list[pd.DataFrame] = []
     sample_ids = frame["sample_id"].astype(str).to_numpy()
-    for fold_number, (train_index, valid_index) in enumerate(inner_splits):
-        train_ids = sample_ids[train_index].tolist()
-        process_scaler = fit_process_scaler(features, train_index)
-        spectrum_scaler = fit_spectrum_scaler(cache, train_ids)
-        quality_scaler = fit_quality_scaler(cache, train_ids)
-        train_data = _signal_dataset(
-            frame.iloc[train_index], cache, spectrum_scaler, quality_scaler,
-            process_scaler.transform(features[train_index]), targets[train_index], augment=True,
-        )
-        valid_data = _signal_dataset(
-            frame.iloc[valid_index], cache, spectrum_scaler, quality_scaler,
-            process_scaler.transform(features[valid_index]), targets[valid_index], augment=False,
-        )
-        model = model_factory(fold_number)
+
+    class SelectionDatasets:
+        audit_frame = frame
+
+        def __call__(self, train_index, valid_index, fold_number):
+            train_ids = sample_ids[train_index].tolist()
+            process_scaler = fit_process_scaler(features, train_index)
+            spectrum_scaler = fit_spectrum_scaler(cache, train_ids)
+            quality_scaler = fit_quality_scaler(cache, train_ids)
+            process_scalers.append(process_scaler)
+            spectrum_scalers.append(spectrum_scaler)
+            quality_scalers.append(quality_scaler)
+            return ComponentFoldData(
+                train_data=_signal_dataset(
+                    frame.iloc[train_index], cache, spectrum_scaler, quality_scaler,
+                    process_scaler.transform(features[train_index]), targets[train_index],
+                    augment=True,
+                ),
+                validation_data=_signal_dataset(
+                    frame.iloc[valid_index], cache, spectrum_scaler, quality_scaler,
+                    process_scaler.transform(features[valid_index]), targets[valid_index],
+                    augment=False,
+                ),
+                train_sample_ids=tuple(sample_ids[train_index]),
+                validation_sample_ids=tuple(sample_ids[valid_index]),
+                scaler_source_ids=tuple(train_ids),
+            )
+
+    def selection_step(model, fold_data, _validation_step, fold_number):
         before = None
         if stage == "G1":
             if not isinstance(model, SelectiveGatedModel):
@@ -677,82 +875,314 @@ def _fit_signal_stage(
             model.freeze_experts()
             before = _expert_state(model)
         result = _fit_backend(
-            backend,
-            stage=stage,
-            model=model,
+            backend, stage=stage, model=model,
             train_loader=_loader(
-                train_data, batch_size=batch_size, shuffle=True,
+                fold_data.train_data, batch_size=batch_size, shuffle=True,
                 seed=seed, order_bags=True,
             ),
             validation_loader=_loader(
-                valid_data, batch_size=batch_size, shuffle=False,
+                fold_data.validation_data, batch_size=batch_size, shuffle=False,
                 seed=seed, order_bags=True,
             ),
-            max_epochs=config.max_epochs,
-            config=config,
-            device=device,
-            seed=seed,
+            max_epochs=config.max_epochs, config=config, device=device, seed=seed,
         )
         if before is not None:
             _assert_experts_unchanged(before, result.model)
         inner_models.append(result.model)
-        process_scalers.append(process_scaler)
-        spectrum_scalers.append(spectrum_scaler)
-        quality_scalers.append(quality_scaler)
-        epochs.append(result.best_epoch)
         history = result.history.copy()
         history.insert(0, "inner_fold", fold_number)
         history.insert(0, "phase", "selection")
         histories.append(history)
+        return result
 
-    selection = EpochSelection(tuple(epochs))
-    all_index = np.arange(len(frame), dtype=np.int64)
-    all_ids = sample_ids.tolist()
-    process_scaler = fit_process_scaler(features, all_index)
-    spectrum_scaler = fit_spectrum_scaler(cache, all_ids)
-    quality_scaler = fit_quality_scaler(cache, all_ids)
-    refit_data = _signal_dataset(
-        frame, cache, spectrum_scaler, quality_scaler,
-        process_scaler.transform(features), targets, augment=True,
+    selection = select_epochs_group_cv(
+        lambda fold_number: model_factory(fold_number),
+        SelectionDatasets(), inner_splits, selection_step, None,
     )
-    refit_model = model_factory(None)
-    before = None
-    if stage == "G1":
-        if not isinstance(refit_model, SelectiveGatedModel):
-            raise ValueError("G1 factory must return SelectiveGatedModel")
-        refit_model.freeze_experts()
-        before = _expert_state(refit_model)
-    refit = _fit_backend(
-        backend,
-        stage=stage,
-        model=refit_model,
-        train_loader=_loader(
-            refit_data, batch_size=batch_size, shuffle=True,
-            seed=seed, order_bags=True,
-        ),
-        validation_loader=None,
-        max_epochs=selection.refit_epochs,
-        config=config,
-        device=device,
-        seed=seed,
+
+    class RefitDataset:
+        audit_frame = frame
+
+        def __init__(self):
+            self.process_scaler: ProcessScaler | None = None
+            self.spectrum_scaler: SpectrumScaler | None = None
+            self.quality_scaler: QualityScaler | None = None
+
+        def __call__(self):
+            all_index = np.arange(len(frame), dtype=np.int64)
+            all_ids = sample_ids.tolist()
+            self.process_scaler = fit_process_scaler(features, all_index)
+            self.spectrum_scaler = fit_spectrum_scaler(cache, all_ids)
+            self.quality_scaler = fit_quality_scaler(cache, all_ids)
+            data = _signal_dataset(
+                frame, cache, self.spectrum_scaler, self.quality_scaler,
+                self.process_scaler.transform(features), targets, augment=True,
+            )
+            return ComponentRefitData(data, tuple(all_ids), tuple(all_ids))
+
+    refit_dataset = RefitDataset()
+    refit_results: list[TrainingResult] = []
+
+    def refit_step(model, dataset, epochs):
+        before = None
+        if stage == "G1":
+            if not isinstance(model, SelectiveGatedModel):
+                raise ValueError("G1 factory must return SelectiveGatedModel")
+            model.freeze_experts()
+            before = _expert_state(model)
+        result = _fit_backend(
+            backend, stage=stage, model=model,
+            train_loader=_loader(
+                dataset, batch_size=batch_size, shuffle=True, seed=seed,
+                order_bags=True,
+            ),
+            validation_loader=None, max_epochs=epochs, config=config,
+            device=device, seed=seed,
+        )
+        if before is not None:
+            _assert_experts_unchanged(before, result.model)
+        refit_results.append(result)
+        return result
+
+    refit_model = refit_component(
+        lambda: model_factory(None), refit_dataset, selection, refit_step
     )
-    if before is not None:
-        _assert_experts_unchanged(before, refit.model)
-    refit_history = refit.history.copy()
-    refit_history.insert(0, "inner_fold", -1)
-    refit_history.insert(0, "phase", "refit")
-    histories.append(refit_history)
+    refit = refit_results[0]
+    history = refit.history.copy()
+    history.insert(0, "inner_fold", -1)
+    history.insert(0, "phase", "refit")
+    histories.append(history)
+    if (
+        refit_dataset.process_scaler is None
+        or refit_dataset.spectrum_scaler is None
+        or refit_dataset.quality_scaler is None
+    ):
+        raise RuntimeError("refit scaler factory did not produce complete scalers")
     return _SignalFit(
         selection=selection,
         inner_models=inner_models,
         inner_process_scalers=process_scalers,
         inner_spectrum_scalers=spectrum_scalers,
         inner_quality_scalers=quality_scalers,
-        model=refit.model,
-        process_scaler=process_scaler,
-        spectrum_scaler=spectrum_scaler,
-        quality_scaler=quality_scaler,
+        model=refit_model,
+        process_scaler=refit_dataset.process_scaler,
+        spectrum_scaler=refit_dataset.spectrum_scaler,
+        quality_scaler=refit_dataset.quality_scaler,
         history=pd.concat(histories, ignore_index=True),
+    )
+
+
+def _fit_r1_nested_stage(
+    *,
+    config: SGRPNConfig,
+    frame: pd.DataFrame,
+    cache: OrderSpectrumCache,
+    features: np.ndarray,
+    outer_p1_oof: ProcessOOFResult,
+    inner_splits: Sequence[tuple[np.ndarray, np.ndarray]],
+    backend: TrainingBackend,
+    device: torch.device,
+    seed: int,
+    batch_size: int,
+) -> _SignalFit:
+    """Select R1 with fold-confined P1 residual targets, then refit outer-train."""
+    epochs: list[int] = []
+    histories: list[pd.DataFrame] = []
+    inner_models: list[nn.Module] = []
+    process_scalers: list[ProcessScaler] = []
+    spectrum_scalers: list[SpectrumScaler] = []
+    quality_scalers: list[QualityScaler] = []
+    target = frame["ra_mean"].to_numpy(dtype=np.float64, copy=True)
+    for fold_number, (train_index, valid_index) in enumerate(inner_splits):
+        subset = frame.iloc[train_index].reset_index(drop=True).copy()
+        subset_features = features[train_index]
+        subset_splits = _validate_inner_splits(
+            subset,
+            make_group_inner_splits(subset, n_splits=4, seed=seed),
+        )
+        p1_subset = _fit_p1_subset(
+            config=config, frame=subset, features=subset_features,
+            inner_splits=subset_splits, backend=backend, device=device,
+            seed=seed, batch_size=batch_size,
+        )
+        valid_residual = target[valid_index] - _process_prediction_array(
+            p1_subset.model, p1_subset.scaler, features[valid_index], device
+        )
+        train_ids = subset["sample_id"].astype(str).tolist()
+        spectrum_scaler = fit_spectrum_scaler(cache, train_ids)
+        quality_scaler = fit_quality_scaler(cache, train_ids)
+        train_data = _signal_dataset(
+            subset, cache, spectrum_scaler, quality_scaler,
+            p1_subset.scaler.transform(subset_features), p1_subset.oof.residual,
+            augment=True,
+        )
+        valid_data = _signal_dataset(
+            frame.iloc[valid_index], cache, spectrum_scaler, quality_scaler,
+            p1_subset.scaler.transform(features[valid_index]), valid_residual,
+            augment=False,
+        )
+        result = _fit_backend(
+            backend, stage="R1", model=ResidualExpert(),
+            train_loader=_loader(
+                train_data, batch_size=batch_size, shuffle=True, seed=seed,
+                order_bags=True,
+            ),
+            validation_loader=_loader(
+                valid_data, batch_size=batch_size, shuffle=False, seed=seed,
+                order_bags=True,
+            ),
+            max_epochs=config.max_epochs, config=config, device=device, seed=seed,
+        )
+        epochs.append(result.best_epoch)
+        inner_models.append(result.model)
+        process_scalers.append(p1_subset.scaler)
+        spectrum_scalers.append(spectrum_scaler)
+        quality_scalers.append(quality_scaler)
+        history = result.history.copy()
+        history.insert(0, "inner_fold", fold_number)
+        history.insert(0, "phase", "selection")
+        histories.append(history)
+
+    selection = EpochSelection(tuple(epochs))
+    all_rows = np.arange(len(frame), dtype=np.int64)
+    process_scaler = fit_process_scaler(features, all_rows)
+    all_ids = frame["sample_id"].astype(str).tolist()
+    spectrum_scaler = fit_spectrum_scaler(cache, all_ids)
+    quality_scaler = fit_quality_scaler(cache, all_ids)
+    refit_data = _signal_dataset(
+        frame, cache, spectrum_scaler, quality_scaler,
+        process_scaler.transform(features), outer_p1_oof.residual, augment=True,
+    )
+    refit = _fit_backend(
+        backend, stage="R1", model=ResidualExpert(),
+        train_loader=_loader(
+            refit_data, batch_size=batch_size, shuffle=True, seed=seed,
+            order_bags=True,
+        ),
+        validation_loader=None, max_epochs=selection.refit_epochs,
+        config=config, device=device, seed=seed,
+    )
+    refit_history = refit.history.copy()
+    refit_history.insert(0, "inner_fold", -1)
+    refit_history.insert(0, "phase", "refit")
+    histories.append(refit_history)
+    return _SignalFit(
+        selection, inner_models, process_scalers, spectrum_scalers,
+        quality_scalers, refit.model, process_scaler, spectrum_scaler,
+        quality_scaler, pd.concat(histories, ignore_index=True),
+    )
+
+
+def _fit_g1_nested_stage(
+    *,
+    config: SGRPNConfig,
+    frame: pd.DataFrame,
+    cache: OrderSpectrumCache,
+    features: np.ndarray,
+    inner_splits: Sequence[tuple[np.ndarray, np.ndarray]],
+    outer_p1: _P1Fit,
+    outer_r1: _SignalFit,
+    backend: TrainingBackend,
+    device: torch.device,
+    seed: int,
+    batch_size: int,
+) -> _SignalFit:
+    """Select gates with upstream experts rebuilt entirely without fold k."""
+    target = frame["ra_mean"].to_numpy(dtype=np.float64, copy=True)
+    epochs: list[int] = []
+    histories: list[pd.DataFrame] = []
+    inner_models: list[nn.Module] = []
+    process_scalers: list[ProcessScaler] = []
+    spectrum_scalers: list[SpectrumScaler] = []
+    quality_scalers: list[QualityScaler] = []
+    for fold_number, (train_index, valid_index) in enumerate(inner_splits):
+        subset = frame.iloc[train_index].reset_index(drop=True).copy()
+        subset_features = features[train_index]
+        subset_target = target[train_index]
+        subset_splits = _validate_inner_splits(
+            subset,
+            make_group_inner_splits(subset, n_splits=4, seed=seed),
+        )
+        p1_subset = _fit_p1_subset(
+            config=config, frame=subset, features=subset_features,
+            inner_splits=subset_splits, backend=backend, device=device,
+            seed=seed, batch_size=batch_size,
+        )
+        residual_subset = _fit_signal_stage(
+            stage="R1", config=config, frame=subset, cache=cache,
+            features=subset_features, targets=p1_subset.oof.residual,
+            inner_splits=subset_splits, model_factory=lambda _fold: ResidualExpert(),
+            backend=backend, device=device, seed=seed, batch_size=batch_size,
+        )
+        model = SelectiveGatedModel(
+            deepcopy(p1_subset.model).cpu(), deepcopy(residual_subset.model).cpu()
+        )
+        model.freeze_experts()
+        before = _expert_state(model)
+        train_data = _signal_dataset(
+            subset, cache, residual_subset.spectrum_scaler,
+            residual_subset.quality_scaler,
+            p1_subset.scaler.transform(subset_features), subset_target,
+            augment=True,
+        )
+        valid_data = _signal_dataset(
+            frame.iloc[valid_index], cache, residual_subset.spectrum_scaler,
+            residual_subset.quality_scaler,
+            p1_subset.scaler.transform(features[valid_index]), target[valid_index],
+            augment=False,
+        )
+        result = _fit_backend(
+            backend, stage="G1", model=model,
+            train_loader=_loader(
+                train_data, batch_size=batch_size, shuffle=True, seed=seed,
+                order_bags=True,
+            ),
+            validation_loader=_loader(
+                valid_data, batch_size=batch_size, shuffle=False, seed=seed,
+                order_bags=True,
+            ),
+            max_epochs=config.max_epochs, config=config, device=device, seed=seed,
+        )
+        _assert_experts_unchanged(before, result.model)
+        epochs.append(result.best_epoch)
+        inner_models.append(result.model)
+        process_scalers.append(p1_subset.scaler)
+        spectrum_scalers.append(residual_subset.spectrum_scaler)
+        quality_scalers.append(residual_subset.quality_scaler)
+        history = result.history.copy()
+        history.insert(0, "inner_fold", fold_number)
+        history.insert(0, "phase", "selection")
+        histories.append(history)
+
+    selection = EpochSelection(tuple(epochs))
+    model = SelectiveGatedModel(
+        deepcopy(outer_p1.model).cpu(), deepcopy(outer_r1.model).cpu()
+    )
+    model.freeze_experts()
+    before = _expert_state(model)
+    refit_data = _signal_dataset(
+        frame, cache, outer_r1.spectrum_scaler, outer_r1.quality_scaler,
+        outer_p1.scaler.transform(features), target, augment=True,
+    )
+    refit = _fit_backend(
+        backend, stage="G1", model=model,
+        train_loader=_loader(
+            refit_data, batch_size=batch_size, shuffle=True, seed=seed,
+            order_bags=True,
+        ),
+        validation_loader=None, max_epochs=selection.refit_epochs,
+        config=config, device=device, seed=seed,
+    )
+    _assert_experts_unchanged(before, refit.model)
+    refit_history = refit.history.copy()
+    refit_history.insert(0, "inner_fold", -1)
+    refit_history.insert(0, "phase", "refit")
+    histories.append(refit_history)
+    return _SignalFit(
+        selection, inner_models, process_scalers, spectrum_scalers,
+        quality_scalers, refit.model, outer_p1.scaler,
+        outer_r1.spectrum_scaler, outer_r1.quality_scaler,
+        pd.concat(histories, ignore_index=True),
     )
 
 
@@ -972,17 +1402,83 @@ def _prediction_frame(
                 }
             )
     predictions = pd.DataFrame.from_records(rows, columns=OOF_COLUMNS)
-    if (
-        len(predictions) != len(frame) * len(MODEL_SEQUENCE)
-        or predictions.duplicated(["sample_id", "model"]).any()
-        or set(predictions["model"]) != set(MODEL_SEQUENCE)
-        or not np.isfinite(predictions[["target", "prediction", "sample_weight"]]).all().all()
-    ):
-        raise ValueError("fold predictions are incomplete, duplicated, or non-finite")
-    g1_gate = predictions.loc[predictions["model"] == "G1", "gate"]
-    if not g1_gate.between(0.0, 1.0).all():
-        raise ValueError("G1 gates must lie in [0, 1]")
+    _validate_oof_frame(predictions, frame, fold, seed)
     return predictions
+
+
+def _validate_oof_frame(
+    predictions: pd.DataFrame,
+    expected_frame: pd.DataFrame,
+    fold: int,
+    seed: int,
+) -> None:
+    if tuple(predictions.columns) != OOF_COLUMNS:
+        raise ValueError("OOF prediction schema is incompatible")
+    normalized = predictions.copy()
+    for column in ("sample_id", "group_id", "version", "model"):
+        if normalized[column].isna().any():
+            raise ValueError(f"OOF prediction {column} must not be missing")
+        normalized.loc[:, column] = normalized[column].astype(str)
+    expected = expected_frame.copy()
+    for column in ("sample_id", "group_id", "version"):
+        expected.loc[:, column] = expected[column].astype(str)
+    expected_ids = expected["sample_id"].tolist()
+    expected_pairs = {
+        (sample_id, model) for sample_id in expected_ids for model in MODEL_SEQUENCE
+    }
+    actual_pairs = set(zip(normalized["sample_id"], normalized["model"], strict=True))
+    if (
+        len(normalized) != len(expected_pairs)
+        or normalized.duplicated(["sample_id", "model"]).any()
+        or actual_pairs != expected_pairs
+    ):
+        raise ValueError("OOF predictions must equal the exact sample/model Cartesian product")
+    try:
+        fold_values = pd.to_numeric(normalized["fold"], errors="raise").to_numpy(dtype=np.float64)
+        seed_values = pd.to_numeric(normalized["seed"], errors="raise").to_numpy(dtype=np.float64)
+        numeric = normalized.loc[:, ["target", "prediction", "sample_weight"]].to_numpy(dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("OOF prediction numeric columns are incompatible") from error
+    if (
+        not np.isfinite(fold_values).all()
+        or not np.isfinite(seed_values).all()
+        or not np.all(fold_values == float(fold))
+        or not np.all(seed_values == float(seed))
+        or not np.isfinite(numeric).all()
+        or np.any(numeric[:, 2] <= 0)
+    ):
+        raise ValueError("OOF fold/seed/target/prediction/weight values are incompatible")
+    expected_by_id = expected.set_index("sample_id")
+    for row in normalized.itertuples(index=False):
+        source = expected_by_id.loc[str(row.sample_id)]
+        if (
+            str(row.group_id) != str(source["group_id"])
+            or str(row.version) != str(source["version"])
+            or not np.isclose(float(row.sample_weight), float(source["sample_weight"]), rtol=0.0, atol=1e-12)
+            or (
+                "ra_mean" in expected_by_id.columns
+                and not np.isclose(
+                    float(row.target), float(source["ra_mean"]), rtol=0.0, atol=1e-12
+                )
+            )
+        ):
+            raise ValueError("OOF ID/group/version/target/weight mapping is incompatible")
+    semantics = {
+        "P1": (("process_mean",), ("residual", "gate")),
+        "V1": ((), ("process_mean", "residual", "gate")),
+        "F1": ((), ("process_mean", "residual", "gate")),
+        "R1": (("process_mean", "residual"), ("gate",)),
+        "G1": (("process_mean", "residual", "gate"), ()),
+    }
+    for model, (finite_columns, nan_columns) in semantics.items():
+        rows = normalized.loc[normalized["model"] == model]
+        if any(not np.isfinite(rows[column].to_numpy(dtype=np.float64)).all() for column in finite_columns):
+            raise ValueError(f"OOF {model} populated components must be finite")
+        if any(not rows[column].isna().all() for column in nan_columns):
+            raise ValueError(f"OOF {model} absent components must be NaN")
+    gates = normalized.loc[normalized["model"] == "G1", "gate"].to_numpy(dtype=np.float64)
+    if np.any((gates < 0.0) | (gates > 1.0)):
+        raise ValueError("OOF G1 gates must lie in [0, 1]")
 
 
 def _validate_protocol(
@@ -991,6 +1487,7 @@ def _validate_protocol(
     cache: OrderSpectrumCache,
     fold: int,
     seed: int,
+    output_root: str | Path | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if tuple(config.seeds) != (20260723,) or int(seed) != 20260723:
         raise ValueError("Phase A requires exactly seed 20260723")
@@ -1027,11 +1524,16 @@ def _validate_protocol(
         or not np.allclose(weights, 1.0 / split_counts, rtol=0.0, atol=1e-12)
     ):
         raise ValueError("Phase A sample_weight must equal 1/split_count")
-    parts = [part.lower() for part in Path(config.output_dir).parts]
-    if "scheme1" in parts or "scheme1_physics" in parts:
-        raise ValueError("legacy output directories are read-only")
-    if len(parts) < 2 or parts[-2:] != ["sgrpn", "phase_a"]:
-        raise ValueError("Phase A outputs must be written under outputs/sgrpn/phase_a")
+    allowed_output = (
+        _PROJECT_PHASE_A_OUTPUT
+        if output_root is None
+        else Path(output_root).resolve()
+    )
+    if Path(config.output_dir).resolve() != allowed_output:
+        raise ValueError(
+            "Phase A output root must be the exact project outputs/sgrpn/phase_a; "
+            "temporary roots require explicit output_root injection"
+        )
     if len(cache.segment_ids) != len(bundle.manifest) or tuple(
         bundle.manifest["sample_id"].astype(str)
     ) != tuple(cache.segment_ids):
@@ -1047,23 +1549,166 @@ def _validate_protocol(
 
 
 def _load_completed_fold(
-    fold_dir: Path, fingerprint: RunFingerprint, fold: int, seed: int
+    fold_dir: Path,
+    fingerprint: RunFingerprint,
+    fold: int,
+    seed: int,
+    expected_frame: pd.DataFrame,
 ) -> FoldArtifacts:
     marker = json.loads((fold_dir / "complete.json").read_text(encoding="utf-8"))
+    _validate_completed_artifacts(fold_dir, marker, fingerprint, fold, seed)
     predictions_path = fold_dir / "oof_predictions.csv"
     if (
         not predictions_path.is_file()
         or marker.get("predictions_sha256") != _sha256_file(predictions_path)
     ):
         raise ValueError("completed fold prediction fingerprint is missing or incompatible")
-    predictions = pd.read_csv(predictions_path)
-    if tuple(predictions.columns) != OOF_COLUMNS:
-        raise ValueError("completed fold OOF schema is incompatible")
+    predictions = pd.read_csv(
+        predictions_path,
+        dtype={"sample_id": str, "group_id": str, "version": str, "model": str},
+    )
+    _validate_oof_frame(predictions, expected_frame, fold, seed)
     checkpoints = {stage: _stage_paths(fold_dir, stage)[0] for stage in MODEL_SEQUENCE}
     histories = {stage: _stage_paths(fold_dir, stage)[1] for stage in MODEL_SEQUENCE}
     if not all(path.is_file() for path in (*checkpoints.values(), *histories.values())):
         raise ValueError("completed fold is missing checkpoint or history artifacts")
     return FoldArtifacts(predictions, checkpoints, histories, fingerprint)
+
+
+def _checkpoint_model(stage: str) -> nn.Module:
+    if stage == "P1":
+        return ProcessMLP()
+    if stage == "V1":
+        return VibrationOnlyModel()
+    if stage == "F1":
+        return DirectFusionModel()
+    if stage == "R1":
+        return ResidualExpert()
+    if stage == "G1":
+        return SelectiveGatedModel()
+    raise ValueError(f"unknown checkpoint stage: {stage}")
+
+
+def _expected_artifact_paths(fold_dir: Path) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for stage in MODEL_SEQUENCE:
+        checkpoint, history, scaler = _stage_paths(fold_dir, stage)
+        for path in (checkpoint, history, scaler):
+            paths[path.relative_to(fold_dir).as_posix()] = path
+    return paths
+
+
+def _validate_checkpoint(
+    path: Path,
+    *,
+    stage: str,
+    fingerprint: RunFingerprint,
+    fold: int,
+    seed: int,
+) -> None:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        raise ValueError(f"checkpoint {stage} cannot be loaded") from error
+    epochs = payload.get("best_epochs") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("protocol") != "sgrpn-phase-a-v1"
+        or payload.get("fingerprint") != fingerprint.value
+        or payload.get("fold") != int(fold)
+        or payload.get("seed") != int(seed)
+        or payload.get("model") != stage
+        or payload.get("completed_stage") != stage
+        or not isinstance(epochs, list)
+        or len(epochs) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in epochs)
+        or payload.get("refit_epochs") != EpochSelection(tuple(epochs)).refit_epochs
+    ):
+        raise ValueError(f"checkpoint {stage} metadata is incompatible")
+    state = payload.get("model_state")
+    if not isinstance(state, dict) or not state:
+        raise ValueError(f"checkpoint {stage} model state is missing")
+    for value in state.values():
+        if not isinstance(value, torch.Tensor) or not bool(torch.isfinite(value).all()):
+            raise ValueError(f"checkpoint {stage} model state must contain finite tensors")
+    try:
+        _checkpoint_model(stage).load_state_dict(state, strict=True)
+    except (RuntimeError, ValueError, TypeError) as error:
+        raise ValueError(f"checkpoint {stage} model state is invalid") from error
+
+
+def _validate_history(path: Path, stage: str) -> None:
+    try:
+        history = pd.read_csv(path)
+    except Exception as error:
+        raise ValueError(f"history {stage} cannot be loaded") from error
+    required = {"phase", "inner_fold", "epoch", "train_loss", "validation_loss"}
+    if history.empty or not required.issubset(history.columns):
+        raise ValueError(f"history {stage} schema is incompatible")
+    numeric = history.loc[:, ["inner_fold", "epoch", "train_loss", "validation_loss"]].to_numpy(dtype=np.float64)
+    if not np.isfinite(numeric).all() or (history["epoch"].to_numpy(dtype=int) < 1).any():
+        raise ValueError(f"history {stage} values must be finite and valid")
+    if set(history["phase"].astype(str)) != {"selection", "refit"}:
+        raise ValueError(f"history {stage} must contain selection and refit phases")
+    selection_folds = set(
+        history.loc[history["phase"].astype(str) == "selection", "inner_fold"].astype(int)
+    )
+    if selection_folds != {0, 1, 2, 3}:
+        raise ValueError(f"history {stage} inner-fold coverage is incompatible")
+    if set(history.loc[history["phase"].astype(str) == "refit", "inner_fold"].astype(int)) != {-1}:
+        raise ValueError(f"history {stage} refit marker is incompatible")
+
+
+def _validate_scalers(path: Path, stage: str) -> None:
+    expected = {
+        "process_mean": (9,),
+        "process_scale": (9,),
+    }
+    if stage != "P1":
+        expected |= {
+            "spectrum_mean": (3, 361),
+            "spectrum_scale": (3, 361),
+            "quality_mean": (7,),
+            "quality_scale": (7,),
+        }
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if set(archive.files) != set(expected):
+                raise ValueError(f"scaler {stage} schema is incompatible")
+            arrays = {name: archive[name] for name in archive.files}
+    except (OSError, ValueError) as error:
+        if isinstance(error, ValueError) and "schema" in str(error):
+            raise
+        raise ValueError(f"scaler {stage} cannot be loaded") from error
+    for name, shape in expected.items():
+        values = arrays[name]
+        if values.shape != shape or not np.isfinite(values).all():
+            raise ValueError(f"scaler {stage} {name} shape/finiteness is incompatible")
+        if name.endswith("_scale") and np.any(values <= 0):
+            raise ValueError(f"scaler {stage} scales must be positive")
+
+
+def _validate_completed_artifacts(
+    fold_dir: Path,
+    marker: dict[str, Any],
+    fingerprint: RunFingerprint,
+    fold: int,
+    seed: int,
+) -> None:
+    expected = _expected_artifact_paths(fold_dir)
+    hashes = marker.get("artifacts")
+    if not isinstance(hashes, dict) or set(hashes) != set(expected):
+        raise ValueError("completed artifact set is missing or incompatible")
+    for relative, path in expected.items():
+        if not path.is_file() or hashes.get(relative) != _sha256_file(path):
+            raise ValueError(f"completed artifact hash mismatch: {relative}")
+    for stage in MODEL_SEQUENCE:
+        checkpoint, history, scaler = _stage_paths(fold_dir, stage)
+        _validate_checkpoint(
+            checkpoint, stage=stage, fingerprint=fingerprint, fold=fold, seed=seed
+        )
+        _validate_history(history, stage)
+        _validate_scalers(scaler, stage)
 
 
 def run_phase_a_fold(
@@ -1076,9 +1721,12 @@ def run_phase_a_fold(
     *,
     backend: TrainingBackend | None = None,
     batch_size: int = 8,
+    output_root: str | Path | None = None,
 ) -> FoldArtifacts:
     """Train one outer fold in the exact P1→V1→F1→R1→G1 order."""
-    train_index, test_index = _validate_protocol(config, bundle, cache, fold, seed)
+    train_index, test_index = _validate_protocol(
+        config, bundle, cache, fold, seed, output_root
+    )
     selected_device = _device(device)
     set_global_seed(seed)
     fingerprint = build_run_fingerprint(config, bundle, cache)
@@ -1087,7 +1735,12 @@ def run_phase_a_fold(
     if marker_path.exists():
         if not completed_fold_matches(marker_path, fingerprint.value, fold=fold, seed=seed):
             raise ValueError("incompatible completed-fold fingerprint, fold, seed, or model state")
-        return _load_completed_fold(fold_dir, fingerprint, fold, seed)
+        expected_frame = bundle.manifest.loc[
+            :, ["sample_id", "group_id", "version", "sample_weight", "ra_mean"]
+        ].iloc[test_index].reset_index(drop=True)
+        return _load_completed_fold(
+            fold_dir, fingerprint, fold, seed, expected_frame
+        )
     if fold_dir.exists() and any(fold_dir.iterdir()) and not (fold_dir / "state.json").is_file():
         raise ValueError("incompatible partial fold artifacts have no exact stage state")
     _validate_partial_state(fold_dir / "state.json", fingerprint, fold, seed)
@@ -1123,95 +1776,21 @@ def run_phase_a_fold(
     histories: dict[str, Path] = {}
     completed: list[str] = []
 
-    # P1: the Task 6 boundary owns canonical feature validation, split/scaler
-    # fitting, and OOF assignment. This callback only supplies configured fitting.
-    p1_inner_models: list[ProcessMLP] = []
-    p1_call = 0
-
-    def configured_p1_trainer(
-        x_train: np.ndarray,
-        y_train: np.ndarray,
-        w_train: np.ndarray,
-        x_valid: np.ndarray,
-        train_groups: np.ndarray,
-        valid_groups: np.ndarray,
-        *,
-        y_valid: np.ndarray,
-        w_valid: np.ndarray,
-    ) -> tuple[np.ndarray, int]:
-        nonlocal p1_call
-        train_rows, valid_rows = inner_splits[p1_call]
-        model = ProcessMLP()
-        train_rows_frame = train_frame.iloc[train_rows].copy()
-        valid_rows_frame = train_frame.iloc[valid_rows].copy()
-        # Task 6 already proved these arrays/groups correspond; retain explicit
-        # equality checks at the adapter boundary before any optimizer call.
-        if not np.array_equal(train_rows_frame["group_id"].astype(str), train_groups.astype(str)):
-            raise ValueError("P1 inner train group order is incompatible")
-        if not np.array_equal(valid_rows_frame["group_id"].astype(str), valid_groups.astype(str)):
-            raise ValueError("P1 inner validation group order is incompatible")
-        train_rows_frame.loc[:, "sample_weight"] = w_train
-        valid_rows_frame.loc[:, "sample_weight"] = w_valid
-        result = _fit_backend(
-            trainer,
-            stage="P1",
-            model=model,
-            train_loader=_loader(
-                _ProcessDataset(train_rows_frame, x_train, y_train),
-                batch_size=batch_size, shuffle=True, seed=seed,
-            ),
-            validation_loader=_loader(
-                _ProcessDataset(valid_rows_frame, x_valid, y_valid),
-                batch_size=batch_size, shuffle=False, seed=seed,
-            ),
-            max_epochs=config.max_epochs,
-            config=config,
-            device=selected_device,
-            seed=seed,
-        )
-        result.model.to(selected_device).eval()
-        with torch.no_grad():
-            prediction = result.model(
-                torch.as_tensor(x_valid, dtype=torch.float32, device=selected_device)
-            ).detach().cpu().numpy()
-        p1_inner_models.append(result.model)
-        p1_histories.append(result.history.assign(phase="selection", inner_fold=p1_call))
-        p1_call += 1
-        return prediction.astype(np.float64, copy=False), result.best_epoch
-
-    p1_histories: list[pd.DataFrame] = []
-    p1_oof = generate_process_oof(
-        train_frame,
-        train_features,
-        ValidationAwareTrainer(configured_p1_trainer),
-        feature_sample_ids=train_frame["sample_id"].astype(str).to_numpy(),
-        n_splits=4,
-        seed=seed,
+    # P1: Task 6 owns canonical feature validation, group cross-fitting and
+    # inner-train process scalers; Task 7 supplies the configured backend/refit.
+    p1 = _fit_p1_subset(
+        config=config, frame=train_frame, features=train_features,
+        inner_splits=inner_splits, backend=trainer, device=selected_device,
+        seed=seed, batch_size=batch_size,
     )
-    p1_selection = EpochSelection(tuple(p1_oof.best_epochs))
-    all_train = np.arange(len(train_frame), dtype=np.int64)
-    outer_process_scaler = fit_process_scaler(train_features, all_train)
-    p1_refit = _fit_backend(
-        trainer,
-        stage="P1",
-        model=ProcessMLP(),
-        train_loader=_loader(
-            _ProcessDataset(
-                train_frame, outer_process_scaler.transform(train_features), train_targets
-            ),
-            batch_size=batch_size, shuffle=True, seed=seed,
-        ),
-        validation_loader=None,
-        max_epochs=p1_selection.refit_epochs,
-        config=config,
-        device=selected_device,
-        seed=seed,
-    )
-    p1_histories.append(p1_refit.history.assign(phase="refit", inner_fold=-1))
+    p1_oof = p1.oof
+    p1_selection = p1.selection
+    p1_refit = TrainingResult(p1.model, p1.selection.refit_epochs, p1.history)
+    outer_process_scaler = p1.scaler
     checkpoints["P1"], histories["P1"] = _persist_stage(
         fold_dir=fold_dir, fingerprint=fingerprint, fold=fold, seed=seed, stage="P1",
-        completed=completed, selection=p1_selection, model=p1_refit.model,
-        history=pd.concat(p1_histories, ignore_index=True),
+        completed=completed, selection=p1_selection, model=p1.model,
+        history=p1.history,
         scalers={"process_mean": outer_process_scaler.mean, "process_scale": outer_process_scaler.scale},
         device=selected_device,
     )
@@ -1250,12 +1829,11 @@ def run_phase_a_fold(
         }, device=selected_device,
     )
 
-    # R1: residual expert target is exactly Task 6's outer-train P1 OOF residual.
-    r1 = _fit_signal_stage(
-        stage="R1", config=config, frame=train_frame, cache=cache,
-        features=train_features, targets=np.asarray(p1_oof.residual, dtype=np.float64),
-        inner_splits=inner_splits,
-        model_factory=lambda _fold: ResidualExpert(), backend=trainer,
+    # R1: every selection fold rebuilds P1 inside its own training groups, so
+    # its residual training targets cannot encode the held-out fold's labels.
+    r1 = _fit_r1_nested_stage(
+        config=config, frame=train_frame, cache=cache, features=train_features,
+        outer_p1_oof=p1_oof, inner_splits=inner_splits, backend=trainer,
         device=selected_device, seed=seed, batch_size=batch_size,
     )
     checkpoints["R1"], histories["R1"] = _persist_stage(
@@ -1268,24 +1846,13 @@ def run_phase_a_fold(
         }, device=selected_device,
     )
 
-    # G1: use fold-matched upstream experts for inner selection, then fresh
-    # copies of the two complete-outer-train refits. Only the gate is trainable.
-    def gate_factory(inner_fold: int | None) -> SelectiveGatedModel:
-        if inner_fold is None:
-            process_expert = deepcopy(p1_refit.model).cpu()
-            residual_expert = deepcopy(r1.model).cpu()
-        else:
-            process_expert = deepcopy(p1_inner_models[inner_fold]).cpu()
-            residual_expert = deepcopy(r1.inner_models[inner_fold]).cpu()
-        model = SelectiveGatedModel(process_expert, residual_expert)
-        model.freeze_experts()
-        return model
-
-    g1 = _fit_signal_stage(
-        stage="G1", config=config, frame=train_frame, cache=cache,
-        features=train_features, targets=train_targets, inner_splits=inner_splits,
-        model_factory=gate_factory, backend=trainer,
-        device=selected_device, seed=seed, batch_size=batch_size,
+    # G1: for each fold k, rebuild P1 OOF/refit and ResidualExpert
+    # selection/refit using only k's training groups, then freeze those experts.
+    g1 = _fit_g1_nested_stage(
+        config=config, frame=train_frame, cache=cache, features=train_features,
+        inner_splits=inner_splits, outer_p1=p1, outer_r1=r1,
+        backend=trainer, device=selected_device, seed=seed,
+        batch_size=batch_size,
     )
     checkpoints["G1"], histories["G1"] = _persist_stage(
         fold_dir=fold_dir, fingerprint=fingerprint, fold=fold, seed=seed, stage="G1",
@@ -1343,6 +1910,10 @@ def run_phase_a_fold(
     )
     marker["predictions_sha256"] = _sha256_file(predictions_path)
     marker["prediction_rows"] = len(predictions)
+    marker["artifacts"] = {
+        relative: _sha256_file(path)
+        for relative, path in _expected_artifact_paths(fold_dir).items()
+    }
     _atomic_write_json(marker_path, marker)
     _atomic_write_json(
         fold_dir / "state.json",
@@ -1361,6 +1932,7 @@ def run_phase_a(
     device: str | torch.device | None = None,
     backend: TrainingBackend | None = None,
     batch_size: int = 8,
+    output_root: str | Path | None = None,
 ) -> FoldArtifacts:
     """Run every registered outer fold and atomically persist combined OOF rows."""
     fold_values = sorted(pd.to_numeric(bundle.folds["fold"], errors="raise").astype(int).unique())
@@ -1370,17 +1942,26 @@ def run_phase_a(
         run_phase_a_fold(
             config, bundle, cache, fold, 20260723, device,
             backend=backend, batch_size=batch_size,
+            output_root=output_root,
         )
         for fold in fold_values
     ]
     predictions = pd.concat([artifact.predictions for artifact in artifacts], ignore_index=True)
-    expected_rows = len(bundle.manifest) * len(MODEL_SEQUENCE)
-    if (
-        len(predictions) != expected_rows
-        or predictions.duplicated(["sample_id", "model"]).any()
-        or set(predictions["model"]) != set(MODEL_SEQUENCE)
-    ):
-        raise ValueError("combined Phase A OOF predictions are incomplete or duplicated")
+    for fold in fold_values:
+        assigned = bundle.folds.loc[
+            pd.to_numeric(bundle.folds["fold"], errors="raise").astype(int) == fold,
+            "sample_id",
+        ].astype(str)
+        expected = bundle.manifest.loc[
+            bundle.manifest["sample_id"].astype(str).isin(set(assigned)),
+            ["sample_id", "group_id", "version", "sample_weight"],
+        ]
+        _validate_oof_frame(
+            predictions.loc[predictions["fold"].astype(int) == fold].reset_index(drop=True),
+            expected.reset_index(drop=True), fold, 20260723,
+        )
+    if len(predictions) != len(bundle.manifest) * len(MODEL_SEQUENCE):
+        raise ValueError("combined Phase A OOF Cartesian coverage is incompatible")
     _atomic_write_frame(Path(config.output_dir) / "oof_predictions.csv", predictions)
     checkpoints = {
         f"fold_{fold}:{stage}": path
@@ -1396,6 +1977,8 @@ def run_phase_a(
 
 
 __all__ = [
+    "ComponentFoldData",
+    "ComponentRefitData",
     "EpochSelection",
     "FoldArtifacts",
     "MODEL_SEQUENCE",
