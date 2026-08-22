@@ -59,6 +59,9 @@ def _hash_tree(root: Path) -> dict[str, str]:
 
 def test_report_is_atomic_machine_readable_and_regenerates_without_checkpoints(tmp_path: Path):
     predictions, manifest = _synthetic_predictions()
+    canonical_duration = pd.DataFrame(
+        {"sample_id": manifest["sample_id"], "duration_recomputed_s": 1.0}
+    )
     legacy = tmp_path / "outputs" / "scheme1"
     legacy.mkdir(parents=True)
     (legacy / "keep.bin").write_bytes(b"legacy")
@@ -70,7 +73,7 @@ def test_report_is_atomic_machine_readable_and_regenerates_without_checkpoints(t
         predictions,
         manifest,
         output_root=output,
-        duration_audit=pd.DataFrame({"sample_id": manifest["sample_id"], "duration_recomputed_s": 1.0}),
+        duration_audit=canonical_duration,
         bootstrap_repetitions=50,
         bootstrap_seed=20260723,
         run_manifest={"device": "cpu", "fingerprint": "fixture"},
@@ -95,6 +98,8 @@ def test_report_is_atomic_machine_readable_and_regenerates_without_checkpoints(t
     acceptance = json.loads((output / "evaluation" / "acceptance.json").read_text(encoding="utf-8"))
     assert isinstance(acceptance["proceed_to_phase_b"], bool)
     assert acceptance["decision"]["proceed_to_phase_b"] == acceptance["proceed_to_phase_b"]
+    assert acceptance["subjective_override_allowed"] is False
+    assert "transfer_reduction_comparison_atol" not in acceptance["thresholds"]
     assert acceptance["bootstrap"]["seed"] == 20260723
     assert acceptance["bootstrap"]["repetitions"] == 50
     notes = json.loads((output / "evaluation" / "method_notes.json").read_text(encoding="utf-8"))
@@ -105,11 +110,13 @@ def test_report_is_atomic_machine_readable_and_regenerates_without_checkpoints(t
 
     for name in ("prediction_scatter.png", "residual_plot.png", "gate_distribution.png", "gate_condition_heatmap.png"):
         (output / "evaluation" / "figures" / name).unlink()
+    registered_duration = (output / "audit" / "duration_audit.csv").read_bytes()
     write_phase_a_report(
         output,
         pd.read_csv(output / "predictions" / "oof_predictions.csv", dtype={"sample_id": str, "group_id": str, "version": str}),
         manifest,
         output_root=output,
+        duration_audit=canonical_duration,
         bootstrap_repetitions=50,
         bootstrap_seed=20260723,
     )
@@ -121,6 +128,8 @@ def test_report_is_atomic_machine_readable_and_regenerates_without_checkpoints(t
     assert regenerated_manifest["fingerprint"] == "fixture"
     assert regenerated_manifest["device"] == "cpu"
     assert regenerated_manifest["duration_audit"]["provenance"] == "existing_registered"
+    assert regenerated_manifest["duration_audit"]["row_count"] == len(canonical_duration)
+    assert (output / "audit" / "duration_audit.csv").read_bytes() == registered_duration
     assert {
         "python_version", "python_executable", "platform", "package_version"
     } <= set(regenerated_manifest["environment"])
@@ -173,3 +182,55 @@ def test_direct_reporting_rejects_arbitrary_phase_a_suffix(tmp_path: Path):
         )
 
     assert not ambiguous.exists()
+
+
+@pytest.mark.parametrize(
+    "tampering", ("rewritten_and_rehashed", "wrong_hash", "missing_row_count")
+)
+def test_report_reconstructs_duration_from_current_canonical_data_when_registration_is_invalid(
+    tmp_path: Path, tampering: str
+):
+    predictions, manifest = _synthetic_predictions()
+    output = tmp_path / "phase_a"
+    canonical = pd.DataFrame(
+        {"sample_id": manifest["sample_id"], "duration_recomputed_s": 1.0}
+    )
+    write_phase_a_report(
+        output,
+        predictions,
+        manifest,
+        output_root=output,
+        duration_audit=canonical,
+        bootstrap_repetitions=20,
+    )
+    duration_path = output / "audit" / "duration_audit.csv"
+    manifest_path = output / "run_manifest.json"
+    registered = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tampering == "rewritten_and_rehashed":
+        stale = canonical.assign(duration_recomputed_s=2.0)
+        duration_path.write_bytes(stale.to_csv(index=False).encode("utf-8"))
+        registered["duration_audit"]["sha256"] = hashlib.sha256(
+            duration_path.read_bytes()
+        ).hexdigest()
+    elif tampering == "wrong_hash":
+        registered["duration_audit"]["sha256"] = "0" * 64
+    else:
+        registered["duration_audit"].pop("row_count")
+    manifest_path.write_text(json.dumps(registered), encoding="utf-8")
+
+    write_phase_a_report(
+        output,
+        predictions,
+        manifest,
+        output_root=output,
+        duration_audit=canonical,
+        bootstrap_repetitions=20,
+    )
+
+    assert duration_path.read_bytes() == canonical.to_csv(index=False).encode("utf-8")
+    repaired = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert repaired["duration_audit"]["provenance"] == "canonical_current_data"
+    assert repaired["duration_audit"]["row_count"] == len(canonical)
+    assert repaired["duration_audit"]["sha256"] == hashlib.sha256(
+        duration_path.read_bytes()
+    ).hexdigest()

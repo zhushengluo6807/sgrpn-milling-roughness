@@ -30,7 +30,6 @@ from .evaluation import (
     BOOTSTRAP_SEED,
     MATERIAL_MARGIN_UM,
     PHASE_A_MODELS,
-    SAFETY_THRESHOLD_ATOL,
     assess_phase_a,
     build_acceptance_inputs,
     negative_transfer,
@@ -91,6 +90,20 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _duration_frames_equal(path: Path, canonical: pd.DataFrame) -> bool:
+    try:
+        persisted = pd.read_csv(path, dtype={"sample_id": str})
+        pd.testing.assert_frame_equal(
+            persisted,
+            canonical.reset_index(drop=True),
+            check_dtype=True,
+            check_exact=True,
+        )
+    except (OSError, ValueError, AssertionError):
+        return False
+    return True
 
 
 def _validate_manifest_binding(predictions: pd.DataFrame, manifest: pd.DataFrame) -> pd.DataFrame:
@@ -496,25 +509,28 @@ def write_phase_a_report(
     )
     duration_path = output / "audit" / "duration_audit.csv"
     if duration_audit is None:
-        if not duration_path.is_file():
-            raise ValueError(
-                "registered duration audit is required or must be reconstructed from current data"
-            )
-        duration_audit = pd.read_csv(duration_path, dtype={"sample_id": str})
-        duration_provenance = "existing_registered"
-    else:
-        duration_provenance = str(
-            manifest_payload.get("duration_audit", {}).get("provenance", "provided")
-            if isinstance(manifest_payload.get("duration_audit"), dict)
-            else "provided"
-        )
+        raise ValueError("current canonical duration audit is required")
+    duration_audit = duration_audit.reset_index(drop=True).copy()
     if "sample_id" not in duration_audit or duration_audit["sample_id"].isna().any():
         raise ValueError("duration audit requires non-missing sample_id values")
     duration_ids = tuple(duration_audit["sample_id"].astype(str))
     expected_ids = tuple(manifest["sample_id"].astype(str))
     if len(set(duration_ids)) != len(duration_ids) or set(duration_ids) != set(expected_ids):
         raise ValueError("duration audit must exactly cover current manifest sample IDs")
-    if duration_audit is not None:
+    prior_duration = existing_manifest.get("duration_audit")
+    registered_existing = bool(
+        isinstance(prior_duration, dict)
+        and type(prior_duration.get("row_count")) is int
+        and prior_duration["row_count"] == len(duration_audit)
+        and duration_path.is_file()
+        and prior_duration.get("sha256") == _sha256(duration_path)
+        and _duration_frames_equal(duration_path, duration_audit)
+    )
+    if registered_existing:
+        duration_provenance = "existing_registered"
+        written["duration_audit"] = duration_path
+    else:
+        duration_provenance = "canonical_current_data"
         written["duration_audit"] = _atomic_csv(
             duration_path, duration_audit
         )
@@ -565,7 +581,6 @@ def write_phase_a_report(
             "g1_mean_path_mae_ratio_max": 0.99,
             "g1_mean_path_fold_wins_min": 3,
             "transfer_reduction_min": 0.10,
-            "transfer_reduction_comparison_atol": SAFETY_THRESHOLD_ATOL,
             "material_negative_transfer_margin_um": MATERIAL_MARGIN_UM,
             "collapsed_gate_median_below": 0.05,
             "collapsed_gate_p95_below": 0.20,

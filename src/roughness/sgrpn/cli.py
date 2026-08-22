@@ -95,6 +95,7 @@ def _validate_formal_run_manifest(
     output: Path,
     config: SGRPNConfig,
     expected_fingerprint: RunFingerprint,
+    current_duration_audit: pd.DataFrame,
 ) -> dict[str, Any]:
     manifest = _read_json(output / "run_manifest.json", "formal run manifest")
     required_status = {
@@ -124,11 +125,26 @@ def _validate_formal_run_manifest(
     duration_record = manifest.get("duration_audit")
     if (
         not isinstance(duration_record, dict)
-        or duration_record.get("provenance") != "canonical_current_data"
+        or duration_record.get("provenance")
+        not in {"canonical_current_data", "existing_registered"}
+        or type(duration_record.get("row_count")) is not int
+        or duration_record["row_count"] != len(current_duration_audit)
         or not duration.is_file()
         or duration_record.get("sha256") != _sha256(duration)
     ):
         raise ValueError("formal run manifest duration audit is incomplete or incompatible")
+    try:
+        persisted_duration = pd.read_csv(duration, dtype={"sample_id": str})
+        pd.testing.assert_frame_equal(
+            persisted_duration,
+            current_duration_audit.reset_index(drop=True),
+            check_dtype=True,
+            check_exact=True,
+        )
+    except (OSError, ValueError, AssertionError) as error:
+        raise ValueError(
+            "formal run manifest duration audit does not match current canonical data"
+        ) from error
     return manifest
 
 
@@ -406,7 +422,9 @@ def load_formal_phase_a_predictions(
         fold_predictions.append(persisted)
     if fingerprints != {expected_fingerprint.value}:
         raise ValueError("formal fold fingerprints do not match")
-    _validate_formal_run_manifest(output, config, expected_fingerprint)
+    _validate_formal_run_manifest(
+        output, config, expected_fingerprint, bundle.duration_audit
+    )
     combined_path = output / "oof_predictions.csv"
     trained = _typed_predictions(combined_path)
     if tuple(trained.columns) != PREDICTION_COLUMNS:

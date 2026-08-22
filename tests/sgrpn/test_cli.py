@@ -100,17 +100,29 @@ def test_formal_loader_uses_canonical_current_bundle_cache_and_fingerprint(
     monkeypatch.setattr(cli, "load_order_cache", lambda loaded, value: events.append("cache") or cache)
     monkeypatch.setattr(cli, "build_run_fingerprint", lambda value, loaded, cached: events.append("fingerprint") or expected)
 
-    class StopAfterTrustBoundary(Exception):
+    class StopAfterDurationBoundary(Exception):
         pass
 
     def verify(root, fold, expected_frame, expected_fingerprint):
         events.append(("verify", fold, expected_fingerprint.value))
-        raise StopAfterTrustBoundary
+        return expected_fingerprint.value, "cpu", pd.DataFrame()
+
+    def validate_manifest(root, value, fingerprint, current_duration):
+        events.append(("duration", fingerprint.value))
+        pd.testing.assert_frame_equal(current_duration, bundle.duration_audit)
+        raise StopAfterDurationBoundary
 
     monkeypatch.setattr(cli, "_verify_fold_artifacts", verify)
-    with pytest.raises(StopAfterTrustBoundary):
+    monkeypatch.setattr(cli, "_validate_formal_run_manifest", validate_manifest)
+    with pytest.raises(StopAfterDurationBoundary):
         cli.load_formal_phase_a_predictions(config, output_root=output)
-    assert events == ["bundle", "cache", "fingerprint", ("verify", 0, "current")]
+    assert events == [
+        "bundle",
+        "cache",
+        "fingerprint",
+        *(("verify", fold, "current") for fold in range(5)),
+        ("duration", "current"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -259,23 +271,89 @@ def test_formal_run_manifest_requires_complete_current_provenance(
         "input_sha256": {name: cli._sha256(path) for name, path in inputs.items()},
         "duration_audit": {
             "provenance": "canonical_current_data",
+            "row_count": 1,
             "sha256": cli._sha256(duration),
         },
     }
     (output / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
-    validated = cli._validate_formal_run_manifest(output, config, expected)
+    current_duration = pd.DataFrame(
+        {"sample_id": ["s0"], "duration_recomputed_s": [1.0]}
+    )
+    validated = cli._validate_formal_run_manifest(
+        output, config, expected, current_duration
+    )
     assert validated["selected_device"] == "cpu"
 
     inputs["m0_oof"].write_text("attacker changed M0", encoding="utf-8")
     with pytest.raises(ValueError, match="input fingerprint"):
-        cli._validate_formal_run_manifest(output, config, expected)
+        cli._validate_formal_run_manifest(output, config, expected, current_duration)
 
     inputs["m0_oof"].write_text("m0_oof", encoding="utf-8")
     manifest.pop("audit_status")
     (output / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="incomplete"):
-        cli._validate_formal_run_manifest(output, config, expected)
+        cli._validate_formal_run_manifest(output, config, expected, current_duration)
+
+
+@pytest.mark.parametrize(
+    "tampering",
+    ("stale", "rewritten_and_rehashed", "missing_row_count", "wrong_row_count"),
+)
+def test_formal_run_manifest_rejects_duration_not_exactly_bound_to_current_canonical_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tampering: str
+):
+    output = tmp_path / "outputs" / "sgrpn" / "phase_a"
+    output.mkdir(parents=True)
+    inputs = {}
+    for name in ("manifest", "folds", "window_index", "m0_oof"):
+        path = tmp_path / f"{name}.csv"
+        path.write_text(name, encoding="utf-8")
+        inputs[name] = path
+    duration = output / "audit" / "duration_audit.csv"
+    duration.parent.mkdir(parents=True)
+    canonical = pd.DataFrame(
+        {"sample_id": ["s0"], "duration_recomputed_s": [1.0]}
+    )
+    duration.write_bytes(canonical.to_csv(index=False).encode("utf-8"))
+    config = SimpleNamespace(
+        manifest_path=inputs["manifest"],
+        folds_path=inputs["folds"],
+        window_index_path=inputs["window_index"],
+        m0_oof_path=inputs["m0_oof"],
+    )
+    expected = RunFingerprint("current", "", "", "", "")
+    monkeypatch.setattr(cli, "config_fingerprint", lambda value, phase: "config-current")
+    run_manifest = {
+        "audit_status": "complete",
+        "feature_status": "complete",
+        "training_status": "complete",
+        "config_fingerprint": "config-current",
+        "training_fingerprint": "current",
+        "selected_device": "cpu",
+        "input_sha256": {name: cli._sha256(path) for name, path in inputs.items()},
+        "duration_audit": {
+            "provenance": "canonical_current_data",
+            "row_count": 1,
+            "sha256": cli._sha256(duration),
+        },
+    }
+    if tampering in {"stale", "rewritten_and_rehashed"}:
+        duration.write_text(
+            "sample_id,duration_recomputed_s\ns0,2.0\n", encoding="utf-8"
+        )
+        if tampering == "rewritten_and_rehashed":
+            run_manifest["duration_audit"]["sha256"] = cli._sha256(duration)
+    elif tampering == "missing_row_count":
+        run_manifest["duration_audit"].pop("row_count")
+    else:
+        run_manifest["duration_audit"]["row_count"] = 2
+    (output / "run_manifest.json").write_text(
+        json.dumps(run_manifest), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="duration audit"):
+        cli._validate_formal_run_manifest(output, config, expected, canonical)
 
 
 def _cache_bound_formal_fixture(

@@ -29,7 +29,6 @@ BOOTSTRAP_SEED = 20260723
 BOOTSTRAP_REPETITIONS = 10_000
 BOOTSTRAP_UNIT = "group_id"
 MATERIAL_MARGIN_UM = 0.01
-SAFETY_THRESHOLD_ATOL = 1e-12
 
 
 @dataclass(frozen=True)
@@ -473,11 +472,8 @@ def assess_phase_a(inputs: AcceptanceInputs) -> PhaseADecision:
     )
     safety_path = bool(
         noninferior
-        # Rates originate as rational group counts but travel through CSV
-        # decimals. This tight tolerance admits mathematical equality at 0.10
-        # without relaxing any scientifically meaningful threshold.
-        and inputs.transfer_reduction_vs_f1 + SAFETY_THRESHOLD_ATOL >= 0.10
-        and inputs.transfer_reduction_vs_r1 + SAFETY_THRESHOLD_ATOL >= 0.10
+        and Decimal(str(inputs.transfer_reduction_vs_f1)) >= Decimal("0.10")
+        and Decimal(str(inputs.transfer_reduction_vs_r1)) >= Decimal("0.10")
     )
     collapsed = bool(
         inputs.gate_median < 0.05
@@ -533,7 +529,6 @@ __all__ = [
     "PHASE_A_MODELS",
     "PREDICTION_COLUMNS",
     "PhaseADecision",
-    "SAFETY_THRESHOLD_ATOL",
     "assess_phase_a",
     "build_acceptance_inputs",
     "negative_transfer",

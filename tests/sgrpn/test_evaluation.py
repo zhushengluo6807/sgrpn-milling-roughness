@@ -295,8 +295,8 @@ def test_safety_equality_survives_builder_float_subtraction():
     )
     inputs = build_acceptance_inputs(summary, folds, transfers, [0.2, 0.4, 0.8])
     decision = assess_phase_a(inputs)
-    assert inputs.transfer_reduction_vs_f1 == pytest.approx(0.10)
-    assert inputs.transfer_reduction_vs_r1 == pytest.approx(0.10)
+    assert inputs.transfer_reduction_vs_f1 == 0.10
+    assert inputs.transfer_reduction_vs_r1 == 0.10
     assert decision.transfer_safety_path is True
     assert decision.proceed_to_phase_b is True
 
@@ -378,3 +378,163 @@ def test_collapse_boundaries_require_both_strictly_below(median, p95, collapsed)
 def test_machine_gate_has_no_subjective_override_parameter_or_field():
     assert tuple(inspect.signature(assess_phase_a).parameters) == ("inputs",)
     assert "subjective_override" not in AcceptanceInputs.__dataclass_fields__
+
+
+def _acceptance_payload(**changes):
+    payload = {
+        "p1_mae_ratio_to_m0": 1.0,
+        "p1_r2_drop_from_m0": 0.0,
+        "g1_mae_ratio_to_p1": 0.99,
+        "g1_rmse_ratio_to_p1": 1.0,
+        "g1_r2_drop_from_p1": 0.0,
+        "g1_fold_wins": 3,
+        "transfer_reduction_vs_f1": 0.0,
+        "transfer_reduction_vs_r1": 0.0,
+        "gate_median": 0.2,
+        "gate_p95": 0.8,
+    }
+    payload.update(changes)
+    return AcceptanceInputs(**payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "threshold"),
+    [
+        ("p1_mae_ratio_to_m0", 1.05),
+        ("p1_r2_drop_from_m0", 0.02),
+    ],
+)
+def test_process_credibility_accepts_equality_and_rejects_nearest_outside(field, threshold):
+    at_limit = assess_phase_a(_acceptance_payload(**{field: threshold}))
+    outside = assess_phase_a(
+        _acceptance_payload(**{field: np.nextafter(threshold, np.inf)})
+    )
+    assert at_limit.process_expert_credible is True
+    assert at_limit.proceed_to_phase_b is True
+    assert outside.process_expert_credible is False
+    assert outside.proceed_to_phase_b is False
+
+
+@pytest.mark.parametrize(
+    ("field", "threshold"),
+    [
+        ("g1_mae_ratio_to_p1", 1.01),
+        ("g1_rmse_ratio_to_p1", 1.03),
+        ("g1_r2_drop_from_p1", 0.0),
+    ],
+)
+def test_g1_noninferiority_accepts_equality_and_rejects_nearest_outside(field, threshold):
+    safety = {
+        "g1_mae_ratio_to_p1": 1.0,
+        "g1_fold_wins": 2,
+        "transfer_reduction_vs_f1": 0.10,
+        "transfer_reduction_vs_r1": 0.10,
+    }
+    at_limit = assess_phase_a(
+        _acceptance_payload(**{**safety, field: threshold})
+    )
+    outside = assess_phase_a(
+        _acceptance_payload(
+            **{**safety, field: np.nextafter(threshold, np.inf)}
+        )
+    )
+    assert at_limit.g1_noninferior is True
+    assert at_limit.proceed_to_phase_b is True
+    assert outside.g1_noninferior is False
+    assert outside.proceed_to_phase_b is False
+
+
+def test_mean_path_ratio_and_fold_win_boundaries_one_field_at_a_time():
+    at_ratio = assess_phase_a(_acceptance_payload(g1_mae_ratio_to_p1=0.99))
+    outside_ratio = assess_phase_a(
+        _acceptance_payload(g1_mae_ratio_to_p1=np.nextafter(0.99, np.inf))
+    )
+    at_wins = assess_phase_a(_acceptance_payload(g1_fold_wins=3))
+    outside_wins = assess_phase_a(_acceptance_payload(g1_fold_wins=2))
+    assert (at_ratio.mean_improvement_path, at_ratio.proceed_to_phase_b) == (True, True)
+    assert (outside_ratio.mean_improvement_path, outside_ratio.proceed_to_phase_b) == (False, False)
+    assert (at_wins.mean_improvement_path, at_wins.proceed_to_phase_b) == (True, True)
+    assert (outside_wins.mean_improvement_path, outside_wins.proceed_to_phase_b) == (False, False)
+
+
+@pytest.mark.parametrize(
+    "field", ("transfer_reduction_vs_f1", "transfer_reduction_vs_r1")
+)
+def test_each_safety_reduction_requires_exact_decimal_point_ten(field):
+    safety = {
+        "g1_mae_ratio_to_p1": 1.0,
+        "g1_fold_wins": 2,
+        "transfer_reduction_vs_f1": 0.10,
+        "transfer_reduction_vs_r1": 0.10,
+    }
+    at_limit = assess_phase_a(_acceptance_payload(**safety))
+    safety[field] = 0.0999999999995
+    just_below = assess_phase_a(_acceptance_payload(**safety))
+    assert (at_limit.transfer_safety_path, at_limit.proceed_to_phase_b) == (True, True)
+    assert (just_below.transfer_safety_path, just_below.proceed_to_phase_b) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("field", "at_limit", "inside"),
+    [
+        ("gate_median", 0.05, np.nextafter(0.05, -np.inf)),
+        ("gate_p95", 0.20, np.nextafter(0.20, -np.inf)),
+    ],
+)
+def test_each_collapse_threshold_is_strict(field, at_limit, inside):
+    no_benefit = {
+        "g1_mae_ratio_to_p1": 1.0,
+        "g1_fold_wins": 2,
+        "gate_median": np.nextafter(0.05, -np.inf),
+        "gate_p95": np.nextafter(0.20, -np.inf),
+    }
+    boundary = assess_phase_a(_acceptance_payload(**{**no_benefit, field: at_limit}))
+    collapsed = assess_phase_a(_acceptance_payload(**{**no_benefit, field: inside}))
+    assert boundary.gate_collapsed_without_benefit is False
+    assert collapsed.gate_collapsed_without_benefit is True
+
+
+@pytest.mark.parametrize(
+    ("changes", "mean_path", "safety_path", "collapsed"),
+    [
+        ({"g1_mae_ratio_to_p1": 0.99, "g1_fold_wins": 3}, True, False, False),
+        (
+            {
+                "g1_mae_ratio_to_p1": 1.0,
+                "g1_fold_wins": 2,
+                "transfer_reduction_vs_f1": 0.10,
+                "transfer_reduction_vs_r1": 0.10,
+            },
+            False,
+            True,
+            False,
+        ),
+        ({"g1_mae_ratio_to_p1": 1.0, "g1_fold_wins": 2}, False, False, True),
+    ],
+)
+def test_collapse_requires_no_mean_or_safety_benefit(changes, mean_path, safety_path, collapsed):
+    decision = assess_phase_a(
+        _acceptance_payload(gate_median=0.01, gate_p95=0.10, **changes)
+    )
+    assert decision.mean_improvement_path is mean_path
+    assert decision.transfer_safety_path is safety_path
+    assert decision.gate_collapsed_without_benefit is collapsed
+
+
+@pytest.mark.parametrize(
+    ("excess", "material_rate"),
+    [(0.01, 0.0), (np.nextafter(0.01, np.inf), 1.0)],
+)
+def test_material_negative_transfer_margin_equality_and_nearest_above(excess, material_rate):
+    result = negative_transfer(
+        pd.DataFrame(
+            {
+                "group_id": ["g"],
+                "p1_abs_error": [0.0],
+                "candidate_abs_error": [excess],
+                "sample_weight": [1.0],
+            }
+        ),
+        material_margin_um=0.01,
+    )
+    assert result.material_rate == material_rate
