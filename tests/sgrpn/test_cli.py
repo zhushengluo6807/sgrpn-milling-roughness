@@ -10,6 +10,7 @@ from roughness.sgrpn import cli
 from roughness.sgrpn.config import SGRPNConfig
 from roughness.sgrpn.data import DataBundle
 from roughness.sgrpn.order_spectrum import OrderSpectrumCache, save_order_cache
+from roughness.sgrpn.reporting import _atomic_csv
 from roughness.sgrpn.training import MODEL_SEQUENCE, RunFingerprint
 
 
@@ -294,6 +295,57 @@ def test_formal_run_manifest_requires_complete_current_provenance(
     (output / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="incomplete"):
         cli._validate_formal_run_manifest(output, config, expected, current_duration)
+
+
+def test_formal_duration_validation_round_trips_atomic_csv_floats_exactly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    output = tmp_path / "outputs" / "sgrpn" / "phase_a"
+    inputs = {}
+    for name in ("manifest", "folds", "window_index", "m0_oof"):
+        path = tmp_path / f"{name}.csv"
+        path.write_text(name, encoding="utf-8")
+        inputs[name] = path
+    canonical = pd.DataFrame(
+        {
+            "sample_id": ["v3_34_seg1"],
+            "row_count": [79104],
+            "duration_source_s": [2.95668],
+            "duration_recomputed_s": [3.09],
+            "absolute_difference_s": [0.13331999999999988],
+            "mismatch_over_1ms": [True],
+        }
+    )
+    duration_path = _atomic_csv(output / "audit" / "duration_audit.csv", canonical)
+    config = SimpleNamespace(
+        manifest_path=inputs["manifest"],
+        folds_path=inputs["folds"],
+        window_index_path=inputs["window_index"],
+        m0_oof_path=inputs["m0_oof"],
+    )
+    expected = RunFingerprint("current", "", "", "", "")
+    monkeypatch.setattr(cli, "config_fingerprint", lambda value, phase: "config-current")
+    run_manifest = {
+        "audit_status": "complete",
+        "feature_status": "complete",
+        "training_status": "complete",
+        "config_fingerprint": "config-current",
+        "training_fingerprint": "current",
+        "selected_device": "cpu",
+        "input_sha256": {name: cli._sha256(path) for name, path in inputs.items()},
+        "duration_audit": {
+            "provenance": "canonical_current_data",
+            "row_count": 1,
+            "sha256": cli._sha256(duration_path),
+        },
+    }
+    (output / "run_manifest.json").write_text(json.dumps(run_manifest), encoding="utf-8")
+
+    validated = cli._validate_formal_run_manifest(
+        output, config, expected, canonical
+    )
+
+    assert validated["duration_audit"]["sha256"] == cli._sha256(duration_path)
 
 
 @pytest.mark.parametrize(

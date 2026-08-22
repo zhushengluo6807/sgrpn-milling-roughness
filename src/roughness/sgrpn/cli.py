@@ -134,7 +134,11 @@ def _validate_formal_run_manifest(
     ):
         raise ValueError("formal run manifest duration audit is incomplete or incompatible")
     try:
-        persisted_duration = pd.read_csv(duration, dtype={"sample_id": str})
+        persisted_duration = pd.read_csv(
+            duration,
+            dtype={"sample_id": str},
+            float_precision="round_trip",
+        )
         pd.testing.assert_frame_equal(
             persisted_duration,
             current_duration_audit.reset_index(drop=True),

@@ -94,7 +94,11 @@ def _sha256(path: Path) -> str:
 
 def _duration_frames_equal(path: Path, canonical: pd.DataFrame) -> bool:
     try:
-        persisted = pd.read_csv(path, dtype={"sample_id": str})
+        persisted = pd.read_csv(
+            path,
+            dtype={"sample_id": str},
+            float_precision="round_trip",
+        )
         pd.testing.assert_frame_equal(
             persisted,
             canonical.reset_index(drop=True),
