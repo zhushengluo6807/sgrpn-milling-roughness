@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from roughness.sgrpn.reporting import write_phase_a_report
 
@@ -68,6 +69,7 @@ def test_report_is_atomic_machine_readable_and_regenerates_without_checkpoints(t
         output,
         predictions,
         manifest,
+        output_root=output,
         duration_audit=pd.DataFrame({"sample_id": manifest["sample_id"], "duration_recomputed_s": 1.0}),
         bootstrap_repetitions=50,
         bootstrap_seed=20260723,
@@ -107,11 +109,21 @@ def test_report_is_atomic_machine_readable_and_regenerates_without_checkpoints(t
         output,
         pd.read_csv(output / "predictions" / "oof_predictions.csv", dtype={"sample_id": str, "group_id": str, "version": str}),
         manifest,
+        output_root=output,
         bootstrap_repetitions=50,
         bootstrap_seed=20260723,
     )
     assert all((output / "evaluation" / "figures" / name).is_file() for name in ("prediction_scatter.png", "residual_plot.png", "gate_distribution.png", "gate_condition_heatmap.png"))
     assert not list(output.rglob("*.tmp-*"))
+    regenerated_manifest = json.loads(
+        (output / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert regenerated_manifest["fingerprint"] == "fixture"
+    assert regenerated_manifest["device"] == "cpu"
+    assert regenerated_manifest["duration_audit"]["provenance"] == "existing_registered"
+    assert {
+        "python_version", "python_executable", "platform", "package_version"
+    } <= set(regenerated_manifest["environment"])
 
 
 def test_report_contains_segment_and_group_metrics_and_gate_diagnostics(tmp_path: Path):
@@ -128,6 +140,10 @@ def test_report_contains_segment_and_group_metrics_and_gate_diagnostics(tmp_path
         output,
         predictions,
         manifest,
+        output_root=output,
+        duration_audit=pd.DataFrame(
+            {"sample_id": manifest["sample_id"], "duration_recomputed_s": 1.0}
+        ),
         quality_features=quality,
         bootstrap_repetitions=20,
     )
@@ -139,3 +155,21 @@ def test_report_contains_segment_and_group_metrics_and_gate_diagnostics(tmp_path
     assert {
         "overall", "n_rpm", "fz_mm_per_tooth", "ap_mm", "version", "quality_0", "quality_6"
     } <= set(gate["dimension"])
+
+
+def test_direct_reporting_rejects_arbitrary_phase_a_suffix(tmp_path: Path):
+    predictions, manifest = _synthetic_predictions()
+    ambiguous = tmp_path / "attacker" / "outputs" / "sgrpn" / "phase_a"
+
+    with pytest.raises(ValueError, match="exact project.*output root"):
+        write_phase_a_report(
+            ambiguous,
+            predictions,
+            manifest,
+            duration_audit=pd.DataFrame(
+                {"sample_id": manifest["sample_id"], "duration_recomputed_s": 1.0}
+            ),
+            bootstrap_repetitions=20,
+        )
+
+    assert not ambiguous.exists()

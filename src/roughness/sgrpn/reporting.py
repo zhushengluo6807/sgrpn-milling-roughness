@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import hashlib
+from importlib.metadata import PackageNotFoundError, version as package_version
 import io
 import json
 import os
 from pathlib import Path
+import platform
+import sys
 from typing import Any
 import uuid
 
@@ -27,6 +30,7 @@ from .evaluation import (
     BOOTSTRAP_SEED,
     MATERIAL_MARGIN_UM,
     PHASE_A_MODELS,
+    SAFETY_THRESHOLD_ATOL,
     assess_phase_a,
     build_acceptance_inputs,
     negative_transfer,
@@ -34,6 +38,7 @@ from .evaluation import (
     validate_prediction_cartesian,
     weighted_metrics,
 )
+from .training import validate_phase_a_output_root
 
 
 def _jsonable(value: Any) -> Any:
@@ -459,6 +464,7 @@ def write_phase_a_report(
     predictions: pd.DataFrame,
     manifest: pd.DataFrame,
     *,
+    output_root: str | Path | None = None,
     duration_audit: pd.DataFrame | None = None,
     quality_features: pd.DataFrame | None = None,
     bootstrap_repetitions: int = BOOTSTRAP_REPETITIONS,
@@ -466,8 +472,19 @@ def write_phase_a_report(
     run_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Path]:
     """Create every Phase A evaluation artifact from persisted tabular inputs."""
-    output = Path(output_dir).resolve()
+    output = validate_phase_a_output_root(output_dir, output_root=output_root)
     output.mkdir(parents=True, exist_ok=True)
+    run_manifest_path = output / "run_manifest.json"
+    existing_manifest: dict[str, Any] = {}
+    if run_manifest_path.is_file():
+        try:
+            existing_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("existing Phase A run manifest is invalid") from error
+        if not isinstance(existing_manifest, dict):
+            raise ValueError("existing Phase A run manifest must be an object")
+    manifest_payload = dict(existing_manifest)
+    manifest_payload.update(run_manifest or {})
     values = _validate_manifest_binding(predictions, manifest)
     if int(bootstrap_seed) != BOOTSTRAP_SEED:
         raise ValueError("Phase A bootstrap seed must be exactly 20260723")
@@ -477,9 +494,29 @@ def write_phase_a_report(
     written["oof_predictions"] = _atomic_csv(
         output / "predictions" / "oof_predictions.csv", values
     )
+    duration_path = output / "audit" / "duration_audit.csv"
+    if duration_audit is None:
+        if not duration_path.is_file():
+            raise ValueError(
+                "registered duration audit is required or must be reconstructed from current data"
+            )
+        duration_audit = pd.read_csv(duration_path, dtype={"sample_id": str})
+        duration_provenance = "existing_registered"
+    else:
+        duration_provenance = str(
+            manifest_payload.get("duration_audit", {}).get("provenance", "provided")
+            if isinstance(manifest_payload.get("duration_audit"), dict)
+            else "provided"
+        )
+    if "sample_id" not in duration_audit or duration_audit["sample_id"].isna().any():
+        raise ValueError("duration audit requires non-missing sample_id values")
+    duration_ids = tuple(duration_audit["sample_id"].astype(str))
+    expected_ids = tuple(manifest["sample_id"].astype(str))
+    if len(set(duration_ids)) != len(duration_ids) or set(duration_ids) != set(expected_ids):
+        raise ValueError("duration audit must exactly cover current manifest sample IDs")
     if duration_audit is not None:
         written["duration_audit"] = _atomic_csv(
-            output / "audit" / "duration_audit.csv", duration_audit
+            duration_path, duration_audit
         )
     groups = _group_predictions(values)
     summary = pd.concat(
@@ -528,6 +565,7 @@ def write_phase_a_report(
             "g1_mean_path_mae_ratio_max": 0.99,
             "g1_mean_path_fold_wins_min": 3,
             "transfer_reduction_min": 0.10,
+            "transfer_reduction_comparison_atol": SAFETY_THRESHOLD_ATOL,
             "material_negative_transfer_margin_um": MATERIAL_MARGIN_UM,
             "collapsed_gate_median_below": 0.05,
             "collapsed_gate_p95_below": 0.20,
@@ -564,8 +602,17 @@ def write_phase_a_report(
     }
     written["method_notes"] = _atomic_json(evaluation / "method_notes.json", method_notes)
     written.update(_write_figures(values, manifest, evaluation / "figures"))
-    manifest_payload = dict(run_manifest or {})
     manifest_payload.pop("proceed_to_phase_b", None)
+    try:
+        installed_version = package_version("roughness-training")
+    except PackageNotFoundError:
+        installed_version = "not-installed"
+    selected_device = manifest_payload.get(
+        "selected_device",
+        manifest_payload.get(
+            "device", manifest_payload.get("selected_devices", "not-recorded")
+        ),
+    )
     manifest_payload.update(
         {
             "schema_version": "sgrpn-phase-a-run-v1",
@@ -578,6 +625,18 @@ def write_phase_a_report(
             },
             "model_matrix": list(PHASE_A_MODELS),
             "phase_b_executed": False,
+            "duration_audit": {
+                "provenance": duration_provenance,
+                "row_count": int(len(duration_audit)),
+                "sha256": _sha256(duration_path),
+            },
+            "environment": {
+                "python_version": platform.python_version(),
+                "python_executable": sys.executable,
+                "platform": platform.platform(),
+                "package_version": installed_version,
+                "device": selected_device,
+            },
             "artifacts": {
                 str(path.relative_to(output)).replace("\\", "/"): _sha256(path)
                 for path in written.values()

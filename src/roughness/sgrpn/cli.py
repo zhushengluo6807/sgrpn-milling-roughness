@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import replace
 import hashlib
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 from pathlib import Path
+import platform
 import shutil
 import sys
 from typing import Any
@@ -28,10 +30,13 @@ from .reporting import write_phase_a_report
 from .training import (
     MODEL_SEQUENCE,
     RunFingerprint,
+    _canonical_integer_text,
     _load_and_validate_persisted_oof,
     _validate_completed_artifacts,
+    build_run_fingerprint,
     run_phase_a,
     run_phase_a_fold,
+    validate_phase_a_output_root,
 )
 
 
@@ -63,14 +68,7 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> Path:
 
 
 def _validate_output_dir(config: SGRPNConfig) -> Path:
-    output = Path(config.output_dir).resolve()
-    suffix = tuple(part.casefold() for part in output.parts[-3:])
-    if suffix != ("outputs", "sgrpn", "phase_a"):
-        raise ValueError("Phase A writes require an exact outputs/sgrpn/phase_a directory")
-    for legacy in ("scheme1", "scheme1_physics"):
-        if legacy in (part.casefold() for part in output.parts):
-            raise ValueError("Phase A must not write into a legacy output directory")
-    return output
+    return validate_phase_a_output_root(config.output_dir)
 
 
 def _selected_device(requested: str) -> str:
@@ -93,6 +91,47 @@ def _read_json(path: Path, name: str) -> dict[str, Any]:
     return payload
 
 
+def _validate_formal_run_manifest(
+    output: Path,
+    config: SGRPNConfig,
+    expected_fingerprint: RunFingerprint,
+) -> dict[str, Any]:
+    manifest = _read_json(output / "run_manifest.json", "formal run manifest")
+    required_status = {
+        "audit_status": "complete",
+        "feature_status": "complete",
+        "training_status": "complete",
+    }
+    if any(manifest.get(key) != value for key, value in required_status.items()):
+        raise ValueError("formal run manifest is incomplete")
+    if (
+        manifest.get("config_fingerprint") != config_fingerprint(config, "phase_a")
+        or manifest.get("training_fingerprint") != expected_fingerprint.value
+        or manifest.get("selected_device") not in {"cpu", "cuda"}
+    ):
+        raise ValueError("formal run manifest fingerprint/device is incompatible")
+    paths = {
+        "manifest": Path(config.manifest_path),
+        "folds": Path(config.folds_path),
+        "window_index": Path(config.window_index_path),
+        "m0_oof": Path(config.m0_oof_path),
+    }
+    recorded_inputs = manifest.get("input_sha256")
+    current_inputs = {name: _sha256(path) for name, path in paths.items()}
+    if not isinstance(recorded_inputs, dict) or recorded_inputs != current_inputs:
+        raise ValueError("formal run manifest input fingerprint mismatch")
+    duration = output / "audit" / "duration_audit.csv"
+    duration_record = manifest.get("duration_audit")
+    if (
+        not isinstance(duration_record, dict)
+        or duration_record.get("provenance") != "canonical_current_data"
+        or not duration.is_file()
+        or duration_record.get("sha256") != _sha256(duration)
+    ):
+        raise ValueError("formal run manifest duration audit is incomplete or incompatible")
+    return manifest
+
+
 def _merge_run_manifest(output: Path, updates: dict[str, Any]) -> Path:
     path = output / "run_manifest.json"
     payload: dict[str, Any] = {}
@@ -102,13 +141,31 @@ def _merge_run_manifest(output: Path, updates: dict[str, Any]) -> Path:
     payload.setdefault("schema_version", "sgrpn-phase-a-run-v1")
     payload["phase_b_executed"] = False
     payload.pop("proceed_to_phase_b", None)
+    try:
+        installed_version = package_version("roughness-training")
+    except PackageNotFoundError:
+        installed_version = "not-installed"
+    existing_environment = payload.get("environment", {})
+    environment = dict(existing_environment) if isinstance(existing_environment, dict) else {}
+    environment.update(
+        {
+            "python_version": platform.python_version(),
+            "python_executable": sys.executable,
+            "platform": platform.platform(),
+            "package_version": installed_version,
+            "device": payload.get(
+                "selected_device", environment.get("device", "not-selected")
+            ),
+        }
+    )
+    payload["environment"] = environment
     return _atomic_json(path, payload)
 
 
 def _audit(config: SGRPNConfig) -> None:
     output = _validate_output_dir(config)
     bundle = load_data_bundle(config)
-    _atomic_bytes(
+    duration_path = _atomic_bytes(
         output / "audit" / "duration_audit.csv",
         bundle.duration_audit.to_csv(index=False).encode("utf-8"),
     )
@@ -120,6 +177,11 @@ def _audit(config: SGRPNConfig) -> None:
             "seed": 20260723,
             "seed_count": 1,
             "fold_audit": bundle.fold_audit,
+            "duration_audit": {
+                "provenance": "canonical_current_data",
+                "row_count": int(len(bundle.duration_audit)),
+                "sha256": _sha256(duration_path),
+            },
             "input_sha256": {
                 "manifest": _sha256(Path(config.manifest_path)),
                 "folds": _sha256(Path(config.folds_path)),
@@ -204,36 +266,11 @@ def _typed_predictions(path: Path) -> pd.DataFrame:
         raise ValueError(f"formal OOF predictions cannot be loaded: {path}") from error
 
 
-def _manifest_and_folds(config: SGRPNConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    manifest = pd.read_csv(
-        config.manifest_path,
-        dtype={"sample_id": str, "group_id": str, "version": str},
-    )
-    folds = pd.read_csv(config.folds_path, dtype={"sample_id": str, "group_id": str})
-    required_manifest = {
-        "sample_id", "group_id", "version", "ra_mean", "sample_weight",
-        "n_rpm", "fz_mm_per_tooth", "ap_mm",
-    }
-    missing = sorted(required_manifest - set(manifest.columns))
-    if missing:
-        raise ValueError(f"formal manifest missing columns: {missing}")
-    if manifest["sample_id"].isna().any() or manifest["sample_id"].duplicated().any():
-        raise ValueError("formal manifest sample IDs must be non-missing and unique")
-    if not {"sample_id", "group_id", "fold"} <= set(folds.columns):
-        raise ValueError("formal fold definitions are incompatible")
-    if folds["sample_id"].isna().any() or folds["sample_id"].duplicated().any():
-        raise ValueError("formal fold sample IDs must be non-missing and unique")
-    assignments = folds.set_index("sample_id").reindex(manifest["sample_id"])
-    fold_values = pd.to_numeric(assignments["fold"], errors="raise")
-    if assignments.isna().any().any() or set(fold_values) != {0, 1, 2, 3, 4} or not np.equal(fold_values, np.floor(fold_values)).all():
-        raise ValueError("formal folds require exact manifest coverage and folds 0..4")
-    if not np.array_equal(assignments["group_id"].astype(str), manifest["group_id"].astype(str)):
-        raise ValueError("formal fold group mapping is incompatible")
-    return manifest, folds
-
-
 def _verify_fold_artifacts(
-    output: Path, fold: int, expected_frame: pd.DataFrame
+    output: Path,
+    fold: int,
+    expected_frame: pd.DataFrame,
+    expected_fingerprint: RunFingerprint,
 ) -> tuple[str, str, pd.DataFrame]:
     fold_dir = output / "folds" / f"fold_{fold}" / "seed_20260723"
     marker = _read_json(fold_dir / "complete.json", f"fold {fold} completion marker")
@@ -243,9 +280,11 @@ def _verify_fold_artifacts(
         or marker.get("seed") != 20260723
         or marker.get("models") != list(MODEL_SEQUENCE)
         or marker.get("completed_stages") != list(MODEL_SEQUENCE)
-        or not isinstance(marker.get("fingerprint"), str)
+        or marker.get("fingerprint") != expected_fingerprint.value
     ):
-        raise ValueError(f"fold {fold} completion marker is incomplete or incompatible")
+        raise ValueError(
+            f"fold {fold} marker does not match the current recomputed fingerprint"
+        )
     prediction_path = fold_dir / "oof_predictions.csv"
     if marker.get("predictions_sha256") != _sha256(prediction_path):
         raise ValueError(f"fold {fold} OOF fingerprint mismatch")
@@ -259,9 +298,8 @@ def _verify_fold_artifacts(
     hashes = marker.get("artifacts")
     if not isinstance(hashes, dict) or set(hashes) != expected_artifacts:
         raise ValueError(f"fold {fold} formal artifact set is incomplete")
-    fingerprint = RunFingerprint(marker["fingerprint"], "", "", "", "")
     _validate_completed_artifacts(
-        fold_dir, marker, fingerprint, fold, 20260723
+        fold_dir, marker, expected_fingerprint, fold, 20260723
     )
     fold_predictions = _load_and_validate_persisted_oof(
         fold_dir, marker, fold, 20260723, expected_frame
@@ -270,7 +308,7 @@ def _verify_fold_artifacts(
     device = state.get("device")
     if state.get("status") != "complete" or state.get("fingerprint") != marker["fingerprint"] or device not in {"cpu", "cuda"}:
         raise ValueError(f"fold {fold} state is incomplete or incompatible")
-    return marker["fingerprint"], str(device), fold_predictions
+    return expected_fingerprint.value, str(device), fold_predictions
 
 
 def _load_m0(config: SGRPNConfig, manifest: pd.DataFrame, folds: pd.DataFrame) -> pd.DataFrame:
@@ -283,7 +321,24 @@ def _load_m0(config: SGRPNConfig, manifest: pd.DataFrame, folds: pd.DataFrame) -
     missing = sorted(required - set(m0.columns))
     if missing:
         raise ValueError(f"M0 OOF missing columns: {missing}")
-    m0 = m0.loc[(m0["model"] == "M0") & (m0["seed"].astype(str) == "20260723")].copy()
+    m0 = m0.loc[m0["model"] == "M0"].copy()
+
+    def exact_integer_column(column: str) -> np.ndarray:
+        parsed: list[int] = []
+        for value in m0[column]:
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"M0 {column} must use canonical integral values")
+            if isinstance(value, (int, np.integer)):
+                parsed.append(int(value))
+            elif isinstance(value, str) and _canonical_integer_text(value, signed=True):
+                parsed.append(int(value))
+            else:
+                raise ValueError(f"M0 {column} must use canonical integral values")
+        return np.asarray(parsed, dtype=np.int64)
+
+    m0["fold"] = exact_integer_column("fold")
+    m0["seed"] = exact_integer_column("seed")
+    m0 = m0.loc[m0["seed"] == 20260723].copy()
     expected_ids = tuple(manifest["sample_id"].astype(str))
     if len(m0) != len(expected_ids) or m0["sample_id"].duplicated().any() or set(m0["sample_id"]) != set(expected_ids):
         raise ValueError("M0 OOF Cartesian coverage is incomplete or incompatible")
@@ -321,51 +376,18 @@ def _load_m0(config: SGRPNConfig, manifest: pd.DataFrame, folds: pd.DataFrame) -
     )
 
 
-def _load_quality_features(
-    config: SGRPNConfig, manifest: pd.DataFrame
-) -> pd.DataFrame:
-    features = Path(config.output_dir) / "features"
-    npz_path = features / "order_spectrum_cache.npz"
-    metadata_path = features / "order_spectrum_cache.json"
-    metadata = _read_json(metadata_path, "order-spectrum cache metadata")
-    if (
-        not npz_path.is_file()
-        or metadata.get("cache_sha256") != _sha256(npz_path)
-        or metadata.get("manifest_sha256") != _sha256(Path(config.manifest_path))
-        or metadata.get("window_index_sha256") != _sha256(Path(config.window_index_path))
-        or metadata.get("sample_rate_hz") != 25600
-        or metadata.get("grid") != (np.arange(361, dtype=np.float64) * 0.25).tolist()
-    ):
-        raise ValueError("order-spectrum cache fingerprints/protocol are incompatible")
-    try:
-        with np.load(npz_path, allow_pickle=False) as archive:
-            if set(archive.files) != {
-                "segment_ids", "spectra", "offsets", "quality", "durations_s"
-            }:
-                raise ValueError("order-spectrum cache schema is incompatible")
-            segment_ids = tuple(str(value) for value in archive["segment_ids"].tolist())
-            quality = np.asarray(archive["quality"], dtype=np.float64)
-    except (OSError, ValueError) as error:
-        if "incompatible" in str(error):
-            raise
-        raise ValueError("order-spectrum cache cannot be loaded") from error
-    expected_ids = tuple(manifest["sample_id"].astype(str))
-    if segment_ids != expected_ids or quality.shape != (len(expected_ids), 7) or not np.isfinite(quality).all():
-        raise ValueError("order-spectrum cache quality/ID binding is incompatible")
-    return pd.DataFrame(
-        {
-            "sample_id": expected_ids,
-            **{f"quality_{index}": quality[:, index] for index in range(7)},
-        }
-    )
-
-
 def load_formal_phase_a_predictions(
     config: SGRPNConfig,
+    *,
+    output_root: str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Load complete formal OOF artifacts; this function cannot train models."""
-    output = _validate_output_dir(config)
-    manifest, folds = _manifest_and_folds(config)
+    output = validate_phase_a_output_root(config.output_dir, output_root=output_root)
+    bundle = load_data_bundle(config)
+    cache = load_order_cache(bundle, config)
+    expected_fingerprint = build_run_fingerprint(config, bundle, cache)
+    manifest = bundle.manifest.copy()
+    folds = bundle.folds.copy()
     fingerprints: set[str] = set()
     devices: set[str] = set()
     fold_predictions: list[pd.DataFrame] = []
@@ -377,13 +399,14 @@ def load_formal_phase_a_predictions(
             ["sample_id", "group_id", "version", "sample_weight", "ra_mean"],
         ].reset_index(drop=True)
         fingerprint, device, persisted = _verify_fold_artifacts(
-            output, fold, expected_frame
+            output, fold, expected_frame, expected_fingerprint
         )
         fingerprints.add(fingerprint)
         devices.add(device)
         fold_predictions.append(persisted)
-    if len(fingerprints) != 1:
+    if fingerprints != {expected_fingerprint.value}:
         raise ValueError("formal fold fingerprints do not match")
+    _validate_formal_run_manifest(output, config, expected_fingerprint)
     combined_path = output / "oof_predictions.csv"
     trained = _typed_predictions(combined_path)
     if tuple(trained.columns) != PREDICTION_COLUMNS:
@@ -392,6 +415,11 @@ def load_formal_phase_a_predictions(
     task7_expected = len(manifest) * len(MODEL_SEQUENCE)
     if len(trained) != task7_expected or set(trained["model"].astype(str)) != set(MODEL_SEQUENCE):
         raise ValueError("trained OOF Cartesian coverage is incomplete or incompatible")
+    trained = validate_prediction_cartesian(
+        trained,
+        expected_sample_ids=tuple(manifest["sample_id"].astype(str)),
+        models=MODEL_SEQUENCE,
+    )
     normalized_trained = trained.copy()
     normalized_trained["fold"] = pd.to_numeric(normalized_trained["fold"], errors="raise").astype(np.int64)
     normalized_trained["seed"] = pd.to_numeric(normalized_trained["seed"], errors="raise").astype(np.int64)
@@ -419,15 +447,28 @@ def load_formal_phase_a_predictions(
     mapped = predictions["sample_id"].map(fold_map)
     if not np.array_equal(pd.to_numeric(predictions["fold"]).astype(int), mapped.astype(int)):
         raise ValueError("formal OOF fold mapping is incompatible")
-    run_manifest_path = output / "run_manifest.json"
-    if run_manifest_path.is_file():
-        run_manifest = _read_json(run_manifest_path, "run manifest")
-        recorded = run_manifest.get("training_fingerprint")
-        if recorded is not None and recorded not in fingerprints:
-            raise ValueError("run-manifest training fingerprint mismatch")
+    quality = pd.DataFrame(
+        {
+            "sample_id": tuple(cache.segment_ids),
+            **{
+                f"quality_{index}": cache.quality[:, index]
+                for index in range(cache.quality.shape[1])
+            },
+        }
+    )
+    manifest.attrs["duration_audit"] = bundle.duration_audit.copy()
+    manifest.attrs["quality_features"] = quality
     return predictions, manifest, {
-        "training_fingerprint": next(iter(fingerprints)),
+        "training_fingerprint": expected_fingerprint.value,
+        "config_sha256": expected_fingerprint.config_sha256,
+        "manifest_sha256": expected_fingerprint.manifest_sha256,
+        "folds_sha256": expected_fingerprint.folds_sha256,
+        "cache_sha256": expected_fingerprint.cache_sha256,
         "selected_devices": sorted(devices),
+        "duration_audit": {
+            "provenance": "canonical_current_data",
+            "row_count": int(len(bundle.duration_audit)),
+        },
     }
 
 
@@ -436,13 +477,8 @@ def _evaluate(config: SGRPNConfig) -> None:
     if config.bootstrap_repetitions != 10_000:
         raise ValueError("formal Phase A requires exactly 10000 bootstrap repetitions")
     predictions, manifest, provenance = load_formal_phase_a_predictions(config)
-    quality = _load_quality_features(config, manifest)
-    duration_path = output / "audit" / "duration_audit.csv"
-    duration = (
-        pd.read_csv(duration_path, dtype={"sample_id": str})
-        if duration_path.is_file()
-        else None
-    )
+    quality = manifest.attrs["quality_features"]
+    duration = manifest.attrs["duration_audit"]
     written = write_phase_a_report(
         output,
         predictions,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 from typing import Any, Sequence
 
 import numpy as np
@@ -28,6 +29,7 @@ BOOTSTRAP_SEED = 20260723
 BOOTSTRAP_REPETITIONS = 10_000
 BOOTSTRAP_UNIT = "group_id"
 MATERIAL_MARGIN_UM = 0.01
+SAFETY_THRESHOLD_ATOL = 1e-12
 
 
 @dataclass(frozen=True)
@@ -311,7 +313,24 @@ def validate_prediction_cartesian(
         or actual_pairs != expected_pairs
     ):
         raise ValueError("OOF predictions must equal the exact sample/model Cartesian product")
-    numeric_columns = ("fold", "seed", "target", "prediction", "sample_weight")
+    from .training import _canonical_integer_text
+
+    def exact_integer_column(column: str) -> np.ndarray:
+        parsed: list[int] = []
+        for value in values[column]:
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"OOF {column} must use canonical integral values")
+            if isinstance(value, (int, np.integer)):
+                parsed.append(int(value))
+            elif isinstance(value, str) and _canonical_integer_text(value, signed=True):
+                parsed.append(int(value))
+            else:
+                raise ValueError(f"OOF {column} must use canonical integral values")
+        return np.asarray(parsed, dtype=np.int64)
+
+    numeric_columns = ("target", "prediction", "sample_weight")
+    folds = exact_integer_column("fold")
+    seeds = exact_integer_column("seed")
     try:
         numeric = values.loc[:, numeric_columns].apply(pd.to_numeric, errors="raise")
     except (TypeError, ValueError) as error:
@@ -319,11 +338,11 @@ def validate_prediction_cartesian(
     if (
         not np.isfinite(numeric.to_numpy(dtype=np.float64)).all()
         or np.any(numeric["sample_weight"].to_numpy(dtype=np.float64) <= 0.0)
-        or set(numeric["seed"].to_numpy(dtype=np.int64)) != {BOOTSTRAP_SEED}
-        or not np.equal(numeric["fold"], np.floor(numeric["fold"])).all()
-        or not np.equal(numeric["seed"], np.floor(numeric["seed"])).all()
+        or set(seeds) != {BOOTSTRAP_SEED}
     ):
         raise ValueError("OOF fold/seed/target/prediction/weight values are incompatible")
+    values.loc[:, "fold"] = folds
+    values.loc[:, "seed"] = seeds
     values.loc[:, numeric_columns] = numeric
     invariants = values.groupby("sample_id", sort=False, observed=True).agg(
         groups=("group_id", "nunique"),
@@ -419,6 +438,9 @@ def build_acceptance_inputs(
     gates = np.asarray(gate_values, dtype=np.float64)
     if gates.ndim != 1 or gates.size == 0 or not np.isfinite(gates).all() or np.any((gates < 0.0) | (gates > 1.0)):
         raise ValueError("gate values must be a non-empty finite vector in [0, 1]")
+    def exact_decimal_reduction(reference: float, candidate: float) -> float:
+        return float(Decimal(str(reference)) - Decimal(str(candidate)))
+
     return AcceptanceInputs(
         p1_mae_ratio_to_m0=float(rows["P1"]["weighted_mae"] / rows["M0"]["weighted_mae"]),
         p1_r2_drop_from_m0=float(rows["M0"]["weighted_r2"] - rows["P1"]["weighted_r2"]),
@@ -426,8 +448,8 @@ def build_acceptance_inputs(
         g1_rmse_ratio_to_p1=float(rows["G1"]["weighted_rmse"] / rows["P1"]["weighted_rmse"]),
         g1_r2_drop_from_p1=float(rows["P1"]["weighted_r2"] - rows["G1"]["weighted_r2"]),
         g1_fold_wins=int((pivot["G1"] < pivot["P1"]).sum()),
-        transfer_reduction_vs_f1=float(rates["F1"] - rates["G1"]),
-        transfer_reduction_vs_r1=float(rates["R1"] - rates["G1"]),
+        transfer_reduction_vs_f1=exact_decimal_reduction(rates["F1"], rates["G1"]),
+        transfer_reduction_vs_r1=exact_decimal_reduction(rates["R1"], rates["G1"]),
         gate_median=float(np.median(gates)),
         gate_p95=float(np.quantile(gates, 0.95)),
     )
@@ -451,8 +473,11 @@ def assess_phase_a(inputs: AcceptanceInputs) -> PhaseADecision:
     )
     safety_path = bool(
         noninferior
-        and inputs.transfer_reduction_vs_f1 >= 0.10
-        and inputs.transfer_reduction_vs_r1 >= 0.10
+        # Rates originate as rational group counts but travel through CSV
+        # decimals. This tight tolerance admits mathematical equality at 0.10
+        # without relaxing any scientifically meaningful threshold.
+        and inputs.transfer_reduction_vs_f1 + SAFETY_THRESHOLD_ATOL >= 0.10
+        and inputs.transfer_reduction_vs_r1 + SAFETY_THRESHOLD_ATOL >= 0.10
     )
     collapsed = bool(
         inputs.gate_median < 0.05
@@ -508,6 +533,7 @@ __all__ = [
     "PHASE_A_MODELS",
     "PREDICTION_COLUMNS",
     "PhaseADecision",
+    "SAFETY_THRESHOLD_ATOL",
     "assess_phase_a",
     "build_acceptance_inputs",
     "negative_transfer",

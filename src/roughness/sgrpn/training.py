@@ -65,6 +65,26 @@ _PROJECT_PHASE_A_OUTPUT = (
 ).resolve()
 
 
+def validate_phase_a_output_root(
+    configured_output: str | Path,
+    *,
+    output_root: str | Path | None = None,
+) -> Path:
+    """Require the one production root, with an explicit exact test injection."""
+    configured = Path(configured_output).resolve()
+    allowed = (
+        _PROJECT_PHASE_A_OUTPUT
+        if output_root is None
+        else Path(output_root).resolve()
+    )
+    if configured != allowed:
+        raise ValueError(
+            "Phase A requires the exact project output root outputs/sgrpn/phase_a; "
+            "temporary roots require explicit exact output_root injection"
+        )
+    return configured
+
+
 @dataclass(frozen=True)
 class RunFingerprint:
     value: str
@@ -1878,16 +1898,7 @@ def _validate_protocol(
         or not np.allclose(weights, 1.0 / split_counts, rtol=0.0, atol=1e-12)
     ):
         raise ValueError("Phase A sample_weight must equal 1/split_count")
-    allowed_output = (
-        _PROJECT_PHASE_A_OUTPUT
-        if output_root is None
-        else Path(output_root).resolve()
-    )
-    if Path(config.output_dir).resolve() != allowed_output:
-        raise ValueError(
-            "Phase A output root must be the exact project outputs/sgrpn/phase_a; "
-            "temporary roots require explicit output_root injection"
-        )
+    validate_phase_a_output_root(config.output_dir, output_root=output_root)
     if len(cache.segment_ids) != len(bundle.manifest) or tuple(
         bundle.manifest["sample_id"].astype(str)
     ) != tuple(cache.segment_ids):
@@ -2531,4 +2542,5 @@ __all__ = [
     "run_phase_a_fold",
     "select_epochs_group_cv",
     "set_global_seed",
+    "validate_phase_a_output_root",
 ]

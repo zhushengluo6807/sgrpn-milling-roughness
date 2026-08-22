@@ -157,9 +157,18 @@ def _build_duration_audit(manifest: pd.DataFrame) -> pd.DataFrame:
 def load_data_bundle(config: SGRPNConfig) -> DataBundle:
     if config.sample_rate_hz != 25600:
         raise ValueError("Phase A sample_rate_hz must be exactly 25600")
-    manifest = pd.read_csv(config.manifest_path)
-    folds = pd.read_csv(config.folds_path)
-    windows = pd.read_csv(config.window_index_path)
+    manifest = pd.read_csv(
+        config.manifest_path,
+        dtype={"sample_id": str, "group_id": str, "version": str},
+    )
+    folds = pd.read_csv(
+        config.folds_path,
+        dtype={"sample_id": str, "group_id": str},
+    )
+    windows = pd.read_csv(
+        config.window_index_path,
+        dtype={"segment_id": str, "group_id": str},
+    )
     _validate_manifest(manifest)
     _validate_windows(manifest, windows)
     fold_audit = validate_outer_folds(manifest, folds)
