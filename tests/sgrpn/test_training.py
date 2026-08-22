@@ -738,6 +738,7 @@ def test_resume_requires_exact_fingerprint_fold_seed_and_model_set(tmp_path: Pat
     marker.write_text(
         json.dumps(
             {
+                "protocol": "sgrpn-phase-a-v2",
                 "status": "complete",
                 "fingerprint": "current",
                 "fold": 2,
@@ -752,6 +753,13 @@ def test_resume_requires_exact_fingerprint_fold_seed_and_model_set(tmp_path: Pat
     assert not completed_fold_matches(marker, "old", fold=2, seed=20260723)
     assert not completed_fold_matches(marker, "current", fold=1, seed=20260723)
     assert not completed_fold_matches(marker, "current", fold=2, seed=1)
+    raw = json.loads(marker.read_text(encoding="utf-8"))
+    raw.pop("protocol")
+    marker.write_text(json.dumps(raw), encoding="utf-8")
+    assert not completed_fold_matches(marker, "current", fold=2, seed=20260723)
+    raw["protocol"] = "sgrpn-phase-a-v1"
+    marker.write_text(json.dumps(raw), encoding="utf-8")
+    assert not completed_fold_matches(marker, "current", fold=2, seed=20260723)
 
 
 def test_fingerprint_binds_consumed_frames_and_source_provenance(tmp_path: Path):
@@ -772,6 +780,27 @@ def test_fingerprint_binds_consumed_frames_and_source_provenance(tmp_path: Path)
     assert build_run_fingerprint(config, bundle, cache).value != original.value
 
 
+def test_swap_aware_protocol_constant_changes_only_fingerprint_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import roughness.sgrpn.training as training
+
+    config, bundle, cache = _fixture(tmp_path)
+    current = build_run_fingerprint(config, bundle, cache)
+    assert getattr(training, "PHASE_A_PROTOCOL", None) == "sgrpn-phase-a-v2"
+
+    monkeypatch.setattr(
+        training, "PHASE_A_PROTOCOL", "sgrpn-phase-a-v1", raising=False
+    )
+    legacy = build_run_fingerprint(config, bundle, cache)
+
+    assert current.value != legacy.value
+    assert current.config_sha256 == legacy.config_sha256
+    assert current.manifest_sha256 == legacy.manifest_sha256
+    assert current.folds_sha256 == legacy.folds_sha256
+    assert current.cache_sha256 == legacy.cache_sha256
+
+
 def test_formal_seed_enables_strict_deterministic_algorithms(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -788,6 +817,77 @@ def test_temporary_output_root_requires_explicit_injection(tmp_path: Path):
     with pytest.raises(ValueError, match="output.*root|outputs/sgrpn/phase_a"):
         run_phase_a_fold(
             config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend()
+        )
+
+
+@pytest.mark.parametrize("protocol", [None, "sgrpn-phase-a-v1"])
+def test_legacy_completion_marker_rejects_before_artifact_load_or_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str | None
+):
+    import roughness.sgrpn.training as training
+
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    fingerprint = build_run_fingerprint(config, bundle, cache)
+    fold_dir = config.output_dir / "folds" / "fold_0" / "seed_20260723"
+    fold_dir.mkdir(parents=True)
+    marker = {
+        "status": "complete",
+        "fingerprint": fingerprint.value,
+        "fold": 0,
+        "seed": 20260723,
+        "models": list(MODEL_SEQUENCE),
+        "completed_stages": list(MODEL_SEQUENCE),
+    }
+    if protocol is not None:
+        marker["protocol"] = protocol
+    (fold_dir / "complete.json").write_text(json.dumps(marker), encoding="utf-8")
+    monkeypatch.setattr(
+        training,
+        "_load_completed_fold",
+        lambda *_args, **_kwargs: pytest.fail("legacy marker reached artifact loading"),
+    )
+
+    class FailIfCalled:
+        def fit(self, **_kwargs):
+            pytest.fail("legacy marker reached backend")
+
+    with pytest.raises(ValueError, match="protocol|incompatible"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu",
+            backend=FailIfCalled(), output_root=config.output_dir,
+        )
+
+
+@pytest.mark.parametrize("protocol", [None, "sgrpn-phase-a-v1"])
+def test_legacy_partial_state_rejects_before_backend(
+    tmp_path: Path, protocol: str | None
+):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    fingerprint = build_run_fingerprint(config, bundle, cache)
+    fold_dir = config.output_dir / "folds" / "fold_0" / "seed_20260723"
+    fold_dir.mkdir(parents=True)
+    state = {
+        "status": "running",
+        "fingerprint": fingerprint.value,
+        "fold": 0,
+        "seed": 20260723,
+        "models": list(MODEL_SEQUENCE),
+        "completed_stages": [],
+        "next_stage": "P1",
+        "device": "cpu",
+    }
+    if protocol is not None:
+        state["protocol"] = protocol
+    (fold_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    class FailIfCalled:
+        def fit(self, **_kwargs):
+            pytest.fail("legacy partial state reached backend")
+
+    with pytest.raises(ValueError, match="protocol|incompatible"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu",
+            backend=FailIfCalled(), output_root=config.output_dir,
         )
 
 
@@ -937,6 +1037,94 @@ def test_fold_checkpoint_is_atomic_and_exact_completed_fold_is_reused(tmp_path: 
             backend=FailIfCalled(),
             output_root=config.output_dir,
         )
+
+
+def test_new_artifacts_persist_exact_swap_aware_protocol(tmp_path: Path):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    run_phase_a_fold(
+        config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+        output_root=config.output_dir,
+    )
+    fold_dir = config.output_dir / "folds" / "fold_0" / "seed_20260723"
+    marker = json.loads((fold_dir / "complete.json").read_text(encoding="utf-8"))
+    state = json.loads((fold_dir / "state.json").read_text(encoding="utf-8"))
+    assert marker["protocol"] == "sgrpn-phase-a-v2"
+    assert state["protocol"] == "sgrpn-phase-a-v2"
+    for stage in MODEL_SEQUENCE:
+        checkpoint = torch.load(
+            fold_dir / "checkpoints" / f"{stage}.pt",
+            map_location="cpu", weights_only=False,
+        )
+        history = pd.read_csv(fold_dir / "history" / f"{stage}.csv")
+        with np.load(
+            fold_dir / "scalers" / f"{stage}_scalers.npz", allow_pickle=False
+        ) as archive:
+            scaler_metadata = json.loads(str(archive["metadata_json"].item()))
+        assert checkpoint["protocol"] == "sgrpn-phase-a-v2"
+        assert set(history["protocol"]) == {"sgrpn-phase-a-v2"}
+        assert scaler_metadata["protocol"] == "sgrpn-phase-a-v2"
+
+
+def test_deep_artifact_validators_reject_legacy_or_missing_protocol(tmp_path: Path):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    run_phase_a_fold(
+        config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+        output_root=config.output_dir,
+    )
+    fold_dir = config.output_dir / "folds" / "fold_0" / "seed_20260723"
+    marker_path = fold_dir / "complete.json"
+
+    def update_hash(relative: str) -> None:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["artifacts"][relative] = hashlib.sha256(
+            (fold_dir / relative).read_bytes()
+        ).hexdigest()
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    artifacts = (
+        ("checkpoint", "checkpoints/P1.pt"),
+        ("history", "history/P1.csv"),
+        ("scaler", "scalers/P1_scalers.npz"),
+    )
+    for kind, relative in artifacts:
+        path = fold_dir / relative
+        pristine = path.read_bytes()
+        for legacy_protocol in ("sgrpn-phase-a-v1", None):
+            path.write_bytes(pristine)
+            if kind == "checkpoint":
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+                if legacy_protocol is None:
+                    payload.pop("protocol")
+                else:
+                    payload["protocol"] = legacy_protocol
+                torch.save(payload, path)
+            elif kind == "history":
+                history = pd.read_csv(path)
+                if legacy_protocol is None:
+                    history = history.drop(columns="protocol")
+                else:
+                    history["protocol"] = legacy_protocol
+                history.to_csv(path, index=False)
+            else:
+                with np.load(path, allow_pickle=False) as archive:
+                    arrays = {name: archive[name].copy() for name in archive.files}
+                metadata = json.loads(str(arrays["metadata_json"].item()))
+                if legacy_protocol is None:
+                    metadata.pop("protocol")
+                else:
+                    metadata["protocol"] = legacy_protocol
+                arrays["metadata_json"] = np.asarray(
+                    json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+                )
+                np.savez_compressed(path, **arrays)
+            update_hash(relative)
+            with pytest.raises(ValueError, match="protocol|metadata|schema|checkpoint"):
+                run_phase_a_fold(
+                    config, bundle, cache, 0, 20260723, "cpu",
+                    backend=RecordingBackend(), output_root=config.output_dir,
+                )
+        path.write_bytes(pristine)
+        update_hash(relative)
 
 
 def test_formal_backend_cannot_substitute_model_and_never_marks_complete(tmp_path: Path):

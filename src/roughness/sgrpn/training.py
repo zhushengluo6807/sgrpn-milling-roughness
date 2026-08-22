@@ -55,6 +55,7 @@ from .order_spectrum import (
 )
 
 
+PHASE_A_PROTOCOL = "sgrpn-phase-a-v2"
 MODEL_SEQUENCE = ("P1", "V1", "F1", "R1", "G1")
 OOF_COLUMNS = (
     "sample_id", "group_id", "version", "fold", "seed", "model",
@@ -203,7 +204,7 @@ def build_run_fingerprint(
     value = _sha256_bytes(
         json.dumps(
             {
-                "protocol": "sgrpn-phase-a-v1",
+                "protocol": PHASE_A_PROTOCOL,
                 "config": config_sha,
                 "manifest": manifest_sha,
                 "folds": folds_sha,
@@ -287,6 +288,7 @@ def completed_fold_matches(
     raw_seed = raw.get("seed")
     return bool(
         raw.get("status") == "complete"
+        and raw.get("protocol") == PHASE_A_PROTOCOL
         and raw.get("fingerprint") == str(fingerprint)
         and raw.get("models") == expected_models
         and raw.get("completed_stages") == expected_models
@@ -1498,6 +1500,7 @@ def _state_payload(
 ) -> dict[str, Any]:
     return {
         "status": status,
+        "protocol": PHASE_A_PROTOCOL,
         "fingerprint": fingerprint.value,
         "fold": int(fold),
         "seed": int(seed),
@@ -1519,7 +1522,8 @@ def _validate_partial_state(
         raise ValueError("incompatible or corrupt partial fold state") from error
     completed = raw.get("completed_stages")
     if (
-        raw.get("fingerprint") != fingerprint.value
+        raw.get("protocol") != PHASE_A_PROTOCOL
+        or raw.get("fingerprint") != fingerprint.value
         or not isinstance(raw.get("fold"), int)
         or isinstance(raw.get("fold"), bool)
         or raw.get("fold") != int(fold)
@@ -1546,7 +1550,7 @@ def _checkpoint_payload(
     device: torch.device,
 ) -> dict[str, Any]:
     return {
-        "protocol": "sgrpn-phase-a-v1",
+        "protocol": PHASE_A_PROTOCOL,
         "fingerprint": fingerprint.value,
         "fold": int(fold),
         "seed": int(seed),
@@ -1575,7 +1579,7 @@ def _persist_stage(
 ) -> tuple[Path, Path]:
     checkpoint, history_path, scaler_path = _stage_paths(fold_dir, stage)
     metadata = {
-        "protocol": "sgrpn-phase-a-v1",
+        "protocol": PHASE_A_PROTOCOL,
         "fingerprint": fingerprint.value,
         "fold": int(fold),
         "seed": int(seed),
@@ -2007,7 +2011,7 @@ def _validate_checkpoint(
     refit_epochs = payload.get("refit_epochs") if isinstance(payload, dict) else None
     if (
         not isinstance(payload, dict)
-        or payload.get("protocol") != "sgrpn-phase-a-v1"
+        or payload.get("protocol") != PHASE_A_PROTOCOL
         or payload.get("fingerprint") != fingerprint.value
         or not isinstance(payload.get("fold"), int)
         or isinstance(payload.get("fold"), bool)
@@ -2060,7 +2064,7 @@ def _artifact_metadata(
     best_epochs: Sequence[int], refit_epochs: int,
 ) -> dict[str, Any]:
     return {
-        "protocol": "sgrpn-phase-a-v1",
+        "protocol": PHASE_A_PROTOCOL,
         "fingerprint": fingerprint.value,
         "fold": int(fold),
         "seed": int(seed),
@@ -2535,6 +2539,7 @@ __all__ = [
     "EpochSelection",
     "FoldArtifacts",
     "MODEL_SEQUENCE",
+    "PHASE_A_PROTOCOL",
     "RunFingerprint",
     "TorchTrainingBackend",
     "TrainingBackend",
