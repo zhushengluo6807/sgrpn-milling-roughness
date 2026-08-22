@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import csv
 import json
 from pathlib import Path
 import hashlib
+import random
 
 import numpy as np
 import pandas as pd
@@ -187,11 +189,15 @@ class RecordingBackend:
                 "device": str(device),
             }
         )
+        best_epoch = max(1, min(int(max_epochs), 2))
         return TrainingResult(
             model=model,
-            best_epoch=max(1, min(int(max_epochs), 2)),
+            best_epoch=best_epoch,
             history=pd.DataFrame(
-                [{"epoch": 1, "train_loss": 0.0, "validation_loss": 0.0}]
+                [
+                    {"epoch": epoch, "train_loss": 0.0, "validation_loss": 0.0}
+                    for epoch in range(1, best_epoch + 1)
+                ]
             ),
         )
 
@@ -281,6 +287,43 @@ class LabelSensitiveBackend:
         )
 
 
+class VariableRngBackend:
+    """Preserve constructor state while consuming label-dependent RNG."""
+
+    def __init__(self) -> None:
+        self.gate_expert_hashes: dict[tuple[str, ...], str] = {}
+
+    def fit(self, **kwargs) -> TrainingResult:
+        model = kwargs["model"]
+        train_batches = list(kwargs["train_loader"])
+        validation_loader = kwargs["validation_loader"]
+        valid_batches = [] if validation_loader is None else list(validation_loader)
+        valid_ids = tuple(
+            sorted(item for batch in valid_batches for item in batch["sample_id"])
+        )
+        if kwargs["stage"] == "G1" and valid_ids:
+            self.gate_expert_hashes[valid_ids] = _expert_hash(model)
+        exposed = torch.cat(
+            [batch["target"] for batch in (*train_batches, *valid_batches)]
+        ).numpy()
+        draws = hashlib.sha256(exposed.tobytes()).digest()[0] + 1
+        # An adversarial trainer may consume each RNG stream in a quantity
+        # determined by labels/early-stopping history. It must not influence
+        # any later model constructor.
+        torch.rand(draws)
+        np.random.random(draws)
+        for _ in range(draws):
+            random.random()
+        loss = float(np.mean(exposed))
+        return TrainingResult(
+            model=model,
+            best_epoch=1,
+            history=pd.DataFrame(
+                [{"epoch": 1, "train_loss": loss, "validation_loss": loss}]
+            ),
+        )
+
+
 def test_epoch_selection_uses_rounded_median_inner_best_epoch():
     assert EpochSelection(best_epochs=(3, 9, 5, 7)).refit_epochs == 6
 
@@ -334,6 +377,50 @@ def test_public_selection_preflights_groups_and_audits_scaler_boundaries():
     corrupt = _AuditedFactory(frame, corrupt_scaler=True)
     with pytest.raises(ValueError, match="scaler.*inner-train|boundary"):
         select_epochs_group_cv(component_factory, corrupt, splits, train_step, None)
+
+
+def test_public_selection_and_refit_reject_reused_model_instances():
+    frame = pd.DataFrame(
+        {"sample_id": [f"s{i}" for i in range(8)], "group_id": [f"g{i}" for i in range(8)]}
+    )
+    splits = make_group_inner_splits(frame, n_splits=4, seed=20260723)
+    datasets = _AuditedFactory(frame)
+    shared = nn.Linear(1, 1)
+
+    with pytest.raises(ValueError, match="fresh|reuse|instance"):
+        select_epochs_group_cv(
+            lambda _fold: shared,
+            datasets,
+            splits,
+            lambda *_args: 1,
+            None,
+        )
+
+    selection_models: list[nn.Module] = []
+
+    def fresh(_fold):
+        model = nn.Linear(1, 1)
+        selection_models.append(model)
+        return model
+
+    selection = select_epochs_group_cv(
+        fresh, datasets, splits, lambda *_args: 1, None
+    )
+
+    class RefitFactory:
+        audit_frame = frame
+
+        def __call__(self):
+            ids = tuple(frame["sample_id"])
+            return ComponentRefitData("all", ids, ids)
+
+    with pytest.raises(ValueError, match="fresh|reuse|selection"):
+        refit_component(
+            lambda: selection_models[0],
+            RefitFactory(),
+            selection,
+            lambda model, *_args: model,
+        )
 
 
 @pytest.mark.parametrize("kind", ["overlap", "incomplete", "duplicate_coverage"])
@@ -530,12 +617,15 @@ def test_fold_orchestration_is_leakage_safe_and_uses_fixed_stage_order(
     assert all(call["device"] == "cpu" for call in backend.calls)
 
 
-def test_gate_fold_experts_are_invariant_to_that_validation_groups_labels(tmp_path: Path):
+@pytest.mark.parametrize("inner_fold", range(4))
+def test_gate_fold_expert_initialization_is_rng_isolated_from_validation_labels(
+    tmp_path: Path, inner_fold: int
+):
     first_config, first_bundle, first_cache = _fixture(tmp_path / "first", max_epochs=1)
     train = first_bundle.manifest.loc[first_bundle.folds["fold"].to_numpy() != 0].reset_index(drop=True)
-    first_split = make_group_inner_splits(train, n_splits=4, seed=20260723)[0][1]
+    first_split = make_group_inner_splits(train, n_splits=4, seed=20260723)[inner_fold][1]
     held_out_ids = tuple(sorted(train.iloc[first_split]["sample_id"].astype(str)))
-    first_backend = LabelSensitiveBackend(outer_train_count=len(train))
+    first_backend = VariableRngBackend()
     run_phase_a_fold(
         first_config, first_bundle, first_cache, fold=0, seed=20260723,
         device="cpu", backend=first_backend, output_root=first_config.output_dir,
@@ -544,16 +634,15 @@ def test_gate_fold_experts_are_invariant_to_that_validation_groups_labels(tmp_pa
     second_config, second_bundle, second_cache = _fixture(tmp_path / "second", max_epochs=1)
     mask = second_bundle.manifest["sample_id"].astype(str).isin(held_out_ids)
     for column in ("ra_1", "ra_2", "ra_3", "ra_mean"):
-        second_bundle.manifest.loc[mask, column] += 1000.0
+        second_bundle.manifest.loc[mask, column] += 123.456
     second_bundle.manifest.to_csv(second_config.manifest_path, index=False)
-    second_backend = LabelSensitiveBackend(outer_train_count=len(train))
+    second_backend = VariableRngBackend()
     run_phase_a_fold(
         second_config, second_bundle, second_cache, fold=0, seed=20260723,
         device="cpu", backend=second_backend, output_root=second_config.output_dir,
     )
 
     assert first_backend.gate_expert_hashes[held_out_ids] == second_backend.gate_expert_hashes[held_out_ids]
-    assert first_backend.gate_selected_hashes[held_out_ids] != second_backend.gate_selected_hashes[held_out_ids]
 
 
 def test_r1_outer_refit_targets_are_sample_specific_p1_oof_residuals(tmp_path: Path):
@@ -565,7 +654,6 @@ def test_r1_outer_refit_targets_are_sample_specific_p1_oof_residuals(tmp_path: P
         config, bundle, cache, fold=0, seed=20260723, device="cpu", backend=backend,
         output_root=config.output_dir,
     )
-
     expected = {
         str(row.sample_id): float(row.ra_mean) - backend.outer_p1_oof[str(row.sample_id)]
         for row in outer_train.itertuples(index=False)
@@ -576,6 +664,20 @@ def test_r1_outer_refit_targets_are_sample_specific_p1_oof_residuals(tmp_path: P
         not np.isclose(backend.outer_p1_oof[sample_id], backend.final_p1_prediction[sample_id])
         for sample_id in expected
     )
+
+
+def test_fold_confined_p1_results_are_cached_between_r1_and_g1(tmp_path: Path):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    backend = RecordingBackend()
+
+    run_phase_a_fold(
+        config, bundle, cache, fold=0, seed=20260723, device="cpu",
+        backend=backend, output_root=config.output_dir,
+    )
+
+    # Top-level P1 is 4 selections + 1 refit. Each of the four exclusion
+    # boundaries is also 4 + 1, and G1 must reuse those immutable snapshots.
+    assert sum(call["stage"] == "P1" for call in backend.calls) == 25
 
 
 def test_fold_checkpoint_is_atomic_and_exact_completed_fold_is_reused(tmp_path: Path):
@@ -642,6 +744,101 @@ def test_resume_deeply_validates_all_stage_artifacts(tmp_path: Path):
         run_phase_a_fold(config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(), output_root=config.output_dir)
 
 
+def test_stage_artifacts_bind_metadata_epochs_and_embedded_g1_experts(tmp_path: Path):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    run_phase_a_fold(
+        config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+        output_root=config.output_dir,
+    )
+    fold_dir = config.output_dir / "folds" / "fold_0" / "seed_20260723"
+    marker_path = fold_dir / "complete.json"
+
+    for stage in MODEL_SEQUENCE:
+        history_path = fold_dir / "history" / f"{stage}.csv"
+        history = pd.read_csv(history_path)
+        assert {
+            "protocol", "fingerprint", "fold", "seed", "stage",
+            "best_epochs", "refit_epochs",
+        }.issubset(history.columns)
+        scaler_path = fold_dir / "scalers" / f"{stage}_scalers.npz"
+        with np.load(scaler_path, allow_pickle=False) as archive:
+            metadata = json.loads(str(archive["metadata_json"].item()))
+        checkpoint = torch.load(
+            fold_dir / "checkpoints" / f"{stage}.pt",
+            map_location="cpu", weights_only=False,
+        )
+        assert metadata == {
+            key: checkpoint[key]
+            for key in (
+                "protocol", "fingerprint", "fold", "seed", "best_epochs",
+                "refit_epochs",
+            )
+        } | {"stage": stage}
+
+    def update_hash(relative: str) -> None:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["artifacts"][relative] = hashlib.sha256(
+            (fold_dir / relative).read_bytes()
+        ).hexdigest()
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    history_relative = "history/P1.csv"
+    history_path = fold_dir / history_relative
+    pristine_history = history_path.read_bytes()
+    fractional = pd.read_csv(history_path)
+    fractional["inner_fold"] = fractional["inner_fold"].astype(object)
+    fractional.loc[0, "inner_fold"] = 0.5
+    fractional.to_csv(history_path, index=False)
+    update_hash(history_relative)
+    with pytest.raises(ValueError, match="history|integral|inner.fold"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+            output_root=config.output_dir,
+        )
+    history_path.write_bytes(pristine_history)
+    update_hash(history_relative)
+
+    p1_relative = "checkpoints/P1.pt"
+    p1_path = fold_dir / p1_relative
+    pristine_p1 = p1_path.read_bytes()
+    p1_payload = torch.load(p1_path, map_location="cpu", weights_only=False)
+    p1_payload["refit_epochs"] = 1.5
+    torch.save(p1_payload, p1_path)
+    update_hash(p1_relative)
+    with pytest.raises(ValueError, match="checkpoint|metadata|epoch"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+            output_root=config.output_dir,
+        )
+    p1_path.write_bytes(pristine_p1)
+    update_hash(p1_relative)
+
+    history_path.write_bytes((fold_dir / "history" / "V1.csv").read_bytes())
+    update_hash(history_relative)
+    with pytest.raises(ValueError, match="history|metadata|stage"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+            output_root=config.output_dir,
+        )
+    history_path.write_bytes(pristine_history)
+    update_hash(history_relative)
+
+    g1_relative = "checkpoints/G1.pt"
+    g1_path = fold_dir / g1_relative
+    g1_payload = torch.load(g1_path, map_location="cpu", weights_only=False)
+    expert_key = next(
+        key for key in g1_payload["model_state"] if key.startswith("process_expert.")
+    )
+    g1_payload["model_state"][expert_key] = g1_payload["model_state"][expert_key] + 1
+    torch.save(g1_payload, g1_path)
+    update_hash(g1_relative)
+    with pytest.raises(ValueError, match="G1|expert|checkpoint"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+            output_root=config.output_dir,
+        )
+
+
 def test_resume_rejects_non_finite_scaler_even_with_matching_file_hash(tmp_path: Path):
     config, bundle, cache = _fixture(tmp_path, max_epochs=1)
     run_phase_a_fold(
@@ -700,6 +897,64 @@ def test_resume_preserves_leading_zero_ids_and_rejects_unexpected_oof_rows(tmp_p
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
     with pytest.raises(ValueError, match="OOF|prediction|sample|Cartesian|unexpected"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+            output_root=config.output_dir,
+        )
+
+
+@pytest.mark.parametrize("bad_seed", [True, 20260723.0])
+def test_protocol_rejects_non_integral_seed_types(tmp_path: Path, bad_seed):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    with pytest.raises(ValueError, match="seed|integral"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, bad_seed, "cpu", backend=RecordingBackend(),
+            output_root=config.output_dir,
+        )
+
+
+@pytest.mark.parametrize("bad_fold", [True, 0.5])
+def test_protocol_rejects_non_integral_outer_fold_definitions(tmp_path: Path, bad_fold):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    bundle.folds["fold"] = bundle.folds["fold"].astype(object)
+    bundle.folds.loc[0, "fold"] = bad_fold
+    with pytest.raises(ValueError, match="fold|integral|canonical"):
+        run_phase_a_fold(
+            config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+            output_root=config.output_dir,
+        )
+
+
+def test_oof_return_dtypes_are_canonical_and_resume_rejects_decimal_integers(tmp_path: Path):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    artifacts = run_phase_a_fold(
+        config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
+        output_root=config.output_dir,
+    )
+    predictions = artifacts.predictions
+    for column in ("sample_id", "group_id", "version", "model"):
+        assert all(isinstance(value, str) for value in predictions[column])
+    for column in ("fold", "seed"):
+        assert pd.api.types.is_integer_dtype(predictions[column])
+    for column in (
+        "target", "prediction", "sample_weight", "process_mean", "residual", "gate"
+    ):
+        assert pd.api.types.is_float_dtype(predictions[column])
+
+    fold_dir = config.output_dir / "folds" / "fold_0" / "seed_20260723"
+    prediction_path = fold_dir / "oof_predictions.csv"
+    with prediction_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+    fold_column = rows[0].index("fold")
+    rows[1][fold_column] = "0.0"
+    with prediction_path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    marker_path = fold_dir / "complete.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["predictions_sha256"] = hashlib.sha256(prediction_path.read_bytes()).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="OOF|fold|integral|canonical"):
         run_phase_a_fold(
             config, bundle, cache, 0, 20260723, "cpu", backend=RecordingBackend(),
             output_root=config.output_dir,
