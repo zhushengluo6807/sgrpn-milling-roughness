@@ -246,16 +246,14 @@ The variance optimizer values deliberately reuse the fixed Phase A gate optimize
 
 - [ ] **Step 6: Write failing handoff-tamper tests**
 
-Build one valid minimal Phase A v2 fixture whose marker registers the exact hashes of its checkpoint, history, and scaler. Parameterize these fail-closed mutations: remove `protocol` from marker or state; set either to `sgrpn-phase-a-v1`; remove or change embedded `protocol` in a checkpoint, history row, or scaler `metadata_json`; change any embedded fingerprint; change a registered artifact byte without updating its marker hash; change a marker artifact hash; and change the completion fingerprint. Also mutate one byte in each of acceptance, Phase A config, manifest, folds, and cache NPZ. For every case, assert `validate_phase_b_handoff` raises `ValueError` naming the affected artifact and that neither `output_dir` nor any child/temp path exists:
+Build one valid minimal Phase A v2 fixture whose marker registers the exact hashes of its checkpoint, history, and scaler. Keep deep-metadata tests separate from outer registered-hash tests so the outer hash barrier cannot mask whether the deep validator rejects bad metadata.
+
+**A. Deep metadata/fingerprint tests with a valid outer registered hash.** For checkpoint, history, and scaler, remove embedded `protocol`, set it to `sgrpn-phase-a-v1`, set it to another protocol, or change the embedded fingerprint. After each mutation, recompute that artifact's SHA-256 and update only its corresponding entry in `complete.json.artifacts`; assert the stored hash now equals the mutated file's actual hash before calling `validate_phase_b_handoff`. The handoff must therefore pass its outer file-hash comparison and then fail in the existing deep protocol/fingerprint validator:
 
 ```python
 @pytest.mark.parametrize(
     ("artifact", "mutation"),
     [
-        ("marker", "missing_protocol"),
-        ("marker", "v1_protocol"),
-        ("state", "missing_protocol"),
-        ("state", "v1_protocol"),
         ("checkpoint", "missing_protocol"),
         ("checkpoint", "v1_protocol"),
         ("checkpoint", "protocol_mismatch"),
@@ -268,23 +266,44 @@ Build one valid minimal Phase A v2 fixture whose marker registers the exact hash
         ("scaler", "v1_protocol"),
         ("scaler", "protocol_mismatch"),
         ("scaler", "fingerprint_mismatch"),
-        ("checkpoint", "registered_hash_mismatch"),
-        ("history", "registered_hash_mismatch"),
-        ("scaler", "registered_hash_mismatch"),
-        ("marker", "fingerprint_mismatch"),
     ],
 )
-def test_phase_b_handoff_rejects_deep_phase_a_mismatch_without_output(
+def test_phase_b_handoff_rejects_deep_metadata_after_hash_is_reregistered(
     valid_phase_a_v2_fixture, artifact, mutation
 ):
     config, output_dir = valid_phase_a_v2_fixture
-    mutate_phase_a_fixture(config, artifact=artifact, mutation=mutation)
-    with pytest.raises(ValueError, match=artifact):
+    artifact_path, marker_path, relative_name = mutate_deep_phase_a_metadata(
+        config, artifact=artifact, mutation=mutation
+    )
+    update_marker_artifact_sha256(marker_path, relative_name, sha256_file(artifact_path))
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["artifacts"][relative_name] == sha256_file(artifact_path)
+    with pytest.raises(ValueError, match=rf"{artifact}.*(protocol|fingerprint|metadata)"):
         validate_phase_b_handoff(config)
     assert not output_dir.exists()
 ```
 
-The fixture helper must rewrite hashes only while constructing its original valid state; mutation helpers must not repair the marker after tampering. Add a positive test proving a fully consistent `sgrpn-phase-a-v2` fixture returns the recomputed Phase A fingerprint and still does not create the Phase B directory. Add a separate closed-acceptance test with the same no-directory assertion.
+`update_marker_artifact_sha256` may update only the one registered artifact entry needed to expose the deep validation path; it must not change protocol, fingerprint, fold, seed, model lists, another artifact hash, or any artifact metadata.
+
+**B. Outer registered-hash barrier tests.** Mutate one byte in a checkpoint, history, or scaler and deliberately leave `complete.json.artifacts` unchanged. Assert the stored and actual hashes differ, then require failure specifically at the registered-hash check:
+
+```python
+@pytest.mark.parametrize("artifact", ["checkpoint", "history", "scaler"])
+def test_phase_b_handoff_rejects_registered_hash_mismatch_before_metadata(
+    valid_phase_a_v2_fixture, artifact
+):
+    config, output_dir = valid_phase_a_v2_fixture
+    artifact_path, marker_path, relative_name = mutate_registered_artifact_byte(
+        config, artifact=artifact
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["artifacts"][relative_name] != sha256_file(artifact_path)
+    with pytest.raises(ValueError, match=rf"{artifact}.*hash"):
+        validate_phase_b_handoff(config)
+    assert not output_dir.exists()
+```
+
+In separate fail-closed identity tests, remove `protocol` from marker or state; set either to `sgrpn-phase-a-v1`; change the marker/state completion fingerprint; mutate one byte in acceptance, Phase A config, manifest, folds, or cache NPZ; and change a marker artifact hash without changing the file. Every case must raise `ValueError` naming the affected artifact and leave the Phase B root absent. Add a positive test proving a fully consistent `sgrpn-phase-a-v2` fixture returns the recomputed Phase A fingerprint and still does not create the Phase B directory. Add a separate closed-acceptance test with the same no-directory assertion.
 
 - [ ] **Step 7: Implement the handoff validator**
 
@@ -298,7 +317,7 @@ For each of the five folds, require exact protocol `sgrpn-phase-a-v2` on both `c
 E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_config.py -v
 ```
 
-Expected: all config tests pass; the positive v2 fixture returns the recomputed fingerprint; every missing/v1/deep protocol, hash, or fingerprint mutation fails closed; and no success or failure case creates a `phase_b` directory.
+Expected: all config tests pass; the positive v2 fixture returns the recomputed fingerprint; category A reaches and fails the deep metadata validator after its outer registered hash has been repaired; category B fails at the unchanged outer hash barrier; every remaining missing/v1/identity mutation fails closed; and no success or failure case creates a `phase_b` directory.
 
 - [ ] **Step 9: Commit the gate and protocol**
 
