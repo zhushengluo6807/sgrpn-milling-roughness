@@ -298,7 +298,7 @@ def test_phase_b_handoff_rejects_registered_hash_mismatch_before_metadata(
     )
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert marker["artifacts"][relative_name] != sha256_file(artifact_path)
-    with pytest.raises(ValueError, match=rf"{artifact}.*hash"):
+    with pytest.raises(ValueError, match=rf"hash mismatch: .*{artifact}"):
         validate_phase_b_handoff(config)
     assert not output_dir.exists()
 ```
