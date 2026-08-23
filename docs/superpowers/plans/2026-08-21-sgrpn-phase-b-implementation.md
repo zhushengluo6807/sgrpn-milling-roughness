@@ -166,6 +166,9 @@ Expected: exit 0 and `Phase A gate verified: transfer_safety`. This shell check 
 ```python
 def test_phase_b_protocol_is_exactly_registered():
     config = load_phase_b_config("configs/sgrpn_phase_b.yaml")
+    assert config.phase_a_config_file_sha256 == (
+        "53768589f6e2311bd3386997ef9295b441290b5607a16f7d688696709110d192"
+    )
     assert tuple(config.seeds) == (20260723, 20260724, 20260725)
     assert tuple(config.alphas) == (0.10, 0.05)
     assert config.inner_splits == 4
@@ -184,6 +187,17 @@ def test_phase_b_rejects_unregistered_seed(tmp_path):
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="exactly 20260723, 20260724, 20260725"):
         load_phase_b_config(path)
+
+
+@pytest.mark.parametrize("value", ["A" * 64, "0" * 63, "g" * 64])
+def test_phase_b_rejects_noncanonical_phase_a_config_file_sha256(tmp_path, value):
+    source = Path("configs/sgrpn_phase_b.yaml")
+    payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+    payload["phase_a_config_file_sha256"] = value
+    path = tmp_path / "bad_phase_b.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="phase_a_config_file_sha256"):
+        load_phase_b_config(path)
 ```
 
 - [ ] **Step 3: Run the config tests to verify RED**
@@ -200,6 +214,7 @@ Expected: FAIL because `PhaseBConfig` and `load_phase_b_config` do not exist.
 @dataclass(frozen=True)
 class PhaseBConfig:
     phase_a_config_path: Path
+    phase_a_config_file_sha256: str
     phase_a_acceptance_path: Path
     phase_a_run_manifest_path: Path
     output_dir: Path
@@ -223,12 +238,13 @@ class PhaseAHandoff:
     input_sha256: Mapping[str, str]
 ```
 
-`load_phase_b_config` must reject extra/missing keys, booleans masquerading as numbers, a noncanonical seed order, alphas other than `(0.10, 0.05)`, a value other than four inner splits, and an output root other than exact project `outputs/sgrpn/phase_b` unless a test passes an explicit exact `output_root`.
+`PhaseAHandoff.phase_a_config_sha256` is the verified SHA-256 of the Phase A YAML file bytes, not `RunFingerprint.config_sha256`. `load_phase_b_config` must reject extra/missing keys, booleans masquerading as numbers, a `phase_a_config_file_sha256` that is not exactly 64 lowercase hexadecimal characters, a noncanonical seed order, alphas other than `(0.10, 0.05)`, a value other than four inner splits, and an output root other than exact project `outputs/sgrpn/phase_b` unless a test passes an explicit exact `output_root`.
 
 - [ ] **Step 5: Write the frozen YAML**
 
 ```yaml
 phase_a_config_path: sgrpn_phase_a.yaml
+phase_a_config_file_sha256: 53768589f6e2311bd3386997ef9295b441290b5607a16f7d688696709110d192
 phase_a_acceptance_path: ../outputs/sgrpn/phase_a/evaluation/acceptance.json
 phase_a_run_manifest_path: ../outputs/sgrpn/phase_a/run_manifest.json
 output_dir: ../outputs/sgrpn/phase_b
@@ -305,9 +321,46 @@ def test_phase_b_handoff_rejects_registered_hash_mismatch_before_metadata(
 
 In separate fail-closed identity tests, remove `protocol` from marker or state; set either to `sgrpn-phase-a-v1`; change the marker/state completion fingerprint; mutate one byte in acceptance, Phase A config, manifest, folds, or cache NPZ; and change a marker artifact hash without changing the file. Every case must raise `ValueError` naming the affected artifact and leave the Phase B root absent. Add a positive test proving a fully consistent `sgrpn-phase-a-v2` fixture returns the recomputed Phase A fingerprint and still does not create the Phase B directory. Add a separate closed-acceptance test with the same no-directory assertion.
 
+Add two explicit Phase A YAML byte-identity regressions. First, change only YAML formatting or append a comment, reload it, and prove the recomputed `RunFingerprint.config_sha256` is unchanged while the file-byte SHA-256 changes; `validate_phase_b_handoff` must still reject the byte mismatch before Phase B directory creation. Second, replace the loaded Phase B config's registered value with a different but syntactically valid 64-character lowercase hash such as `"0" * 64`, then require the handoff to reject it against the unchanged Phase A YAML bytes:
+
+```python
+def test_phase_b_handoff_rejects_yaml_byte_only_change_before_output(
+    valid_phase_a_v2_fixture
+):
+    config, output_dir = valid_phase_a_v2_fixture
+    path = config.phase_a_config_path
+    phase_a_before = load_sgrpn_config(path)
+    bundle_before = load_data_bundle(phase_a_before)
+    cache_before = load_order_cache(bundle_before, phase_a_before)
+    before = build_run_fingerprint(phase_a_before, bundle_before, cache_before)
+    path.write_text(path.read_text(encoding="utf-8") + "\n# byte-only change\n", encoding="utf-8")
+    phase_a_after = load_sgrpn_config(path)
+    bundle_after = load_data_bundle(phase_a_after)
+    cache_after = load_order_cache(bundle_after, phase_a_after)
+    after = build_run_fingerprint(phase_a_after, bundle_after, cache_after)
+    assert after.config_sha256 == before.config_sha256
+    assert after.value == before.value
+    assert sha256_file(path) != config.phase_a_config_file_sha256
+    with pytest.raises(ValueError, match="Phase A config file SHA-256"):
+        validate_phase_b_handoff(config)
+    assert not output_dir.exists()
+
+
+def test_phase_b_handoff_rejects_wrong_registered_config_file_hash(
+    valid_phase_a_v2_fixture
+):
+    config, output_dir = valid_phase_a_v2_fixture
+    wrong = replace(config, phase_a_config_file_sha256="0" * 64)
+    with pytest.raises(ValueError, match="Phase A config file SHA-256"):
+        validate_phase_b_handoff(wrong)
+    assert not output_dir.exists()
+```
+
 - [ ] **Step 7: Implement the handoff validator**
 
-`validate_phase_b_handoff` is read-only and must run before `Path.mkdir`, temporary-file creation, writer construction, or any other Phase B output action. It must verify, in order: acceptance schema and both true gate fields; `subjective_override_allowed is false`; `phase_b_executed is false`; acceptance byte hash against the run manifest; Phase A config byte hash; every `input_sha256` source; and feature-cache NPZ against its cache JSON. It must then load the current Phase A config, canonical bundle, and cache, call the current `build_run_fingerprint(config, bundle, cache)`, and compare every component hash plus `.value` with the Phase A run manifest instead of trusting the manifest's `training_fingerprint` field.
+`validate_phase_b_handoff` is read-only and must run before `Path.mkdir`, temporary-file creation, writer construction, or any other Phase B output action. It must verify, in order: acceptance schema and both true gate fields; `subjective_override_allowed is false`; `phase_b_executed is false`; acceptance byte hash against the run manifest; current Phase A YAML byte SHA-256 against `PhaseBConfig.phase_a_config_file_sha256`; every `input_sha256` source; and feature-cache NPZ against its cache JSON. The Phase A `run_manifest.config_sha256` is not a YAML byte hash and must never be used as one; do not rewrite Phase A to add such a field.
+
+After the independent byte-identity gate passes, load the current Phase A config, canonical bundle, and cache, call the current `build_run_fingerprint(config, bundle, cache)`, and compare `RunFingerprint.config_sha256`, `.manifest_sha256`, `.folds_sha256`, `.cache_sha256`, and `.value` respectively with the Phase A run manifest's `config_sha256`, `manifest_sha256`, `folds_sha256`, `cache_sha256`, and `training_fingerprint`. Thus semantic scientific identity is recomputed rather than trusted, while the separately preregistered Phase B field preserves exact YAML-byte immutability.
 
 For each of the five folds, require exact protocol `sgrpn-phase-a-v2` on both `complete.json` and `state.json`, exact seed `20260723`, fold number, complete five-model state, and the recomputed fingerprint. Delegate checkpoint/history/scaler validation to the existing Phase A deep validators (`_validate_completed_artifacts` and its `_validate_checkpoint`, `_validate_history`, and `_validate_scalers` chain), so every marker-registered byte hash, embedded protocol, embedded fingerprint, schema, epoch metadata, finite tensor/scale constraint, and G1-embedded P1/R1 state is rechecked from bytes. Reuse `_load_and_validate_persisted_oof` for each fold's prediction hash and row identity. Use function-local imports if `config.py` would otherwise create a module-import cycle; do not duplicate or weaken the Phase A validation logic. Missing protocol, a v1 protocol, any hash mismatch, or any fingerprint mismatch must raise before the Phase B output root exists. The function returns only recomputed hashes and IDs, never loaded model parameters.
 
