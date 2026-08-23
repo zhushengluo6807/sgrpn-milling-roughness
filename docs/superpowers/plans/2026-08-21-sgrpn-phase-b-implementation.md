@@ -23,7 +23,7 @@
 - Keep every `group_id` wholly within one side of each outer or inner split. No standardizer, early-stopping decision, residual target, variance fit, conformal score, conformal quantile, or report selector may read an outer-test label.
 - Each segment remains one region sample with readings `[ra_1, ra_2, ra_3]`; the mean target is their arithmetic mean. Average probability loss across the three readings before multiplying by `1/split_count`, so repeating the labels never triples a region's total weight.
 - Treat the three reading terms as repeated observations sharing one region-level `mu` and one region-level `sigma`, not as three independent samples or three separately tunable task heads.
-- The heteroscedastic head input is exactly `[process_9, vibration_embedding_64, quality_7, gate_1, abs(gate * residual)_1]`, totaling 82 values. Its output is exactly `softplus(raw_scale) + 1e-4`.
+- The heteroscedastic head input is exactly `[process_9, vibration_embedding_64, quality_7, gate_1, abs(prediction - process_mean)_1]`, totaling 82 values. For swap-ensemble validation/inference, `prediction`, `process_mean`, `embedding`, and `gate` are the fields returned by `average_swap_predictions`, so the correction is the actual ensemble correction `abs(mean(g * residual))`, never the algebraically different `abs(mean(g) * mean(residual))`. Its output is exactly `softplus(raw_scale) + 1e-4`.
 - Freeze P1, Residual-CNN, and Trust-Gate parameters and training-state buffers while fitting either scale model. Compare every mean-model state tensor before and after scale fitting with `torch.equal` and fail on any change.
 - The homoscedastic ablation learns one global scalar `sigma` per outer fold and seed through the same repeated-reading Gaussian NLL, optimizer, split, selection, refit, and calibration protocol as the heteroscedastic head.
 - Calibrate 90% and 95% intervals separately for each `(outer_fold, seed, scale_model)`. Each calibration `group_id` contributes one score: the maximum standardized absolute error over all its registered regions and all three readings.
@@ -364,7 +364,8 @@ git commit -m "feat: preserve SGRPN repeat measurements"
 ```python
 def test_scale_features_are_exactly_registered_82_values():
     output = ModelOutput(
-        prediction=torch.tensor([1.2]), residual=torch.tensor([-0.4]),
+        prediction=torch.tensor([1.1]), process_mean=torch.tensor([1.0]),
+        residual=torch.tensor([-0.4]),
         gate=torch.tensor([0.25]), embedding=torch.zeros(1, 64),
     )
     features = build_scale_features(output, torch.zeros(1, 9), torch.zeros(1, 7))
@@ -430,7 +431,7 @@ class GlobalScale(nn.Module):
 
 - [ ] **Step 5: Implement feature assembly and repeated NLL**
 
-`build_scale_features` must require populated finite `embedding`, `gate`, and `residual`, validate matching batch sizes and gate range, calculate `correction_abs = abs(gate * residual)`, and concatenate in the registered order. `repeated_gaussian_nll` must require shapes `[B]`, `[B]`, `[B,3]`, `[B]`, positive finite sigma/weights, compute `0.5*log(2*pi*sigma²) + 0.5*((y-mu)/sigma)²`, average axis 1, then normalize the region-weighted sum by `weight.sum()`.
+`build_scale_features` must require populated finite `prediction`, `process_mean`, `embedding`, and `gate`, validate matching batch sizes and gate range, calculate `correction_abs = abs(prediction - process_mean)`, and concatenate in the registered order. For a single orientation this equals `abs(gate * residual)`; for a swap ensemble it equals the absolute averaged correction and must not be reconstructed from separately averaged gate/residual fields. Add an anti-correlated two-orientation regression in which `mean(g) * mean(residual)` differs from `mean(g * residual)` and require the feature to equal `abs(averaged_prediction - averaged_process_mean)`. `repeated_gaussian_nll` must require shapes `[B]`, `[B]`, `[B,3]`, `[B]`, positive finite sigma/weights, compute `0.5*log(2*pi*sigma²) + 0.5*((y-mu)/sigma)²`, average axis 1, then normalize the region-weighted sum by `weight.sum()`.
 
 - [ ] **Step 6: Implement and test immutable mean-state snapshots**
 
@@ -736,7 +737,7 @@ class PhaseBRunArtifacts:
 
 - [ ] **Step 5: Implement `fit_scale_model`**
 
-For each batch, obtain mean outputs under `torch.no_grad()`, build the fixed 82 features, train only scale parameters using `repeated_gaussian_nll`, AdamW with the Phase B configuration, and select the finite minimum validation NLL with patience 20 and maximum 200 epochs. Restore the selected state and call `assert_mean_model_unchanged` before returning.
+For each optimizer batch, obtain the frozen mean model's current-orientation output under `torch.no_grad()` and build the fixed 82 features. For validation and all saved inference, call `average_swap_predictions` first and build features from its averaged output, matching the registered mean predictor used for selection and evaluation. Train only scale parameters using `repeated_gaussian_nll`, AdamW with the Phase B configuration, and select the finite minimum validation NLL with patience 20 and maximum 200 epochs. Restore the selected state and call `assert_mean_model_unchanged` before returning.
 
 - [ ] **Step 6: Implement group-confined nested calibration**
 
