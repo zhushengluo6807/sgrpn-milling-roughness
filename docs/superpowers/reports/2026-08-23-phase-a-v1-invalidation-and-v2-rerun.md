@@ -69,4 +69,3 @@ The registered acceptance file was read exactly once after the post-evaluation c
 
 The decision was reported as emitted. No v1-v2 metric comparison, outcome-driven model
 selection, hyperparameter tuning, or Phase B execution was performed during the rerun.
-
