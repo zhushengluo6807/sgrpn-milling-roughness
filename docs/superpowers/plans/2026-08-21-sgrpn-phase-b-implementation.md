@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Before any Phase B source, test, configuration, training, evaluation, or output action, require `outputs/sgrpn/phase_a/evaluation/acceptance.json` to be byte-hash registered by the Phase A `run_manifest.json`, require both top-level and nested `decision.proceed_to_phase_b` to be `true`, and require `phase_b_executed` to be `false`.
-- Recompute and validate the Phase A configuration, manifest, folds, window-index, M0, cache, training fingerprint, five fold completion markers, and every registered Phase A fold artifact; any mismatch stops Phase B before writing under `outputs/sgrpn/phase_b/`.
+- Recompute and validate the Phase A configuration, manifest, folds, window-index, M0, cache, training fingerprint, five fold completion markers, and every registered Phase A fold artifact. Every marker, state file, checkpoint, history, and scaler metadata record must declare exact protocol `sgrpn-phase-a-v2`; any missing protocol, `sgrpn-phase-a-v1`, other protocol, artifact-hash mismatch, or fingerprint mismatch stops Phase B before `outputs/sgrpn/phase_b/` or any child/temp directory is created.
 - Treat `configs/sgrpn_phase_a.yaml`, `outputs/sgrpn/phase_a/**`, `outputs/scheme1/**`, and `outputs/scheme1_physics/**` as immutable inputs. Write Phase B runtime artifacts only under `outputs/sgrpn/phase_b/`.
 - Use only the 586 registered segments, 212 registered `group_id` values, three registered Ra readings per segment, fixed five outer folds, fixed four inner group folds, cached 3×361 order spectra, seven quality features, and `1/split_count` region weights. Do not acquire, create, remove, relabel, or substitute samples, groups, readings, windows, folds, or signal versions.
 - The formal run is the approved Phase B extension, not a new experiment: do not add machining, idle, shutdown, repeat-measurement, synthetic-label, hyperparameter-search, alternative-split, or post-result follow-up runs.
@@ -136,7 +136,7 @@ The Phase B probability OOF table must contain exactly `586 * 3 * 2 = 3516` rows
 - Modify: `tests/sgrpn/test_config.py`
 
 **Interfaces:**
-- Consumes: `load_sgrpn_config(path) -> SGRPNConfig`, Phase A `acceptance.json`, `run_manifest.json`, cache metadata, five `complete.json` markers, and their registered byte hashes.
+- Consumes: `load_sgrpn_config(path) -> SGRPNConfig`, `load_data_bundle`, `load_order_cache`, the current `build_run_fingerprint`, the existing Phase A deep artifact validators, Phase A `acceptance.json`, `run_manifest.json`, cache metadata, five `complete.json` markers, five `state.json` files, and all registered checkpoint/history/scaler byte hashes and embedded metadata.
 - Produces: `PhaseBConfig`, `PhaseAHandoff`, `load_phase_b_config(path: str | Path) -> PhaseBConfig`, `validate_phase_b_handoff(config: PhaseBConfig) -> PhaseAHandoff`, and `validate_phase_b_output_root(path: str | Path, *, output_root: str | Path | None = None) -> Path`.
 
 - [ ] **Step 1: Run the read-only gate preflight before editing any Phase B file**
@@ -146,17 +146,20 @@ Run from the worktree root:
 ```powershell
 $a = Get-Content -Raw -LiteralPath outputs/sgrpn/phase_a/evaluation/acceptance.json | ConvertFrom-Json
 $m = Get-Content -Raw -LiteralPath outputs/sgrpn/phase_a/run_manifest.json | ConvertFrom-Json
+$expectedProtocol = 'sgrpn-phase-a-v2'
 if (-not $a.proceed_to_phase_b -or -not $a.decision.proceed_to_phase_b -or $a.phase_b_executed) { throw 'Phase A gate is closed' }
 $acceptanceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath outputs/sgrpn/phase_a/evaluation/acceptance.json).Hash.ToLowerInvariant()
 if ($acceptanceHash -ne $m.artifacts.'evaluation/acceptance.json') { throw 'Phase A acceptance fingerprint mismatch' }
 0..4 | ForEach-Object {
     $marker = Get-Content -Raw -LiteralPath "outputs/sgrpn/phase_a/folds/fold_$_/seed_20260723/complete.json" | ConvertFrom-Json
-    if ($marker.status -ne 'complete' -or $marker.fingerprint -ne $m.training_fingerprint -or $marker.seed -ne 20260723 -or $marker.fold -ne $_) { throw "Phase A fold $_ handoff mismatch" }
+    $state = Get-Content -Raw -LiteralPath "outputs/sgrpn/phase_a/folds/fold_$_/seed_20260723/state.json" | ConvertFrom-Json
+    if ($marker.protocol -cne $expectedProtocol -or $marker.status -ne 'complete' -or $marker.fingerprint -ne $m.training_fingerprint -or $marker.seed -ne 20260723 -or $marker.fold -ne $_) { throw "Phase A fold $_ marker handoff mismatch" }
+    if ($state.protocol -cne $expectedProtocol -or $state.status -ne 'complete' -or $state.fingerprint -ne $m.training_fingerprint -or $state.seed -ne 20260723 -or $state.fold -ne $_) { throw "Phase A fold $_ state handoff mismatch" }
 }
 Write-Output "Phase A gate verified: $($a.decision.path)"
 ```
 
-Expected: exit 0 and `Phase A gate verified: transfer_safety`. On any other result, stop execution without creating or modifying Phase B files.
+Expected: exit 0 and `Phase A gate verified: transfer_safety`. This shell check is only the first read-only guard; Step 7 must still recompute scientific identity and run the deep Python validators. On any other result, stop execution without creating or modifying Phase B files or directories.
 
 - [ ] **Step 2: Write failing Phase B config tests**
 
@@ -243,11 +246,51 @@ The variance optimizer values deliberately reuse the fixed Phase A gate optimize
 
 - [ ] **Step 6: Write failing handoff-tamper tests**
 
-Copy a minimal Phase A fixture, mutate one byte in each of acceptance, Phase A config, manifest, folds, cache NPZ, a fold checkpoint, and a fold completion fingerprint, and assert each mutation raises `ValueError` containing the affected artifact name. Assert a closed acceptance gate writes no Phase B directory.
+Build one valid minimal Phase A v2 fixture whose marker registers the exact hashes of its checkpoint, history, and scaler. Parameterize these fail-closed mutations: remove `protocol` from marker or state; set either to `sgrpn-phase-a-v1`; remove or change embedded `protocol` in a checkpoint, history row, or scaler `metadata_json`; change any embedded fingerprint; change a registered artifact byte without updating its marker hash; change a marker artifact hash; and change the completion fingerprint. Also mutate one byte in each of acceptance, Phase A config, manifest, folds, and cache NPZ. For every case, assert `validate_phase_b_handoff` raises `ValueError` naming the affected artifact and that neither `output_dir` nor any child/temp path exists:
+
+```python
+@pytest.mark.parametrize(
+    ("artifact", "mutation"),
+    [
+        ("marker", "missing_protocol"),
+        ("marker", "v1_protocol"),
+        ("state", "missing_protocol"),
+        ("state", "v1_protocol"),
+        ("checkpoint", "missing_protocol"),
+        ("checkpoint", "v1_protocol"),
+        ("checkpoint", "protocol_mismatch"),
+        ("checkpoint", "fingerprint_mismatch"),
+        ("history", "missing_protocol"),
+        ("history", "v1_protocol"),
+        ("history", "protocol_mismatch"),
+        ("history", "fingerprint_mismatch"),
+        ("scaler", "missing_protocol"),
+        ("scaler", "v1_protocol"),
+        ("scaler", "protocol_mismatch"),
+        ("scaler", "fingerprint_mismatch"),
+        ("checkpoint", "registered_hash_mismatch"),
+        ("history", "registered_hash_mismatch"),
+        ("scaler", "registered_hash_mismatch"),
+        ("marker", "fingerprint_mismatch"),
+    ],
+)
+def test_phase_b_handoff_rejects_deep_phase_a_mismatch_without_output(
+    valid_phase_a_v2_fixture, artifact, mutation
+):
+    config, output_dir = valid_phase_a_v2_fixture
+    mutate_phase_a_fixture(config, artifact=artifact, mutation=mutation)
+    with pytest.raises(ValueError, match=artifact):
+        validate_phase_b_handoff(config)
+    assert not output_dir.exists()
+```
+
+The fixture helper must rewrite hashes only while constructing its original valid state; mutation helpers must not repair the marker after tampering. Add a positive test proving a fully consistent `sgrpn-phase-a-v2` fixture returns the recomputed Phase A fingerprint and still does not create the Phase B directory. Add a separate closed-acceptance test with the same no-directory assertion.
 
 - [ ] **Step 7: Implement the handoff validator**
 
-`validate_phase_b_handoff` must verify, in order: acceptance schema and both true gate fields; `subjective_override_allowed is false`; `phase_b_executed is false`; acceptance byte hash against the run manifest; Phase A config byte hash; every `input_sha256` source; feature-cache NPZ against its cache JSON; five exact completion markers; all registered checkpoint/history/scaler hashes; one shared Phase A training fingerprint; Phase A seed `20260723`; and complete five-model Phase A fold state. It returns only hashes and IDs, never loaded model parameters.
+`validate_phase_b_handoff` is read-only and must run before `Path.mkdir`, temporary-file creation, writer construction, or any other Phase B output action. It must verify, in order: acceptance schema and both true gate fields; `subjective_override_allowed is false`; `phase_b_executed is false`; acceptance byte hash against the run manifest; Phase A config byte hash; every `input_sha256` source; and feature-cache NPZ against its cache JSON. It must then load the current Phase A config, canonical bundle, and cache, call the current `build_run_fingerprint(config, bundle, cache)`, and compare every component hash plus `.value` with the Phase A run manifest instead of trusting the manifest's `training_fingerprint` field.
+
+For each of the five folds, require exact protocol `sgrpn-phase-a-v2` on both `complete.json` and `state.json`, exact seed `20260723`, fold number, complete five-model state, and the recomputed fingerprint. Delegate checkpoint/history/scaler validation to the existing Phase A deep validators (`_validate_completed_artifacts` and its `_validate_checkpoint`, `_validate_history`, and `_validate_scalers` chain), so every marker-registered byte hash, embedded protocol, embedded fingerprint, schema, epoch metadata, finite tensor/scale constraint, and G1-embedded P1/R1 state is rechecked from bytes. Reuse `_load_and_validate_persisted_oof` for each fold's prediction hash and row identity. Use function-local imports if `config.py` would otherwise create a module-import cycle; do not duplicate or weaken the Phase A validation logic. Missing protocol, a v1 protocol, any hash mismatch, or any fingerprint mismatch must raise before the Phase B output root exists. The function returns only recomputed hashes and IDs, never loaded model parameters.
 
 - [ ] **Step 8: Run config and handoff tests to verify GREEN**
 
@@ -255,7 +298,7 @@ Copy a minimal Phase A fixture, mutate one byte in each of acceptance, Phase A c
 E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_config.py -v
 ```
 
-Expected: all config tests pass and fixture failures leave no `phase_b` directory.
+Expected: all config tests pass; the positive v2 fixture returns the recomputed fingerprint; every missing/v1/deep protocol, hash, or fingerprint mutation fails closed; and no success or failure case creates a `phase_b` directory.
 
 - [ ] **Step 9: Commit the gate and protocol**
 
@@ -623,7 +666,7 @@ Use the existing fit helpers without changing architectures, loss functions, lea
 
 - [ ] **Step 6: Keep Phase A wrappers exact**
 
-Leave `run_phase_a_fold`'s P1/V1/F1/R1/G1 order and seed `20260723` restriction intact. Add regression assertions that its prediction columns, fingerprint, stage order, and persisted checkpoint protocol remain `sgrpn-phase-a-v1` and match pre-change fixtures.
+Leave `run_phase_a_fold`'s P1/V1/F1/R1/G1 order and seed `20260723` restriction intact. Add regression assertions that its prediction columns, fingerprint, stage order, and persisted marker/state/checkpoint/history/scaler protocol remain `sgrpn-phase-a-v2` and match pre-change fixtures.
 
 - [ ] **Step 7: Run all training tests to verify GREEN**
 
