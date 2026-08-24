@@ -61,6 +61,20 @@ PHASE_B_STATE_ORDER = (
 )
 PHASE_B_SEEDS = (20260723, 20260724, 20260725)
 PHASE_B_ALPHAS = (0.10, 0.05)
+PHASE_B_COMPLETE_MARKER_KEYS = frozenset(
+    {
+        "protocol",
+        "fingerprint",
+        "fold",
+        "seed",
+        "models",
+        "completed_stages",
+        "status",
+        "artifacts",
+        "probability_rows",
+        "mean_rows",
+    }
+)
 
 CALIBRATION_SCORE_COLUMNS = (
     "group_id",
@@ -1182,6 +1196,22 @@ def _phase_b_artifact_paths(fold_dir: Path) -> dict[str, Path]:
     return {relative: fold_dir / relative for relative in relatives}
 
 
+def _phase_b_expected_directories(relative_files: Iterable[str]) -> set[str]:
+    directories: set[str] = set()
+    for relative in relative_files:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            directories.add(parent.as_posix())
+            parent = parent.parent
+    return directories
+
+
+def _is_link_entry(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
 def _phase_b_state_payload(
     fingerprint: str,
     fold: int,
@@ -1573,21 +1603,38 @@ def _validate_completed_phase_b_artifacts(
     *,
     marker_published: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if set(marker) != PHASE_B_COMPLETE_MARKER_KEYS:
+        raise ValueError("Phase B completion marker keys are incompatible")
     if not _phase_b_identity_matches(marker, fingerprint, fold, seed, complete=True):
         raise ValueError("Phase B completion identity is incompatible")
     expected = _phase_b_artifact_paths(fold_dir)
     hashes = marker.get("artifacts")
     if not isinstance(hashes, dict) or set(hashes) != set(expected):
         raise ValueError("Phase B completion artifact set is incompatible")
-    actual_files = {
-        path.relative_to(fold_dir).as_posix()
-        for path in fold_dir.rglob("*")
-        if path.is_file()
-    }
+    if _is_link_entry(fold_dir) or not fold_dir.is_dir():
+        raise ValueError("Phase B completion root must be a regular directory")
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    for path in fold_dir.rglob("*"):
+        relative = path.relative_to(fold_dir).as_posix()
+        if _is_link_entry(path):
+            raise ValueError(f"Phase B completion tree contains a link: {relative}")
+        if path.is_file():
+            actual_files.add(relative)
+        elif path.is_dir():
+            actual_directories.add(relative)
+        else:
+            raise ValueError(
+                f"Phase B completion tree contains a non-regular entry: {relative}"
+            )
     expected_files = set(expected)
     if marker_published:
         expected_files.add("complete.json")
-    if actual_files != expected_files:
+    expected_directories = _phase_b_expected_directories(expected_files)
+    if (
+        actual_files != expected_files
+        or actual_directories != expected_directories
+    ):
         raise ValueError("Phase B completion directory tree is incompatible")
     for relative, path in expected.items():
         if not path.is_file() or hashes.get(relative) != _sha256_file(path):
@@ -1631,20 +1678,10 @@ def _validate_completed_phase_b_artifacts(
     predictions = _read_phase_b_probability_predictions(fold_dir / "predictions.csv")
     mean_predictions = _phase_b_mean_frame_from_checkpoint(checkpoints["G1"])
     if (
-        (
-            "probability_rows" in marker
-            and (
-                type(marker.get("probability_rows")) is not int
-                or marker.get("probability_rows") != len(predictions)
-            )
-        )
-        or (
-            "mean_rows" in marker
-            and (
-                type(marker.get("mean_rows")) is not int
-                or marker.get("mean_rows") != len(mean_predictions)
-            )
-        )
+        type(marker.get("probability_rows")) is not int
+        or marker.get("probability_rows") != len(predictions)
+        or type(marker.get("mean_rows")) is not int
+        or marker.get("mean_rows") != len(mean_predictions)
         or set(predictions["fold"]) != {fold}
         or set(predictions["seed"]) != {seed}
         or set(mean_predictions["fold"]) != {fold}

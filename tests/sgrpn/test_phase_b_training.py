@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -1070,6 +1071,20 @@ def test_phase_b_completion_requires_exact_tree_and_every_registered_hash(
         for path in fold_dir.rglob("*")
         if path.is_file()
     } == expected_files
+    assert {
+        path.relative_to(fold_dir).as_posix()
+        for path in fold_dir.rglob("*")
+        if path.is_dir()
+    } == {
+        "mean",
+        "mean/checkpoints",
+        "mean/history",
+        "scale",
+        "scale/checkpoints",
+        "scale/history",
+        "scalers",
+        "calibration",
+    }
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert set(marker["artifacts"]) == expected_files - {"complete.json"}
     assert completed_phase_b_fold_matches(
@@ -1104,6 +1119,96 @@ def test_phase_b_completion_requires_exact_tree_and_every_registered_hash(
             marker_path, expected_fingerprint, fold=0, seed=20260723
         ), relative
         path.write_bytes(original)
+
+
+@pytest.mark.parametrize("field", ("probability_rows", "mean_rows"))
+def test_phase_b_completion_requires_both_row_count_fields(
+    completed_fold_fixture, field
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    del payload[field]
+    marker_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+@pytest.mark.parametrize("field", ("probability_rows", "mean_rows"))
+@pytest.mark.parametrize("value", (True, 1.0, "1"))
+def test_phase_b_completion_requires_native_integer_row_counts(
+    completed_fold_fixture, field, value
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    marker_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+def test_phase_b_completion_rejects_unexpected_marker_keys(completed_fold_fixture):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    payload["unexpected"] = "entry"
+    marker_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+@pytest.mark.parametrize(
+    "entry_kind", ("empty_directory", "temporary_directory", "regular_file")
+)
+def test_phase_b_completion_rejects_every_unexpected_tree_entry(
+    completed_fold_fixture, entry_kind
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    unexpected = marker_path.parent / (
+        "state.json.tmp-residue" if entry_kind == "temporary_directory" else "unexpected"
+    )
+    if entry_kind in {"empty_directory", "temporary_directory"}:
+        unexpected.mkdir()
+    else:
+        unexpected.write_bytes(b"unexpected")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+def test_phase_b_completion_rejects_symlinked_expected_artifact(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    artifact = marker_path.parent / "predictions.csv"
+    target = marker_path.parent.parent / "symlink-target.csv"
+    target.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    try:
+        artifact.symlink_to(target)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"symlinks are unavailable on this platform: {error}")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+def test_phase_b_completion_rejects_nonregular_tree_entry(completed_fold_fixture):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO entries are unavailable on this platform")
+    marker_path, expected_fingerprint = completed_fold_fixture
+    fifo = marker_path.parent / "unexpected-fifo"
+    os.mkfifo(fifo)
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
 
 
 def test_phase_b_completion_deeply_reloads_registered_artifacts(
