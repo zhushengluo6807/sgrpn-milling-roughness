@@ -842,14 +842,309 @@ def seed_uncertainty_summary(predictions: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def paired_probability_bootstrap(*args: Any, **kwargs: Any) -> BootstrapResult:
-    """Reserved for Task 8B's registered group-paired probability bootstrap."""
-    raise NotImplementedError("paired_probability_bootstrap is implemented in Task 8B")
+def _probability_bootstrap_rows(predictions: pd.DataFrame) -> pd.DataFrame:
+    values = _validate_phase_b_schema(
+        predictions, PHASE_B_PREDICTION_COLUMNS, label="probability bootstrap"
+    )
+    values["seed"] = _phase_b_canonical_integers(values["seed"], "seed")
+    values["fold"] = _phase_b_canonical_integers(values["fold"], "fold")
+    values["scale_model"] = values["scale_model"].astype(str)
+    keys = ["sample_id", "seed", "scale_model"]
+    sample_count = values["sample_id"].nunique()
+    if (
+        sample_count == 0
+        or len(values) != sample_count * len(PHASE_B_SEEDS) * len(SCALE_MODELS)
+        or values.duplicated(keys).any()
+        or set(values["seed"]) != set(PHASE_B_SEEDS)
+        or set(values["scale_model"]) != set(SCALE_MODELS)
+    ):
+        raise ValueError(
+            "probability bootstrap requires the exact registered sample/seed/model Cartesian rows"
+        )
+    seed_sets = values.groupby(
+        ["sample_id", "scale_model"], observed=True
+    )["seed"].agg(set)
+    if not seed_sets.eq(set(PHASE_B_SEEDS)).all():
+        raise ValueError(
+            "probability bootstrap requires all three registered seeds inside every sample/model pair"
+        )
+    sample_metadata = [
+        "group_id",
+        "version",
+        "fold",
+        "target_mean",
+        "ra_1",
+        "ra_2",
+        "ra_3",
+        "sample_weight",
+    ]
+    if values.groupby("sample_id", observed=True)[sample_metadata].nunique(
+        dropna=False
+    ).gt(1).any().any():
+        raise ValueError(
+            "probability bootstrap requires registered sample metadata across all seeds"
+        )
+    _phase_b_validate_probability_values(values, enforce_registered_intervals=True)
+
+    paired_keys = ["sample_id", "seed"]
+    metadata = [
+        "group_id",
+        "version",
+        "fold",
+        "target_mean",
+        "ra_1",
+        "ra_2",
+        "ra_3",
+        "sample_weight",
+        "mu",
+        "gate",
+        "correction",
+    ]
+    heteroscedastic = values.loc[
+        values["scale_model"] == "heteroscedastic", paired_keys + metadata
+    ]
+    homoscedastic = values.loc[
+        values["scale_model"] == "homoscedastic", paired_keys + metadata
+    ]
+    paired = heteroscedastic.merge(
+        homoscedastic,
+        on=paired_keys,
+        how="outer",
+        suffixes=("_heteroscedastic", "_homoscedastic"),
+        validate="one_to_one",
+        indicator=True,
+    )
+    if len(paired) != sample_count * len(PHASE_B_SEEDS) or not (
+        paired["_merge"] == "both"
+    ).all():
+        raise ValueError("probability bootstrap model rows are not exactly paired")
+    for column in ("group_id", "version"):
+        if not (
+            paired[f"{column}_heteroscedastic"]
+            == paired[f"{column}_homoscedastic"]
+        ).all():
+            raise ValueError("probability bootstrap paired metadata is incompatible")
+    for column in metadata[2:]:
+        if not np.allclose(
+            paired[f"{column}_heteroscedastic"].to_numpy(dtype=np.float64),
+            paired[f"{column}_homoscedastic"].to_numpy(dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("probability bootstrap paired metadata is incompatible")
+    return values
 
 
-def assess_phase_b_claims(*args: Any, **kwargs: Any) -> PhaseBPaperDecision:
-    """Reserved for Task 8B's Phase B paper-decision state machine."""
-    raise NotImplementedError("assess_phase_b_claims is implemented in Task 8B")
+def paired_probability_bootstrap(
+    predictions: pd.DataFrame,
+    *,
+    metric: str,
+    interval_type: str | None = None,
+    nominal_coverage: float | None = None,
+    repetitions: int = BOOTSTRAP_REPETITIONS,
+    seed: int = BOOTSTRAP_SEED,
+) -> BootstrapResult:
+    """Bootstrap heteroscedastic-minus-homoscedastic probability metrics.
+
+    Each draw samples complete ``group_id`` blocks, retaining every sample and
+    all three registered seed replicates belonging to the selected group.
+    """
+    if (
+        isinstance(repetitions, (bool, np.bool_))
+        or not isinstance(repetitions, (int, np.integer))
+        or int(repetitions) != BOOTSTRAP_REPETITIONS
+    ):
+        raise ValueError("probability bootstrap requires exactly 10000 repetitions")
+    if (
+        isinstance(seed, (bool, np.bool_))
+        or not isinstance(seed, (int, np.integer))
+        or int(seed) != BOOTSTRAP_SEED
+    ):
+        raise ValueError("probability bootstrap requires seed 20260723")
+    metric_name = str(metric)
+    registered_metrics = {
+        "gaussian_nll",
+        "gaussian_crps",
+        "mean_interval_width",
+        "winkler_score",
+    }
+    if metric_name not in registered_metrics:
+        raise ValueError("metric is not a registered probability bootstrap metric")
+    if metric_name in {"mean_interval_width", "winkler_score"}:
+        if interval_type not in {"raw", "conformal"} or nominal_coverage not in _PHASE_B_NORMAL_Z:
+            raise ValueError(
+                "interval metrics require a registered interval type and nominal coverage"
+            )
+        resolved_interval_type = str(interval_type)
+        resolved_coverage = float(nominal_coverage)
+    else:
+        if interval_type is not None or nominal_coverage is not None:
+            raise ValueError("NLL and CRPS do not accept interval selectors")
+        resolved_interval_type = None
+        resolved_coverage = None
+
+    values = _probability_bootstrap_rows(predictions)
+    rows: list[dict[str, Any]] = []
+    for (group_id, scale_model), group_rows in values.groupby(
+        ["group_id", "scale_model"], sort=True, observed=True
+    ):
+        metrics = _probability_metrics(
+            group_rows, resolved_interval_type, resolved_coverage
+        )
+        weight = float(group_rows["sample_weight"].sum())
+        rows.append(
+            {
+                "group_id": group_id,
+                "scale_model": scale_model,
+                "numerator": metrics[metric_name] * weight,
+                "weight": weight,
+            }
+        )
+    grouped = pd.DataFrame(rows)
+    heteroscedastic = grouped.loc[
+        grouped["scale_model"] == "heteroscedastic",
+        ["group_id", "numerator", "weight"],
+    ].rename(
+        columns={
+            "numerator": "heteroscedastic_numerator",
+            "weight": "heteroscedastic_weight",
+        }
+    )
+    homoscedastic = grouped.loc[
+        grouped["scale_model"] == "homoscedastic",
+        ["group_id", "numerator", "weight"],
+    ].rename(
+        columns={
+            "numerator": "homoscedastic_numerator",
+            "weight": "homoscedastic_weight",
+        }
+    )
+    paired = heteroscedastic.merge(
+        homoscedastic,
+        on="group_id",
+        how="outer",
+        validate="one_to_one",
+        indicator=True,
+    )
+    if paired.empty or not (paired["_merge"] == "both").all():
+        raise ValueError("probability bootstrap requires exactly paired group blocks")
+    if not np.allclose(
+        paired["heteroscedastic_weight"],
+        paired["homoscedastic_weight"],
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("probability bootstrap paired group weights are incompatible")
+
+    heteroscedastic_numerator = paired["heteroscedastic_numerator"].to_numpy(
+        dtype=np.float64
+    )
+    homoscedastic_numerator = paired["homoscedastic_numerator"].to_numpy(
+        dtype=np.float64
+    )
+    weights = paired["heteroscedastic_weight"].to_numpy(dtype=np.float64)
+    point = float(
+        heteroscedastic_numerator.sum() / weights.sum()
+        - homoscedastic_numerator.sum() / weights.sum()
+    )
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    group_count = len(paired)
+    sampled = rng.integers(
+        0, group_count, size=(BOOTSTRAP_REPETITIONS, group_count)
+    )
+    sampled_weight = weights[sampled].sum(axis=1)
+    draws = (
+        heteroscedastic_numerator[sampled].sum(axis=1) / sampled_weight
+        - homoscedastic_numerator[sampled].sum(axis=1) / sampled_weight
+    )
+    if not np.isfinite(point) or not np.isfinite(draws).all():
+        raise ValueError("probability bootstrap estimates must remain finite")
+    return BootstrapResult(
+        point_estimate=point,
+        lower=float(np.quantile(draws, 0.025)),
+        upper=float(np.quantile(draws, 0.975)),
+        repetitions=BOOTSTRAP_REPETITIONS,
+        resampling_unit=BOOTSTRAP_UNIT,
+        seed=BOOTSTRAP_SEED,
+    )
+
+
+def assess_phase_b_claims(probability_metrics: pd.DataFrame) -> PhaseBPaperDecision:
+    """Apply the preregistered Phase B paper-claim limits, failing closed."""
+    required = {
+        "aggregation",
+        "scale_model",
+        "interval_type",
+        "nominal_coverage",
+        "metric",
+        "value",
+    }
+    missing = sorted(required - set(probability_metrics.columns))
+    if missing:
+        raise ValueError(f"Phase B claim metrics missing columns: {missing}")
+    candidates = probability_metrics.loc[
+        (probability_metrics["aggregation"] == "all_seed")
+        & (probability_metrics["interval_type"] == "conformal")
+        & (probability_metrics["metric"] == "winkler_score")
+        & probability_metrics["scale_model"].isin(SCALE_MODELS),
+        list(required),
+    ].copy()
+    candidates["nominal_coverage"] = pd.to_numeric(
+        candidates["nominal_coverage"], errors="coerce"
+    )
+    candidates["value"] = pd.to_numeric(candidates["value"], errors="coerce")
+    expected = {
+        (scale_model, coverage)
+        for scale_model in SCALE_MODELS
+        for coverage in _PHASE_B_NORMAL_Z
+    }
+    actual = set(
+        zip(
+            candidates["scale_model"],
+            candidates["nominal_coverage"],
+            strict=True,
+        )
+    )
+    if (
+        len(candidates) != len(expected)
+        or candidates.duplicated(["scale_model", "nominal_coverage"]).any()
+        or actual != expected
+    ):
+        raise ValueError(
+            "Phase B claims require exactly one all-seed conformal Winkler row "
+            "per registered model and coverage"
+        )
+    if not np.isfinite(candidates["value"].to_numpy(dtype=np.float64)).all():
+        raise ValueError("Phase B claim Winkler values must be finite")
+    scores = candidates.set_index(["scale_model", "nominal_coverage"])["value"]
+    emphasize = all(
+        float(scores.loc[("heteroscedastic", coverage)])
+        < float(scores.loc[("homoscedastic", coverage)])
+        for coverage in _PHASE_B_NORMAL_Z
+    )
+    score_reason = (
+        "heteroscedastic_conformal_winkler_rule_met_at_90_and_95"
+        if emphasize
+        else "heteroscedastic_conformal_winkler_rule_not_met"
+    )
+    return PhaseBPaperDecision(
+        emphasize_heteroscedasticity=emphasize,
+        retain_group_conformal=True,
+        practical_width_threshold_registered=False,
+        coverage_claim_scope="exchangeable_new_groups_of_existing_type",
+        sigma_interpretation=(
+            "conditional_predictive_dispersion_combining_repeat_variation_"
+            "and_unmodeled_error"
+        ),
+        seed_spread_interpretation=(
+            "descriptive_model_instability_not_posterior_epistemic_variance"
+        ),
+        reasons=(
+            score_reason,
+            "group_conformal_calibration_retained",
+            "no_numeric_practical_width_threshold_preregistered",
+        ),
+    )
 
 
 __all__ = [

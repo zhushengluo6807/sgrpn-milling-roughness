@@ -5,12 +5,27 @@ import inspect
 
 from roughness.sgrpn.evaluation import (
     AcceptanceInputs,
+    BOOTSTRAP_REPETITIONS,
+    PhaseBPaperDecision,
+    ProbabilityMetrics,
     assess_phase_a,
+    assess_phase_b_claims,
     build_acceptance_inputs,
     negative_transfer,
     paired_group_bootstrap,
+    paired_probability_bootstrap,
+    probability_metric_table,
+    seed_uncertainty_summary,
+    validate_phase_b_prediction_cartesian,
     validate_prediction_cartesian,
     weighted_metrics,
+)
+from roughness.sgrpn.phase_b_training import (
+    MEAN_MODELS,
+    PHASE_B_MEAN_COLUMNS,
+    PHASE_B_PREDICTION_COLUMNS,
+    PHASE_B_SEEDS,
+    SCALE_MODELS,
 )
 
 
@@ -538,3 +553,412 @@ def test_material_negative_transfer_margin_equality_and_nearest_above(excess, ma
         material_margin_um=0.01,
     )
     assert result.material_rate == material_rate
+
+
+def _phase_b_fixture(sample_count=586):
+    sample_ids = [f"s{index:03d}" for index in range(sample_count)]
+    manifest_rows = []
+    fold_rows = []
+    probability_rows = []
+    mean_rows = []
+    z90 = 1.6448536269514722
+    z95 = 1.959963984540054
+    for index, sample_id in enumerate(sample_ids):
+        group_id = f"g{index // 2:03d}"
+        fold = (index // 2) % 5
+        target = 0.5 + index / 1000.0
+        readings = (target - 0.1, target, target + 0.1)
+        split_count = 2 if index % 2 == 0 else 1
+        weight = 1.0 / split_count
+        manifest_rows.append(
+            {
+                "sample_id": sample_id,
+                "group_id": group_id,
+                "version": "v3" if index % 2 == 0 else "v4",
+                "ra_1": readings[0],
+                "ra_2": readings[1],
+                "ra_3": readings[2],
+                "ra_mean": target,
+                "sample_weight": weight,
+                "split_count": split_count,
+                "n_rpm": 4000.0 + 1000.0 * fold,
+                "fz_mm_per_tooth": 0.03 + 0.01 * fold,
+                "ap_mm": 0.5 + 0.25 * fold,
+            }
+        )
+        fold_rows.append({"sample_id": sample_id, "group_id": group_id, "fold": fold})
+        for seed_offset, seed in enumerate(PHASE_B_SEEDS):
+            mu = target + 0.005 * seed_offset
+            process_mean = mu - 0.02
+            residual = 0.04
+            gate = 0.5
+            for scale_model in SCALE_MODELS:
+                sigma = 0.2 if scale_model == "heteroscedastic" else 0.25
+                probability_rows.append(
+                    {
+                        "sample_id": sample_id,
+                        "group_id": group_id,
+                        "version": manifest_rows[-1]["version"],
+                        "fold": fold,
+                        "seed": seed,
+                        "scale_model": scale_model,
+                        "target_mean": target,
+                        "ra_1": readings[0],
+                        "ra_2": readings[1],
+                        "ra_3": readings[2],
+                        "sample_weight": weight,
+                        "mu": mu,
+                        "sigma": sigma,
+                        "gate": gate,
+                        "correction": mu - process_mean,
+                        "raw_lower_90": mu - z90 * sigma,
+                        "raw_upper_90": mu + z90 * sigma,
+                        "raw_lower_95": mu - z95 * sigma,
+                        "raw_upper_95": mu + z95 * sigma,
+                        "conformal_q_90": 2.0,
+                        "conformal_lower_90": mu - 2.0 * sigma,
+                        "conformal_upper_90": mu + 2.0 * sigma,
+                        "conformal_q_95": 2.5,
+                        "conformal_lower_95": mu - 2.5 * sigma,
+                        "conformal_upper_95": mu + 2.5 * sigma,
+                    }
+                )
+            for model in MEAN_MODELS:
+                if model == "P1":
+                    prediction, model_residual, model_gate = process_mean, 0.0, 0.0
+                elif model == "R1":
+                    prediction, model_residual, model_gate = process_mean + residual, residual, 1.0
+                else:
+                    prediction, model_residual, model_gate = mu, residual, gate
+                mean_rows.append(
+                    {
+                        "sample_id": sample_id,
+                        "group_id": group_id,
+                        "version": manifest_rows[-1]["version"],
+                        "fold": fold,
+                        "seed": seed,
+                        "model": model,
+                        "target_mean": target,
+                        "prediction": prediction,
+                        "sample_weight": weight,
+                        "process_mean": process_mean,
+                        "residual": model_residual,
+                        "gate": model_gate,
+                    }
+                )
+    return (
+        pd.DataFrame(manifest_rows),
+        pd.DataFrame(fold_rows),
+        pd.DataFrame(probability_rows, columns=PHASE_B_PREDICTION_COLUMNS),
+        pd.DataFrame(mean_rows, columns=PHASE_B_MEAN_COLUMNS),
+    )
+
+
+def test_phase_b_cartesian_validation_enforces_registered_probability_and_mean_rows():
+    manifest, folds, probability, mean = _phase_b_fixture()
+
+    validated = validate_phase_b_prediction_cartesian(
+        probability, manifest=manifest, folds=folds, mean_predictions=mean
+    )
+    assert len(validated) == 3516
+    assert validated["sample_id"].iloc[0] == "s000"
+
+    bad_frames = []
+    bad_frames.append(probability.iloc[:-1].copy())
+    duplicate = probability.copy()
+    duplicate.iloc[-1] = duplicate.iloc[0]
+    bad_frames.append(duplicate)
+    wrong_group = probability.copy()
+    wrong_group.loc[0, "group_id"] = "swapped"
+    bad_frames.append(wrong_group)
+    wrong_reading = probability.copy()
+    wrong_reading.loc[0, "ra_1"] += 0.01
+    bad_frames.append(wrong_reading)
+    wrong_seed = probability.copy()
+    wrong_seed["seed"] = wrong_seed["seed"].astype(object)
+    wrong_seed.loc[0, "seed"] = "20260723.0"
+    bad_frames.append(wrong_seed)
+    zero_sigma = probability.copy()
+    zero_sigma.loc[0, "sigma"] = 0.0
+    bad_frames.append(zero_sigma)
+    quantile_drift = probability.copy()
+    quantile_drift.loc[0, "conformal_q_90"] = 2.01
+    quantile_drift.loc[0, "conformal_lower_90"] = (
+        quantile_drift.loc[0, "mu"] - 2.01 * quantile_drift.loc[0, "sigma"]
+    )
+    quantile_drift.loc[0, "conformal_upper_90"] = (
+        quantile_drift.loc[0, "mu"] + 2.01 * quantile_drift.loc[0, "sigma"]
+    )
+    bad_frames.append(quantile_drift)
+
+    for bad in bad_frames:
+        with pytest.raises(ValueError):
+            validate_phase_b_prediction_cartesian(
+                bad, manifest=manifest, folds=folds, mean_predictions=mean
+            )
+
+    bad_mean = mean.copy()
+    bad_mean.loc[bad_mean["model"] == "G1", "gate"] = 1.5
+    with pytest.raises(ValueError, match="mean"):
+        validate_phase_b_prediction_cartesian(
+            probability, manifest=manifest, folds=folds, mean_predictions=bad_mean
+        )
+
+
+def test_probability_table_contains_every_registered_measure():
+    rows = []
+    for group_id, mu in (("g1", 0.5), ("g2", 0.8)):
+        for scale_model in SCALE_MODELS:
+            rows.append(
+                {
+                    "sample_id": group_id,
+                    "group_id": group_id,
+                    "version": "v3",
+                    "fold": 0,
+                    "seed": 20260723,
+                    "scale_model": scale_model,
+                    "target_mean": mu,
+                    "ra_1": mu - 0.1,
+                    "ra_2": mu,
+                    "ra_3": mu + 0.1,
+                    "sample_weight": 1.0,
+                    "mu": mu,
+                    "sigma": 0.2,
+                    "gate": 0.5,
+                    "correction": 0.0,
+                    "raw_lower_90": mu - 0.4,
+                    "raw_upper_90": mu + 0.4,
+                    "raw_lower_95": mu - 0.5,
+                    "raw_upper_95": mu + 0.5,
+                    "conformal_q_90": 2.0,
+                    "conformal_lower_90": mu - 0.4,
+                    "conformal_upper_90": mu + 0.4,
+                    "conformal_q_95": 2.5,
+                    "conformal_lower_95": mu - 0.5,
+                    "conformal_upper_95": mu + 0.5,
+                }
+            )
+    table = probability_metric_table(
+        pd.DataFrame(rows, columns=PHASE_B_PREDICTION_COLUMNS)
+    )
+    assert set(table["metric"]) == {
+        "mean_mae",
+        "mean_rmse",
+        "mean_r2",
+        "gaussian_nll",
+        "gaussian_crps",
+        "single_reading_coverage",
+        "simultaneous_group_coverage",
+        "mean_interval_width",
+        "winkler_score",
+    }
+    assert set(table["interval_type"].dropna()) == {"raw", "conformal"}
+    assert set(table["nominal_coverage"].dropna()) == {0.90, 0.95}
+    assert set(table["aggregation"]) == {"fold", "seed", "all_seed"}
+
+
+def test_probability_all_seed_metrics_average_seed_replicates():
+    _, _, probability, _ = _phase_b_fixture(sample_count=4)
+    table = probability_metric_table(probability)
+    seed_rows = table.loc[
+        (table["aggregation"] == "seed")
+        & (table["scale_model"] == "heteroscedastic")
+        & (table["metric"] == "gaussian_nll")
+    ]
+    all_seed = table.loc[
+        (table["aggregation"] == "all_seed")
+        & (table["scale_model"] == "heteroscedastic")
+        & (table["metric"] == "gaussian_nll"),
+        "value",
+    ].item()
+    assert all_seed == pytest.approx(seed_rows["value"].mean())
+
+
+def test_seed_uncertainty_is_descriptive_and_never_builds_ensemble_intervals():
+    _, _, probability, _ = _phase_b_fixture(sample_count=2)
+    summary = seed_uncertainty_summary(probability)
+
+    row = summary.loc[
+        (summary["sample_id"] == "s000")
+        & (summary["scale_model"] == "heteroscedastic")
+    ].iloc[0]
+    assert row["mu_mean"] == pytest.approx(0.505)
+    assert row["aleatoric_variance_mean"] == pytest.approx(0.04)
+    assert row["seed_prediction_variance"] == pytest.approx(1.0 / 60000.0)
+    assert row["seed_spread_interpretation"] == "descriptive_seed_instability"
+    assert not any("total_variance" in column for column in summary.columns)
+    assert not any("ensemble" in column for column in summary.columns)
+
+    missing_seed = probability.loc[probability["seed"] != PHASE_B_SEEDS[-1]]
+    with pytest.raises(ValueError, match="three registered seeds"):
+        seed_uncertainty_summary(missing_seed)
+
+
+@pytest.mark.parametrize(
+    ("metric", "interval_type", "nominal_coverage"),
+    [
+        ("gaussian_nll", None, None),
+        ("gaussian_crps", None, None),
+        ("mean_interval_width", "raw", 0.90),
+        ("mean_interval_width", "conformal", 0.95),
+        ("winkler_score", "raw", 0.90),
+        ("winkler_score", "conformal", 0.95),
+    ],
+)
+def test_probability_bootstrap_is_exact_group_paired_and_reproducible(
+    metric, interval_type, nominal_coverage
+):
+    _, _, probability, _ = _phase_b_fixture(sample_count=10)
+    kwargs = {
+        "metric": metric,
+        "interval_type": interval_type,
+        "nominal_coverage": nominal_coverage,
+    }
+    first = paired_probability_bootstrap(probability, **kwargs)
+    second = paired_probability_bootstrap(probability, **kwargs)
+
+    table = probability_metric_table(probability)
+    matching = table.loc[
+        (table["aggregation"] == "all_seed")
+        & (table["metric"] == metric)
+    ]
+    if interval_type is not None:
+        matching = matching.loc[
+            (matching["interval_type"] == interval_type)
+            & (matching["nominal_coverage"] == nominal_coverage)
+        ]
+    expected = {
+        row.scale_model: row.value for row in matching.itertuples(index=False)
+    }
+
+    assert first == second
+    assert first.point_estimate == pytest.approx(
+        expected["heteroscedastic"] - expected["homoscedastic"]
+    )
+    assert first.repetitions == BOOTSTRAP_REPETITIONS == 10_000
+    assert first.seed == 20260723
+    assert first.resampling_unit == "group_id"
+    assert np.isfinite([first.point_estimate, first.lower, first.upper]).all()
+
+    with pytest.raises(ValueError, match="exactly 10000"):
+        paired_probability_bootstrap(
+            probability, metric="gaussian_nll", repetitions=9999
+        )
+    with pytest.raises(ValueError, match="seed 20260723"):
+        paired_probability_bootstrap(
+            probability, metric="gaussian_nll", seed=20260724
+        )
+
+
+def test_probability_bootstrap_rejects_incomplete_or_ambiguous_cartesian_rows():
+    _, _, probability, _ = _phase_b_fixture(sample_count=4)
+    duplicate = pd.concat([probability, probability.iloc[[0]]], ignore_index=True)
+    wrong_group = probability.copy()
+    wrong_group.loc[0, "group_id"] = "mismatched"
+    split_seed_group = probability.copy()
+    split_seed_group.loc[
+        (split_seed_group["sample_id"] == "s000")
+        & (split_seed_group["seed"] == PHASE_B_SEEDS[0]),
+        "group_id",
+    ] = "mismatched"
+
+    for malformed in (
+        probability.iloc[:-1],
+        duplicate,
+        wrong_group,
+        split_seed_group,
+    ):
+        with pytest.raises(ValueError, match="registered|paired"):
+            paired_probability_bootstrap(malformed, metric="gaussian_nll")
+
+    with pytest.raises(ValueError, match="interval type and nominal coverage"):
+        paired_probability_bootstrap(probability, metric="winkler_score")
+    with pytest.raises(ValueError, match="registered probability bootstrap metric"):
+        paired_probability_bootstrap(probability, metric="mean_mae")
+
+
+def test_phase_b_probability_dataclasses_expose_only_registered_claim_fields():
+    assert tuple(ProbabilityMetrics.__dataclass_fields__) == (
+        "mean_mae",
+        "mean_rmse",
+        "mean_r2",
+        "gaussian_nll",
+        "gaussian_crps",
+        "single_reading_coverage",
+        "simultaneous_group_coverage",
+        "mean_interval_width",
+        "winkler_score",
+    )
+    assert tuple(PhaseBPaperDecision.__dataclass_fields__) == (
+        "emphasize_heteroscedasticity",
+        "retain_group_conformal",
+        "practical_width_threshold_registered",
+        "coverage_claim_scope",
+        "sigma_interpretation",
+        "seed_spread_interpretation",
+        "reasons",
+    )
+
+
+def _phase_b_claim_metrics(hetero_90, hetero_95, homo_90=1.0, homo_95=1.0):
+    return pd.DataFrame(
+        [
+            {
+                "aggregation": "all_seed",
+                "scale_model": scale_model,
+                "interval_type": "conformal",
+                "nominal_coverage": coverage,
+                "metric": "winkler_score",
+                "value": value,
+            }
+            for scale_model, coverage, value in (
+                ("heteroscedastic", 0.90, hetero_90),
+                ("heteroscedastic", 0.95, hetero_95),
+                ("homoscedastic", 0.90, homo_90),
+                ("homoscedastic", 0.95, homo_95),
+            )
+        ]
+    )
+
+
+def test_no_winkler_gain_disables_heteroscedastic_emphasis():
+    decision = assess_phase_b_claims(_phase_b_claim_metrics(1.01, 1.01))
+    assert decision.emphasize_heteroscedasticity is False
+    assert decision.retain_group_conformal is True
+    assert decision.practical_width_threshold_registered is False
+    assert decision.coverage_claim_scope == "exchangeable_new_groups_of_existing_type"
+    assert decision.sigma_interpretation == (
+        "conditional_predictive_dispersion_combining_repeat_variation_"
+        "and_unmodeled_error"
+    )
+    assert decision.seed_spread_interpretation == (
+        "descriptive_model_instability_not_posterior_epistemic_variance"
+    )
+    assert decision.reasons == (
+        "heteroscedastic_conformal_winkler_rule_not_met",
+        "group_conformal_calibration_retained",
+        "no_numeric_practical_width_threshold_preregistered",
+    )
+
+
+def test_heteroscedastic_emphasis_requires_strict_gain_at_both_coverages():
+    emphasized = assess_phase_b_claims(_phase_b_claim_metrics(0.99, 0.99))
+    assert emphasized.emphasize_heteroscedasticity is True
+    assert emphasized.reasons == (
+        "heteroscedastic_conformal_winkler_rule_met_at_90_and_95",
+        "group_conformal_calibration_retained",
+        "no_numeric_practical_width_threshold_preregistered",
+    )
+    assert assess_phase_b_claims(
+        _phase_b_claim_metrics(0.99, 1.0)
+    ).emphasize_heteroscedasticity is False
+
+    valid = _phase_b_claim_metrics(0.99, 0.99)
+    malformed_frames = [
+        valid.iloc[:-1],
+        pd.concat([valid, valid.iloc[[0]]], ignore_index=True),
+        valid.assign(value=[0.99, np.nan, 1.0, 1.0]),
+    ]
+    for malformed in malformed_frames:
+        with pytest.raises(ValueError, match="exactly one|finite"):
+            assess_phase_b_claims(malformed)
