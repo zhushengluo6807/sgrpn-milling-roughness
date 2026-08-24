@@ -1,0 +1,13 @@
+phase_a_config_path: sgrpn_phase_a.yaml
+phase_a_config_file_sha256: 53768589f6e2311bd3386997ef9295b441290b5607a16f7d688696709110d192
+phase_a_acceptance_path: ../outputs/sgrpn/phase_a/evaluation/acceptance.json
+phase_a_run_manifest_path: ../outputs/sgrpn/phase_a/run_manifest.json
+output_dir: ../outputs/sgrpn/phase_b
+seeds: [20260723, 20260724, 20260725]
+alphas: [0.10, 0.05]
+inner_splits: 4
+max_epochs: 200
+patience: 20
+variance_learning_rate: 0.001
+weight_decay: 0.0001
+bootstrap_repetitions: 10000
