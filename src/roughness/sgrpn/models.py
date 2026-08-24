@@ -363,7 +363,7 @@ def build_scale_features(output: ModelOutput, process: Tensor, quality: Tensor) 
     if bool(((gate < 0) | (gate > 1)).any()):
         raise ValueError("gate must lie in [0, 1]")
     correction_abs = (prediction - process_mean).abs()
-    return torch.cat([embedding, process, quality, gate[:, None], correction_abs[:, None]], dim=1)
+    return torch.cat([process, embedding, quality, gate[:, None], correction_abs[:, None]], dim=1)
 
 
 def repeated_gaussian_nll(mu: Tensor, sigma: Tensor, readings: Tensor, weight: Tensor) -> Tensor:

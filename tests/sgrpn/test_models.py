@@ -35,12 +35,17 @@ def test_scale_features_are_exactly_registered_82_values():
         process_mean=torch.tensor([1.0]),
         residual=torch.tensor([-0.4]),
         gate=torch.tensor([0.25]),
-        embedding=torch.zeros(1, 64),
+        embedding=torch.arange(101.0, 165.0).reshape(1, 64),
     )
-    features = build_scale_features(output, torch.zeros(1, 9), torch.zeros(1, 7))
+    process = torch.arange(1.0, 10.0).reshape(1, 9)
+    quality = torch.arange(201.0, 208.0).reshape(1, 7)
+    features = build_scale_features(output, process, quality)
     assert features.shape == (1, 82)
-    assert features[0, -2].item() == pytest.approx(0.25)
-    assert features[0, -1].item() == pytest.approx(0.10)
+    torch.testing.assert_close(features[:, :9], process)
+    torch.testing.assert_close(features[:, 9:73], output.embedding)
+    torch.testing.assert_close(features[:, 73:80], quality)
+    assert features[0, 80].item() == pytest.approx(0.25)
+    assert features[0, 81].item() == pytest.approx(0.10)
 
 
 def test_scale_features_use_absolute_averaged_correction_not_averaged_gate_residual():
