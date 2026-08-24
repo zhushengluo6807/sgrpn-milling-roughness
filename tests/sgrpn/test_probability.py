@@ -131,6 +131,31 @@ def test_probability_primitives_normalize_non_numeric_structures_to_value_error(
         gaussian_crps({"bad": 1}, np.array([1.0]), np.zeros((1, 3)), np.array([1.0]))
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: gaussian_crps(
+            np.array([1.0e308]), np.array([1.0e308]), np.full((1, 3), -1.0e308), np.array([1.0])
+        ),
+        lambda: raw_gaussian_interval(np.array([1.0e308]), np.array([1.0e308]), alpha=0.05),
+        lambda: group_conformal_scores(
+            np.array(["g"]), np.array([1.0e308]), np.array([1.0]), np.full((1, 3), -1.0e308)
+        ),
+        lambda: conformal_interval(np.array([0.0]), np.array([1.0e308]), quantile=1.0e308),
+        lambda: single_reading_coverage(
+            np.zeros(2), np.ones(2), np.zeros((2, 3)), np.full(2, 1.0e308)
+        ),
+        lambda: mean_interval_width(np.array([-1.0e308]), np.array([1.0e308]), np.array([1.0])),
+        lambda: winkler_score(
+            np.array([-1.0e308]), np.array([1.0e308]), np.zeros((1, 3)), np.array([1.0]), alpha=0.10
+        ),
+    ],
+)
+def test_probability_primitives_reject_finite_inputs_that_overflow_computation(call):
+    with pytest.raises(ValueError):
+        call()
+
+
 def test_group_score_tables_reject_duplicate_groups_when_quantiled():
     scores = pd.DataFrame({"group_id": ["a", "a"], "score": [1.0, 2.0]})
     with pytest.raises(ValueError, match="duplicate"):

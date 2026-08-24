@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 from typing import Any
@@ -39,6 +40,38 @@ def _numeric_array(value: Any, message: str) -> np.ndarray:
         return np.asarray(value, dtype=np.float64)
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(message) from error
+
+
+@contextmanager
+def _checked_arithmetic(message: str):
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            yield
+    except FloatingPointError as error:
+        raise ValueError(message) from error
+
+
+def _finite_array(value: Any, message: str) -> np.ndarray:
+    values = _numeric_array(value, message)
+    if not np.isfinite(values).all():
+        raise ValueError(message)
+    return values
+
+
+def _finite_metric(value: Any, message: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(message) from error
+    if not math.isfinite(result):
+        raise ValueError(message)
+    return result
+
+
+def _weighted_region_mean(values: np.ndarray, weights: np.ndarray, message: str) -> float:
+    with _checked_arithmetic(message):
+        result = np.dot(weights, values) / weights.sum()
+    return _finite_metric(result, message)
 
 
 def _regions(mu: Any, sigma: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -112,20 +145,27 @@ def gaussian_crps(mu: Any, sigma: Any, readings: Any, region_weights: Any) -> fl
     location, scale = _regions(mu, sigma)
     observed = _readings(readings, len(location))
     weights = _weights(region_weights, len(location))
-    z = (observed - location[:, None]) / scale[:, None]
-    phi = np.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
-    normal_cdf = 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
-    per_reading = scale[:, None] * (
-        z * (2.0 * normal_cdf - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi)
-    )
-    return float(np.dot(weights, per_reading.mean(axis=1)) / weights.sum())
+    message = "Gaussian CRPS calculation must remain finite"
+    with _checked_arithmetic(message):
+        z = (observed - location[:, None]) / scale[:, None]
+        phi = np.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+        normal_cdf = 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
+        per_reading = scale[:, None] * (
+            z * (2.0 * normal_cdf - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi)
+        )
+        per_region = _finite_array(per_reading.mean(axis=1), message)
+    return _weighted_region_mean(per_region, weights, message)
 
 
 def raw_gaussian_interval(mu: Any, sigma: Any, *, alpha: float) -> tuple[np.ndarray, np.ndarray]:
     """Return the registered central Gaussian interval for each region."""
     location, scale = _regions(mu, sigma)
     z = _NORMAL_Z[_alpha(alpha)]
-    return location - z * scale, location + z * scale
+    message = "Gaussian interval calculation must remain finite"
+    with _checked_arithmetic(message):
+        lower = location - z * scale
+        upper = location + z * scale
+    return _finite_array(lower, message), _finite_array(upper, message)
 
 
 def group_conformal_scores(
@@ -135,9 +175,14 @@ def group_conformal_scores(
     location, scale = _regions(mu, sigma)
     groups = _group_ids(group_ids, len(location))
     observed = _readings(readings, len(location))
-    region_scores = np.abs(observed - location[:, None]).max(axis=1) / scale
+    message = "group conformal score calculation must remain finite"
+    with _checked_arithmetic(message):
+        region_scores = np.abs(observed - location[:, None]).max(axis=1) / scale
+    region_scores = _finite_array(region_scores, message)
     scores = pd.DataFrame({"group_id": groups, "score": region_scores})
-    return scores.groupby("group_id", as_index=False, sort=True, observed=True)["score"].max()
+    grouped = scores.groupby("group_id", as_index=False, sort=True, observed=True)["score"].max()
+    _finite_array(grouped["score"], message)
+    return grouped
 
 
 def finite_sample_group_quantile(scores: Any, *, alpha: float) -> GroupConformalResult:
@@ -176,7 +221,11 @@ def conformal_interval(
         raise ValueError("conformal quantile must be finite and non-negative") from error
     if not np.isfinite(q_value) or q_value < 0.0:
         raise ValueError("conformal quantile must be finite and non-negative")
-    return location - q_value * scale, location + q_value * scale
+    message = "conformal interval calculation must remain finite"
+    with _checked_arithmetic(message):
+        lower = location - q_value * scale
+        upper = location + q_value * scale
+    return _finite_array(lower, message), _finite_array(upper, message)
 
 
 def single_reading_coverage(
@@ -187,7 +236,9 @@ def single_reading_coverage(
     observed = _readings(readings, len(low))
     weights = _weights(region_weights, len(low))
     covered = ((low[:, None] <= observed) & (observed <= high[:, None])).mean(axis=1)
-    return float(np.dot(weights, covered) / weights.sum())
+    return _weighted_region_mean(
+        covered, weights, "single-reading coverage calculation must remain finite"
+    )
 
 
 def simultaneous_group_coverage(
@@ -201,14 +252,19 @@ def simultaneous_group_coverage(
     grouped = pd.DataFrame({"group_id": groups, "covered": by_region}).groupby(
         "group_id", sort=True, observed=True
     )["covered"].all()
-    return float(grouped.mean())
+    return _finite_metric(
+        grouped.mean(), "simultaneous group coverage calculation must remain finite"
+    )
 
 
 def mean_interval_width(lower: Any, upper: Any, region_weights: Any) -> float:
     """Return region-weighted mean interval width."""
     low, high = _interval(lower, upper)
     weights = _weights(region_weights, len(low))
-    return float(np.dot(weights, high - low) / weights.sum())
+    message = "mean interval width calculation must remain finite"
+    with _checked_arithmetic(message):
+        width = _finite_array(high - low, message)
+    return _weighted_region_mean(width, weights, message)
 
 
 def winkler_score(
@@ -219,11 +275,14 @@ def winkler_score(
     low, high = _interval(lower, upper)
     observed = _readings(readings, len(low))
     weights = _weights(region_weights, len(low))
-    per_reading = np.broadcast_to((high - low)[:, None], observed.shape).astype(
-        np.float64, copy=True
-    )
-    below = observed < low[:, None]
-    above = observed > high[:, None]
-    per_reading[below] += (2.0 / resolved_alpha) * (low[:, None] - observed)[below]
-    per_reading[above] += (2.0 / resolved_alpha) * (observed - high[:, None])[above]
-    return float(np.dot(weights, per_reading.mean(axis=1)) / weights.sum())
+    message = "Winkler score calculation must remain finite"
+    with _checked_arithmetic(message):
+        per_reading = np.broadcast_to((high - low)[:, None], observed.shape).astype(
+            np.float64, copy=True
+        )
+        below = observed < low[:, None]
+        above = observed > high[:, None]
+        per_reading[below] += (2.0 / resolved_alpha) * (low[:, None] - observed)[below]
+        per_reading[above] += (2.0 / resolved_alpha) * (observed - high[:, None])[above]
+        per_region = _finite_array(per_reading.mean(axis=1), message)
+    return _weighted_region_mean(per_region, weights, message)
