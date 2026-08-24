@@ -17,10 +17,11 @@ from torch import nn
 from roughness.scheme1.crossfit import make_group_inner_splits
 
 from roughness.sgrpn.config import SGRPNConfig
-from roughness.sgrpn.data import DataBundle
+from roughness.sgrpn.data import DataBundle, outer_indices
 from roughness.sgrpn.order_spectrum import OrderSpectrumCache
 from roughness.sgrpn.models import (
     ModelOutput,
+    SelectiveGatedModel,
     average_swap_predictions,
     sgrpn_loss,
     weighted_huber,
@@ -226,6 +227,14 @@ def _gate_hash(model: nn.Module) -> str:
         if name.startswith("gate."):
             digest.update(name.encode("utf-8"))
             digest.update(value.detach().cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _state_hash(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        digest.update(name.encode("utf-8"))
+        digest.update(value.detach().cpu().numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -937,6 +946,239 @@ def test_fold_orchestration_is_leakage_safe_and_uses_fixed_stage_order(
     gates = artifacts.predictions.loc[artifacts.predictions["model"] == "G1", "gate"]
     assert gates.between(0.0, 1.0).all()
     assert all(call["device"] == "cpu" for call in backend.calls)
+
+
+def test_phase_b_mean_path_accepts_only_registered_seeds(tmp_path: Path):
+    import roughness.sgrpn.training as training
+
+    config, bundle, cache = _fixture(tmp_path, max_epochs=2)
+    train_index, _ = outer_indices(bundle, fold=0)
+    train_sample_ids = (
+        bundle.manifest.iloc[train_index]["sample_id"].astype(str).tolist()
+    )
+    for seed in (20260723, 20260724, 20260725):
+        artifacts = training.fit_g1_mean_path(
+            config,
+            bundle,
+            cache,
+            fold=0,
+            seed=seed,
+            train_sample_ids=train_sample_ids,
+            device="cpu",
+            backend=RecordingBackend(),
+            batch_size=2,
+        )
+        assert artifacts.seed == seed
+    with pytest.raises(ValueError, match="registered Phase B seed"):
+        training.fit_g1_mean_path(
+            config,
+            bundle,
+            cache,
+            0,
+            7,
+            train_sample_ids,
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "unknown", "outer-test"])
+def test_phase_b_mean_path_rejects_non_training_ids_before_model_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+):
+    import roughness.sgrpn.training as training
+
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    train_index, test_index = outer_indices(bundle, fold=0)
+    train_ids = bundle.manifest.iloc[train_index]["sample_id"].astype(str).tolist()
+    if kind == "duplicate":
+        requested_ids = [*train_ids, train_ids[0]]
+    elif kind == "unknown":
+        requested_ids = [*train_ids[:-1], "not-registered"]
+    else:
+        requested_ids = [
+            *train_ids[:-1],
+            str(bundle.manifest.iloc[test_index[0]]["sample_id"]),
+        ]
+
+    def fail_constructor(*_args, **_kwargs):
+        pytest.fail("invalid mean-path IDs reached a model constructor")
+
+    monkeypatch.setattr(training, "_construct_seeded_model", fail_constructor)
+    with pytest.raises(ValueError, match="train_sample_ids"):
+        training.fit_g1_mean_path(
+            config,
+            bundle,
+            cache,
+            fold=0,
+            seed=20260723,
+            train_sample_ids=requested_ids,
+            device="cpu",
+            backend=RecordingBackend(),
+            batch_size=2,
+        )
+
+
+def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import roughness.sgrpn.training as training
+
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    train_index, _ = outer_indices(bundle, fold=0)
+    train_ids = bundle.manifest.iloc[train_index]["sample_id"].astype(str).tolist()
+    original_constructor = training._construct_seeded_model
+    construction_runs: list[list[tuple[tuple[str, int, str], nn.Module, str]]] = []
+    active_run = -1
+
+    def audited_constructor(*args, **kwargs):
+        model = original_constructor(*args, **kwargs)
+        context = (
+            str(kwargs["stage"]),
+            int(kwargs["inner_fold"]),
+            str(kwargs["substage"]),
+        )
+        construction_runs[active_run].append((context, model, _state_hash(model)))
+        return model
+
+    def fail_checkpoint_load(*_args, **_kwargs):
+        pytest.fail("Phase B mean path attempted to load a Phase A checkpoint")
+
+    monkeypatch.setattr(training, "_construct_seeded_model", audited_constructor)
+    monkeypatch.setattr(torch, "load", fail_checkpoint_load)
+    artifacts_by_run = []
+    backends = []
+    for run_number in range(2):
+        active_run = run_number
+        construction_runs.append([])
+        backend = RecordingBackend()
+        backends.append(backend)
+        artifacts_by_run.append(
+            training.fit_g1_mean_path(
+                config,
+                bundle,
+                cache,
+                fold=0,
+                seed=20260723,
+                train_sample_ids=train_ids,
+                device="cpu",
+                backend=backend,
+                batch_size=2,
+            )
+        )
+
+    for backend in backends:
+        stages = [call["stage"] for call in backend.calls]
+        assert tuple(dict.fromkeys(stages)) == ("P1", "R1", "G1")
+        assert "V1" not in stages
+        assert "F1" not in stages
+    assert [record[0] for record in construction_runs[0]] == [
+        record[0] for record in construction_runs[1]
+    ]
+    assert [record[2] for record in construction_runs[0]] == [
+        record[2] for record in construction_runs[1]
+    ]
+    first_models = {id(record[1]) for record in construction_runs[0]}
+    second_models = {id(record[1]) for record in construction_runs[1]}
+    assert first_models.isdisjoint(second_models)
+    first_parameters = {
+        id(parameter)
+        for _, model, _ in construction_runs[0]
+        for parameter in model.parameters()
+    }
+    second_parameters = {
+        id(parameter)
+        for _, model, _ in construction_runs[1]
+        for parameter in model.parameters()
+    }
+    assert first_parameters.isdisjoint(second_parameters)
+
+    artifacts = artifacts_by_run[0]
+    assert isinstance(artifacts, training.MeanPathArtifacts)
+    assert artifacts.fold == 0
+    assert artifacts.seed == 20260723
+    assert artifacts.train_sample_ids == tuple(train_ids)
+    assert isinstance(artifacts.model, SelectiveGatedModel)
+    assert len(artifacts.inner_splits) == 4
+    assert len(artifacts.inner_models) == 4
+    assert len(artifacts.inner_scalers) == 4
+    assert set(artifacts.best_epochs) == {"P1", "R1", "G1"}
+    assert set(artifacts.histories) == {"P1", "R1", "G1"}
+    train_frame = (
+        bundle.manifest.set_index(bundle.manifest["sample_id"].astype(str))
+        .loc[train_ids]
+        .reset_index(drop=True)
+    )
+    for inner_model, (inner_train, inner_valid) in zip(
+        artifacts.inner_models, artifacts.inner_splits, strict=True
+    ):
+        assert isinstance(inner_model, SelectiveGatedModel)
+        assert not any(
+            parameter.requires_grad
+            for parameter in inner_model.process_expert.parameters()
+        )
+        assert not any(
+            parameter.requires_grad
+            for parameter in inner_model.residual_expert.parameters()
+        )
+        expected_ids = tuple(
+            train_frame.iloc[inner_train]["sample_id"].astype(str)
+        )
+        expected_groups = tuple(
+            train_frame.iloc[inner_train]["group_id"].astype(str)
+        )
+        assert inner_model.checkpoint_metadata == {
+            "train_sample_ids": expected_ids,
+            "train_group_ids": expected_groups,
+        }
+        assert set(train_frame.iloc[inner_train]["group_id"]).isdisjoint(
+            train_frame.iloc[inner_valid]["group_id"]
+        )
+
+
+def test_phase_a_regression_preserves_v2_outputs_and_persisted_protocol(
+    tmp_path: Path,
+):
+    config, bundle, cache = _fixture(tmp_path, max_epochs=1)
+    backend = RecordingBackend()
+    artifacts = run_phase_a_fold(
+        config,
+        bundle,
+        cache,
+        fold=0,
+        seed=20260723,
+        device="cpu",
+        backend=backend,
+        output_root=config.output_dir,
+    )
+
+    expected_columns = [
+        "sample_id", "group_id", "version", "fold", "seed", "model",
+        "target", "prediction", "sample_weight", "process_mean", "residual",
+        "gate",
+    ]
+    assert list(artifacts.predictions.columns) == expected_columns
+    assert artifacts.fingerprint == build_run_fingerprint(config, bundle, cache)
+    assert tuple(dict.fromkeys(call["stage"] for call in backend.calls)) == tuple(
+        MODEL_SEQUENCE
+    )
+    fold_dir = config.output_dir / "folds" / "fold_0" / "seed_20260723"
+    marker = json.loads((fold_dir / "complete.json").read_text(encoding="utf-8"))
+    state = json.loads((fold_dir / "state.json").read_text(encoding="utf-8"))
+    assert marker["protocol"] == "sgrpn-phase-a-v2"
+    assert state["protocol"] == "sgrpn-phase-a-v2"
+    assert marker["models"] == list(MODEL_SEQUENCE)
+    assert marker["completed_stages"] == list(MODEL_SEQUENCE)
+    for stage in MODEL_SEQUENCE:
+        checkpoint = torch.load(
+            fold_dir / "checkpoints" / f"{stage}.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        assert checkpoint["protocol"] == "sgrpn-phase-a-v2"
+        assert checkpoint["fingerprint"] == artifacts.fingerprint.value
 
 
 @pytest.mark.parametrize("inner_fold", range(4))

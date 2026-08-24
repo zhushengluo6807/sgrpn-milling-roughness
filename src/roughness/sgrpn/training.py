@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import hashlib
@@ -120,6 +120,22 @@ class FoldArtifacts:
     checkpoint_paths: dict[str, Path]
     history_paths: dict[str, Path]
     fingerprint: RunFingerprint
+
+
+@dataclass(frozen=True)
+class MeanPathArtifacts:
+    fold: int
+    seed: int
+    train_sample_ids: tuple[str, ...]
+    model: SelectiveGatedModel
+    process_scaler: ProcessScaler
+    spectrum_scaler: SpectrumScaler
+    quality_scaler: QualityScaler
+    inner_splits: Sequence[tuple[np.ndarray, np.ndarray]]
+    inner_models: Sequence[SelectiveGatedModel]
+    inner_scalers: Sequence[tuple[ProcessScaler, SpectrumScaler, QualityScaler]]
+    best_epochs: Mapping[str, Sequence[int]]
+    histories: Mapping[str, pd.DataFrame]
 
 
 class TrainingBackend(Protocol):
@@ -982,14 +998,53 @@ def _fit_p1_subset(
         call_number += 1
         return prediction.astype(np.float64, copy=False), result.best_epoch
 
-    oof = generate_process_oof(
-        frame,
-        features,
-        ValidationAwareTrainer(callback),
-        feature_sample_ids=frame["sample_id"].astype(str).to_numpy(),
-        n_splits=4,
-        seed=seed,
-    )
+    if seed == 20260723:
+        oof = generate_process_oof(
+            frame,
+            features,
+            ValidationAwareTrainer(callback),
+            feature_sample_ids=frame["sample_id"].astype(str).to_numpy(),
+            n_splits=4,
+            seed=seed,
+        )
+    else:
+        target = frame["ra_mean"].to_numpy(dtype=np.float64, copy=True)
+        weight = frame["sample_weight"].to_numpy(dtype=np.float64, copy=True)
+        groups = frame["group_id"].astype(str).to_numpy()
+        prediction = np.full(len(frame), np.nan, dtype=np.float64)
+        assignment_count = np.zeros(len(frame), dtype=np.int64)
+        inner_fold = np.full(len(frame), -1, dtype=np.int64)
+        best_epochs: list[int] = []
+        for fold_number, (train_rows, valid_rows) in enumerate(splits):
+            fold_scaler = fit_process_scaler(features, train_rows)
+            fold_prediction, best_epoch = callback(
+                fold_scaler.transform(features[train_rows]),
+                target[train_rows].copy(),
+                weight[train_rows].copy(),
+                fold_scaler.transform(features[valid_rows]),
+                groups[train_rows].copy(),
+                groups[valid_rows].copy(),
+                y_valid=target[valid_rows].copy(),
+                w_valid=weight[valid_rows].copy(),
+            )
+            if (
+                np.asarray(fold_prediction).shape != (len(valid_rows),)
+                or not np.isfinite(fold_prediction).all()
+            ):
+                raise ValueError("P1 inner prediction must be a finite vector")
+            prediction[valid_rows] = fold_prediction
+            assignment_count[valid_rows] += 1
+            inner_fold[valid_rows] = fold_number
+            best_epochs.append(int(best_epoch))
+        if not np.all(assignment_count == 1) or not np.isfinite(prediction).all():
+            raise ValueError("every P1 row must receive one finite inner prediction")
+        oof = ProcessOOFResult(
+            prediction=prediction,
+            residual=target - prediction,
+            assignment_count=assignment_count,
+            best_epochs=tuple(best_epochs),
+            inner_fold=inner_fold,
+        )
     selection = EpochSelection(tuple(oof.best_epochs))
     all_rows = np.arange(len(frame), dtype=np.int64)
     scaler = fit_process_scaler(features, all_rows)
@@ -1475,6 +1530,142 @@ def _fit_g1_nested_stage(
         quality_scalers, refit.model, outer_p1.scaler,
         outer_r1.spectrum_scaler, outer_r1.quality_scaler,
         pd.concat(histories, ignore_index=True),
+    )
+
+
+def fit_g1_mean_path(
+    config: SGRPNConfig,
+    bundle: DataBundle,
+    cache: OrderSpectrumCache,
+    fold: int,
+    seed: int,
+    train_sample_ids: Sequence[str],
+    *,
+    device: str | torch.device | None,
+    backend: TrainingBackend | None = None,
+    batch_size: int = 8,
+) -> MeanPathArtifacts:
+    """Fit one fresh Phase B P1→R1→G1 path on an explicit train subset."""
+    if (
+        not isinstance(seed, int)
+        or isinstance(seed, bool)
+        or seed not in (20260723, 20260724, 20260725)
+    ):
+        raise ValueError("seed must be a registered Phase B seed")
+    requested_ids = tuple(map(str, train_sample_ids))
+    if not requested_ids or len(set(requested_ids)) != len(requested_ids):
+        raise ValueError("train_sample_ids must be a nonempty unique sequence")
+
+    registered_train_index, _ = outer_indices(bundle, fold)
+    manifest_ids = bundle.manifest["sample_id"].astype(str).to_numpy()
+    if len(set(manifest_ids)) != len(manifest_ids):
+        raise ValueError("manifest sample_id values must be unique")
+    registered_train_ids = set(manifest_ids[registered_train_index])
+    if any(sample_id not in registered_train_ids for sample_id in requested_ids):
+        raise ValueError(
+            "train_sample_ids must contain only registered outer-train sample IDs"
+        )
+    row_by_id = {sample_id: row for row, sample_id in enumerate(manifest_ids)}
+    requested_rows = np.asarray(
+        [row_by_id[sample_id] for sample_id in requested_ids], dtype=np.int64
+    )
+    train_frame = (
+        bundle.manifest.iloc[requested_rows].reset_index(drop=True).copy()
+    )
+    train_features = build_process_features(train_frame)
+    inner_splits = _validate_inner_splits(
+        train_frame,
+        make_group_inner_splits(train_frame, n_splits=4, seed=seed),
+    )
+
+    selected_device = _device(device)
+    set_global_seed(seed)
+    trainer: TrainingBackend = TorchTrainingBackend() if backend is None else backend
+    p1 = _fit_p1_subset(
+        config=config,
+        frame=train_frame,
+        features=train_features,
+        inner_splits=inner_splits,
+        backend=trainer,
+        device=selected_device,
+        seed=seed,
+        outer_fold=fold,
+        context_stage="P1",
+        batch_size=batch_size,
+    )
+    r1, confined_p1_cache = _fit_r1_nested_stage(
+        config=config,
+        frame=train_frame,
+        cache=cache,
+        features=train_features,
+        outer_p1_oof=p1.oof,
+        inner_splits=inner_splits,
+        backend=trainer,
+        device=selected_device,
+        seed=seed,
+        outer_fold=fold,
+        batch_size=batch_size,
+    )
+    g1 = _fit_g1_nested_stage(
+        config=config,
+        frame=train_frame,
+        cache=cache,
+        features=train_features,
+        inner_splits=inner_splits,
+        outer_p1=p1,
+        outer_r1=r1,
+        p1_cache=confined_p1_cache,
+        backend=trainer,
+        device=selected_device,
+        seed=seed,
+        outer_fold=fold,
+        batch_size=batch_size,
+    )
+
+    sample_ids = train_frame["sample_id"].astype(str).to_numpy()
+    group_ids = train_frame["group_id"].astype(str).to_numpy()
+    for model, (inner_train, _inner_valid) in zip(
+        g1.inner_models, inner_splits, strict=True
+    ):
+        model.checkpoint_metadata = {
+            "train_sample_ids": tuple(sample_ids[inner_train]),
+            "train_group_ids": tuple(group_ids[inner_train]),
+        }
+    g1.model.checkpoint_metadata = {
+        "train_sample_ids": requested_ids,
+        "train_group_ids": tuple(group_ids),
+    }
+    return MeanPathArtifacts(
+        fold=int(fold),
+        seed=seed,
+        train_sample_ids=requested_ids,
+        model=g1.model,
+        process_scaler=g1.process_scaler,
+        spectrum_scaler=g1.spectrum_scaler,
+        quality_scaler=g1.quality_scaler,
+        inner_splits=tuple(
+            (train_index.copy(), valid_index.copy())
+            for train_index, valid_index in inner_splits
+        ),
+        inner_models=tuple(g1.inner_models),
+        inner_scalers=tuple(
+            zip(
+                g1.inner_process_scalers,
+                g1.inner_spectrum_scalers,
+                g1.inner_quality_scalers,
+                strict=True,
+            )
+        ),
+        best_epochs={
+            "P1": tuple(p1.selection.best_epochs),
+            "R1": tuple(r1.selection.best_epochs),
+            "G1": tuple(g1.selection.best_epochs),
+        },
+        histories={
+            "P1": p1.history.copy(),
+            "R1": r1.history.copy(),
+            "G1": g1.history.copy(),
+        },
     )
 
 
