@@ -17,7 +17,7 @@ from torch import nn
 from roughness.scheme1.crossfit import make_group_inner_splits
 
 from roughness.sgrpn.config import SGRPNConfig
-from roughness.sgrpn.data import DataBundle, outer_indices
+from roughness.sgrpn.data import DataBundle, build_process_features, outer_indices
 from roughness.sgrpn.order_spectrum import OrderSpectrumCache
 from roughness.sgrpn.models import (
     ModelOutput,
@@ -1020,18 +1020,38 @@ def test_phase_b_mean_path_rejects_non_training_ids_before_model_construction(
         )
 
 
+@pytest.mark.parametrize("seed", [20260723, 20260724, 20260725])
 def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    seed: int,
 ):
+    import roughness.sgrpn.crossfit as crossfit
     import roughness.sgrpn.training as training
 
     config, bundle, cache = _fixture(tmp_path, max_epochs=1)
     train_index, _ = outer_indices(bundle, fold=0)
-    train_ids = bundle.manifest.iloc[train_index]["sample_id"].astype(str).tolist()
+    outer_train_ids = (
+        bundle.manifest.iloc[train_index]["sample_id"].astype(str).tolist()
+    )
+    train_ids = [outer_train_ids[index] for index in (5, 1, 4, 0, 3, 2)]
+    excluded_ids = set(outer_train_ids) - set(train_ids)
     original_constructor = training._construct_seeded_model
+    original_process_scaler = training.fit_process_scaler
+    original_spectrum_scaler = training.fit_spectrum_scaler
+    original_quality_scaler = training.fit_quality_scaler
     construction_runs: list[list[tuple[tuple[str, int, str], nn.Module, str]]] = []
+    scaler_runs: list[list[tuple[str, tuple[str, ...]]]] = []
     active_run = -1
+    manifest_features = build_process_features(bundle.manifest)
+    feature_ids = {
+        row.tobytes(): str(sample_id)
+        for row, sample_id in zip(
+            manifest_features,
+            bundle.manifest["sample_id"].astype(str),
+            strict=True,
+        )
+    }
 
     def audited_constructor(*args, **kwargs):
         model = original_constructor(*args, **kwargs)
@@ -1043,16 +1063,39 @@ def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundarie
         construction_runs[active_run].append((context, model, _state_hash(model)))
         return model
 
+    def audited_process_scaler(features, rows):
+        source_ids = tuple(
+            feature_ids[row.tobytes()]
+            for row in np.asarray(features)[np.asarray(rows, dtype=np.int64)]
+        )
+        scaler_runs[active_run].append(("process", source_ids))
+        return original_process_scaler(features, rows)
+
+    def audited_spectrum_scaler(order_cache, source_ids):
+        normalized = tuple(map(str, source_ids))
+        scaler_runs[active_run].append(("spectrum", normalized))
+        return original_spectrum_scaler(order_cache, source_ids)
+
+    def audited_quality_scaler(order_cache, source_ids):
+        normalized = tuple(map(str, source_ids))
+        scaler_runs[active_run].append(("quality", normalized))
+        return original_quality_scaler(order_cache, source_ids)
+
     def fail_checkpoint_load(*_args, **_kwargs):
         pytest.fail("Phase B mean path attempted to load a Phase A checkpoint")
 
     monkeypatch.setattr(training, "_construct_seeded_model", audited_constructor)
+    monkeypatch.setattr(training, "fit_process_scaler", audited_process_scaler)
+    monkeypatch.setattr(crossfit, "fit_process_scaler", audited_process_scaler)
+    monkeypatch.setattr(training, "fit_spectrum_scaler", audited_spectrum_scaler)
+    monkeypatch.setattr(training, "fit_quality_scaler", audited_quality_scaler)
     monkeypatch.setattr(torch, "load", fail_checkpoint_load)
     artifacts_by_run = []
     backends = []
     for run_number in range(2):
         active_run = run_number
         construction_runs.append([])
+        scaler_runs.append([])
         backend = RecordingBackend()
         backends.append(backend)
         artifacts_by_run.append(
@@ -1061,7 +1104,7 @@ def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundarie
                 bundle,
                 cache,
                 fold=0,
-                seed=20260723,
+                seed=seed,
                 train_sample_ids=train_ids,
                 device="cpu",
                 backend=backend,
@@ -1074,6 +1117,26 @@ def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundarie
         assert tuple(dict.fromkeys(stages)) == ("P1", "R1", "G1")
         assert "V1" not in stages
         assert "F1" not in stages
+        assert all(
+            set(call["train_ids"]).issubset(train_ids)
+            and set(call["valid_ids"]).issubset(train_ids)
+            and excluded_ids.isdisjoint(call["train_ids"])
+            and excluded_ids.isdisjoint(call["valid_ids"])
+            for call in backend.calls
+        )
+    for scaler_audits in scaler_runs:
+        assert scaler_audits
+        assert {kind for kind, _ in scaler_audits} == {
+            "process", "spectrum", "quality"
+        }
+        assert all(
+            source_ids
+            and set(source_ids).issubset(train_ids)
+            and excluded_ids.isdisjoint(source_ids)
+            for _, source_ids in scaler_audits
+        )
+        for kind in ("process", "spectrum", "quality"):
+            assert (kind, tuple(train_ids)) in scaler_audits
     assert [record[0] for record in construction_runs[0]] == [
         record[0] for record in construction_runs[1]
     ]
@@ -1098,7 +1161,7 @@ def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundarie
     artifacts = artifacts_by_run[0]
     assert isinstance(artifacts, training.MeanPathArtifacts)
     assert artifacts.fold == 0
-    assert artifacts.seed == 20260723
+    assert artifacts.seed == seed
     assert artifacts.train_sample_ids == tuple(train_ids)
     assert isinstance(artifacts.model, SelectiveGatedModel)
     assert len(artifacts.inner_splits) == 4
@@ -1106,6 +1169,12 @@ def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundarie
     assert len(artifacts.inner_scalers) == 4
     assert set(artifacts.best_epochs) == {"P1", "R1", "G1"}
     assert set(artifacts.histories) == {"P1", "R1", "G1"}
+    assert artifacts.model.checkpoint_metadata == {
+        "train_sample_ids": tuple(train_ids),
+        "train_group_ids": tuple(
+            bundle.manifest.set_index("sample_id").loc[train_ids]["group_id"].astype(str)
+        ),
+    }
     train_frame = (
         bundle.manifest.set_index(bundle.manifest["sample_id"].astype(str))
         .loc[train_ids]
@@ -1135,6 +1204,115 @@ def test_phase_b_mean_path_uses_fresh_fixed_stages_and_auditable_inner_boundarie
         }
         assert set(train_frame.iloc[inner_train]["group_id"]).isdisjoint(
             train_frame.iloc[inner_valid]["group_id"]
+        )
+
+
+@pytest.mark.parametrize("seed", [20260723, 20260724, 20260725])
+def test_phase_b_mean_path_ignores_labels_outside_ordered_training_subset(
+    tmp_path: Path,
+    seed: int,
+):
+    import roughness.sgrpn.training as training
+
+    first_config, first_bundle, first_cache = _fixture(
+        tmp_path / "first", max_epochs=1
+    )
+    second_config, second_bundle, second_cache = _fixture(
+        tmp_path / "second", max_epochs=1
+    )
+    train_index, test_index = outer_indices(first_bundle, fold=0)
+    outer_train_ids = (
+        first_bundle.manifest.iloc[train_index]["sample_id"].astype(str).tolist()
+    )
+    train_ids = [outer_train_ids[index] for index in (5, 1, 4, 0, 3, 2)]
+    excluded_train_ids = set(outer_train_ids) - set(train_ids)
+    outer_test_ids = set(
+        first_bundle.manifest.iloc[test_index]["sample_id"].astype(str)
+    )
+    changed_ids = excluded_train_ids | outer_test_ids
+    changed_mask = second_bundle.manifest["sample_id"].astype(str).isin(changed_ids)
+    for column in ("ra_1", "ra_2", "ra_3", "ra_mean"):
+        second_bundle.manifest.loc[changed_mask, column] += 123.456
+    assert changed_mask.sum() == len(changed_ids)
+
+    first_backend = RecordingBackend()
+    first = training.fit_g1_mean_path(
+        first_config,
+        first_bundle,
+        first_cache,
+        fold=0,
+        seed=seed,
+        train_sample_ids=train_ids,
+        device="cpu",
+        backend=first_backend,
+        batch_size=2,
+    )
+    second_backend = RecordingBackend()
+    second = training.fit_g1_mean_path(
+        second_config,
+        second_bundle,
+        second_cache,
+        fold=0,
+        seed=seed,
+        train_sample_ids=train_ids,
+        device="cpu",
+        backend=second_backend,
+        batch_size=2,
+    )
+
+    assert first.train_sample_ids == second.train_sample_ids == tuple(train_ids)
+    assert first.model.checkpoint_metadata == second.model.checkpoint_metadata
+    assert _state_hash(first.model) == _state_hash(second.model)
+    assert [_state_hash(model) for model in first.inner_models] == [
+        _state_hash(model) for model in second.inner_models
+    ]
+    assert [model.checkpoint_metadata for model in first.inner_models] == [
+        model.checkpoint_metadata for model in second.inner_models
+    ]
+    assert all(
+        changed_ids.isdisjoint(model.checkpoint_metadata["train_sample_ids"])
+        for model in first.inner_models
+    )
+    for first_scaler, second_scaler in (
+        (first.process_scaler, second.process_scaler),
+        (first.spectrum_scaler, second.spectrum_scaler),
+        (first.quality_scaler, second.quality_scaler),
+    ):
+        np.testing.assert_array_equal(first_scaler.mean, second_scaler.mean)
+        np.testing.assert_array_equal(first_scaler.scale, second_scaler.scale)
+    for first_scalers, second_scalers in zip(
+        first.inner_scalers, second.inner_scalers, strict=True
+    ):
+        for first_scaler, second_scaler in zip(
+            first_scalers, second_scalers, strict=True
+        ):
+            np.testing.assert_array_equal(first_scaler.mean, second_scaler.mean)
+            np.testing.assert_array_equal(first_scaler.scale, second_scaler.scale)
+    for first_split, second_split in zip(
+        first.inner_splits, second.inner_splits, strict=True
+    ):
+        np.testing.assert_array_equal(first_split[0], second_split[0])
+        np.testing.assert_array_equal(first_split[1], second_split[1])
+    for stage in ("P1", "R1", "G1"):
+        assert first.best_epochs[stage] == second.best_epochs[stage]
+        pd.testing.assert_frame_equal(first.histories[stage], second.histories[stage])
+
+    assert len(first_backend.calls) == len(second_backend.calls)
+    for first_call, second_call in zip(
+        first_backend.calls, second_backend.calls, strict=True
+    ):
+        assert first_call["stage"] == second_call["stage"]
+        assert first_call["train_ids"] == second_call["train_ids"]
+        assert first_call["valid_ids"] == second_call["valid_ids"]
+        assert set(first_call["train_ids"]).issubset(train_ids)
+        assert set(first_call["valid_ids"]).issubset(train_ids)
+        assert changed_ids.isdisjoint(first_call["train_ids"])
+        assert changed_ids.isdisjoint(first_call["valid_ids"])
+        np.testing.assert_array_equal(
+            first_call["train_targets"], second_call["train_targets"]
+        )
+        np.testing.assert_array_equal(
+            first_call["valid_targets"], second_call["valid_targets"]
         )
 
 
