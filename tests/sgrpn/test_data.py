@@ -11,6 +11,7 @@ from roughness.sgrpn.data import (
     load_data_bundle,
     outer_indices,
     recompute_duration,
+    repeat_measure_batch,
     validate_group_split,
     write_data_audit,
 )
@@ -105,6 +106,49 @@ def test_process_features_are_exactly_nine_columns():
 
     np.testing.assert_allclose(features[0], [4000.0, 0.05, 1.0, 16_000_000.0, 0.0025, 1.0, 200.0, 4000.0, 0.05])
     assert features.shape == (1, 9)
+
+
+def test_repeat_measure_batch_keeps_one_row_per_region():
+    frame = pd.DataFrame({
+        "ra_1": [0.4, 0.7], "ra_2": [0.5, 0.8], "ra_3": [0.6, 0.9],
+        "ra_mean": [0.5, 0.8], "sample_weight": [0.5, 0.25],
+        "split_count": [2, 4],
+    })
+    batch = repeat_measure_batch(frame)
+    assert batch.readings.shape == (2, 3)
+    np.testing.assert_allclose(batch.mean, [0.5, 0.8])
+    np.testing.assert_allclose(batch.weight, [0.5, 0.25])
+
+
+def test_repeat_measure_batch_rejects_noncanonical_region_weight():
+    frame = pd.DataFrame({
+        "ra_1": [0.4], "ra_2": [0.5], "ra_3": [0.6], "ra_mean": [0.5],
+        "sample_weight": [1.0], "split_count": [2],
+    })
+    with pytest.raises(ValueError, match="1/split_count"):
+        repeat_measure_batch(frame)
+
+
+def test_repeat_measure_batch_rejects_inconsistent_mean():
+    frame = pd.DataFrame({
+        "ra_1": [0.4], "ra_2": [0.5], "ra_3": [0.6], "ra_mean": [0.51],
+        "sample_weight": [0.5], "split_count": [2],
+    })
+    with pytest.raises(ValueError, match="arithmetic mean"):
+        repeat_measure_batch(frame)
+
+
+def test_repeat_measure_batch_rejects_nonfinite_readings_and_nonpositive_split_count():
+    base = {
+        "ra_1": [0.4], "ra_2": [0.5], "ra_3": [0.6], "ra_mean": [0.5],
+        "sample_weight": [0.5], "split_count": [2],
+    }
+    nonfinite = pd.DataFrame({**base, "ra_2": [np.inf]})
+    with pytest.raises(ValueError, match="finite"):
+        repeat_measure_batch(nonfinite)
+    nonpositive = pd.DataFrame({**base, "split_count": [0]})
+    with pytest.raises(ValueError, match="split_count"):
+        repeat_measure_batch(nonpositive)
 
 
 def test_duration_uses_row_count_not_metadata():

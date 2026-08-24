@@ -49,6 +49,32 @@ class DataBundle:
     duration_audit: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class RepeatMeasureBatch:
+    readings: np.ndarray  # [N, 3]
+    mean: np.ndarray  # [N]
+    weight: np.ndarray  # [N]
+
+
+def repeat_measure_batch(frame: pd.DataFrame) -> RepeatMeasureBatch:
+    """Validate and package one three-reading region per input row."""
+    required = {"ra_1", "ra_2", "ra_3", "ra_mean", "sample_weight", "split_count"}
+    _require_columns(frame, required, "Repeat-measure frame")
+    readings = _finite_values(frame, ("ra_1", "ra_2", "ra_3"), "Repeat-measure frame")
+    mean = _finite_values(frame, ("ra_mean",), "Repeat-measure frame").ravel()
+    weight = _finite_values(frame, ("sample_weight",), "Repeat-measure frame").ravel()
+    split_count = _finite_values(frame, ("split_count",), "Repeat-measure frame").ravel()
+    if (split_count <= 0).any():
+        raise ValueError("Repeat-measure split_count must be positive")
+    expected_mean = readings.mean(axis=1)
+    if not np.allclose(mean, expected_mean, atol=1e-12, rtol=0.0):
+        raise ValueError("Repeat-measure ra_mean must equal the arithmetic mean")
+    expected_weight = 1.0 / split_count
+    if not np.allclose(weight, expected_weight, atol=1e-12, rtol=0.0):
+        raise ValueError("Repeat-measure sample_weight must equal 1/split_count")
+    return RepeatMeasureBatch(readings=readings, mean=mean, weight=weight)
+
+
 def recompute_duration(row_count: int, sample_rate_hz: int) -> float:
     if row_count < 0:
         raise ValueError("row_count must be non-negative")
