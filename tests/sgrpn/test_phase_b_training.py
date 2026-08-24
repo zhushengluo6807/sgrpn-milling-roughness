@@ -29,9 +29,15 @@ from roughness.sgrpn.order_spectrum import (
     SpectrumScaler,
 )
 from roughness.sgrpn.phase_b_training import (
+    PHASE_B_MEAN_COLUMNS,
+    PHASE_B_PREDICTION_COLUMNS,
     SCALE_MODELS,
+    PhaseBFoldArtifacts,
+    PhaseBRunFingerprint,
     build_nested_calibration,
+    completed_phase_b_fold_matches,
     fit_scale_model,
+    run_phase_b,
     run_phase_b_fold,
 )
 from roughness.sgrpn.training import MeanPathArtifacts
@@ -251,6 +257,7 @@ def test_exact_epoch_scale_refit_trains_every_epoch_without_validation_or_restor
 def test_public_phase_b_training_signatures_are_exactly_typed():
     nested = inspect.signature(build_nested_calibration)
     fold = inspect.signature(run_phase_b_fold)
+    run = inspect.signature(run_phase_b)
 
     assert tuple(nested.parameters) == (
         "config",
@@ -276,7 +283,18 @@ def test_public_phase_b_training_signatures_are_exactly_typed():
         "batch_size",
         "output_root",
     )
-    for signature, keyword_only in ((nested, 6), (fold, 7)):
+    assert tuple(run.parameters) == (
+        "config",
+        "handoff",
+        "phase_a_config",
+        "bundle",
+        "cache",
+        "device",
+        "backend",
+        "batch_size",
+        "output_root",
+    )
+    for signature, keyword_only in ((nested, 6), (fold, 7), (run, 5)):
         parameters = tuple(signature.parameters.values())
         assert all(
             parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -295,6 +313,10 @@ def test_public_phase_b_training_signatures_are_exactly_typed():
     assert fold.parameters["backend"].default is None
     assert fold.parameters["batch_size"].default == 8
     assert fold.parameters["output_root"].default is None
+    assert run.parameters["device"].default is None
+    assert run.parameters["backend"].default is None
+    assert run.parameters["batch_size"].default == 8
+    assert run.parameters["output_root"].default is None
 
 
 def _fixture(
@@ -732,11 +754,6 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
 
     config, phase_a, handoff, bundle, cache = _fixture(tmp_path)
     fixture_hash = _phase_a_fixture_hash(phase_a, handoff, bundle, cache)
-    files_before = {
-        path.relative_to(tmp_path)
-        for path in tmp_path.rglob("*")
-        if path.is_file()
-    }
     _fake_mean_path(monkeypatch, [])
     first = run_phase_b_fold(
         config,
@@ -751,21 +768,17 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
         output_root=config.output_dir,
     )
     assert _phase_a_fixture_hash(phase_a, handoff, bundle, cache) == fixture_hash
-    assert {
-        path.relative_to(tmp_path)
-        for path in tmp_path.rglob("*")
-        if path.is_file()
-    } == files_before
     _, outer_test = outer_indices(bundle, 0)
     changed_manifest = bundle.manifest.copy()
     changed_manifest.loc[outer_test, ["ra_1", "ra_2", "ra_3", "ra_mean"]] += 100.0
     changed_bundle = replace(bundle, manifest=changed_manifest)
+    changed_config = replace(config, output_dir=tmp_path / "changed_phase_b")
     changed_fixture_hash = _phase_a_fixture_hash(
         phase_a, handoff, changed_bundle, cache
     )
     _fake_mean_path(monkeypatch, [])
     second = run_phase_b_fold(
-        config,
+        changed_config,
         handoff,
         phase_a,
         changed_bundle,
@@ -774,18 +787,12 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
         seed,
         device="cpu",
         batch_size=32,
-        output_root=config.output_dir,
+        output_root=changed_config.output_dir,
     )
     assert (
         _phase_a_fixture_hash(phase_a, handoff, changed_bundle, cache)
         == changed_fixture_hash
     )
-    assert {
-        path.relative_to(tmp_path)
-        for path in tmp_path.rglob("*")
-        if path.is_file()
-    } == files_before
-
     assert phase_b_training.PHASE_B_PREDICTION_COLUMNS == EXPECTED_PHASE_B_PREDICTION_COLUMNS
     assert phase_b_training.PHASE_B_MEAN_COLUMNS == EXPECTED_PHASE_B_MEAN_COLUMNS
     assert phase_b_training.CALIBRATION_SCORE_COLUMNS == EXPECTED_CALIBRATION_SCORE_COLUMNS
@@ -851,7 +858,7 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
     assert first.checkpoint_paths.keys() == set(SCALE_MODELS)
     assert first.history_paths.keys() == set(SCALE_MODELS)
     assert all(path.is_relative_to(config.output_dir) for path in first.checkpoint_paths.values())
-    assert not config.output_dir.exists()
+    assert config.output_dir.is_dir()
 
 
 @pytest.mark.parametrize("bad_seed", [7, True, 20260723.0])
@@ -883,3 +890,489 @@ def test_nested_calibration_fails_closed_without_19_outer_train_groups(
             device="cpu",
             batch_size=32,
         )
+
+
+def _persisted_phase_b_fold(tmp_path: Path, monkeypatch):
+    config, phase_a, handoff, bundle, cache = _fixture(tmp_path)
+    _fake_mean_path(monkeypatch, [])
+    artifacts = run_phase_b_fold(
+        config,
+        handoff,
+        phase_a,
+        bundle,
+        cache,
+        0,
+        20260723,
+        device="cpu",
+        batch_size=32,
+        output_root=config.output_dir,
+    )
+    marker_path = (
+        config.output_dir
+        / "folds"
+        / "fold_0"
+        / "seed_20260723"
+        / "complete.json"
+    )
+    return marker_path, artifacts, config, phase_a, handoff, bundle, cache
+
+
+@pytest.fixture
+def completed_fold_fixture(tmp_path, monkeypatch):
+    marker_path, artifacts, *_ = _persisted_phase_b_fold(tmp_path, monkeypatch)
+    return marker_path, artifacts.fingerprint.value
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("protocol", "wrong"),
+        ("fingerprint", "wrong"),
+        ("seed", 7),
+        ("fold", 9),
+        ("models", ["wrong"]),
+        ("probability_rows", -1),
+        ("mean_rows", -1),
+    ),
+)
+def test_phase_b_resume_rejects_marker_binding_change(
+    completed_fold_fixture, field, changed
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    payload[field] = changed
+    marker_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+def test_phase_b_fingerprint_binds_protocol_models_fold_seed_and_every_input(
+    tmp_path, monkeypatch
+):
+    from roughness.sgrpn import phase_b_training
+
+    config, _phase_a, handoff, bundle, cache = _fixture(tmp_path)
+    original = phase_b_training._phase_b_fingerprint(
+        config, handoff, bundle, cache, fold=0, seed=20260723
+    )
+    assert phase_b_training.PHASE_B_PROTOCOL == "sgrpn-phase-b-v1"
+    assert original.value != phase_b_training._phase_b_fingerprint(
+        config, handoff, bundle, cache, fold=1, seed=20260723
+    ).value
+    assert original.value != phase_b_training._phase_b_fingerprint(
+        config, handoff, bundle, cache, fold=0, seed=20260724
+    ).value
+
+    config_changes = {
+        "phase_a_config_path": tmp_path / "changed-phase-a.yaml",
+        "phase_a_config_file_sha256": "1" * 64,
+        "phase_a_acceptance_path": tmp_path / "changed-acceptance.json",
+        "phase_a_run_manifest_path": tmp_path / "changed-run-manifest.json",
+        "output_dir": tmp_path / "changed-output",
+        "seeds": tuple(reversed(config.seeds)),
+        "alphas": tuple(reversed(config.alphas)),
+        "inner_splits": 5,
+        "max_epochs": 2,
+        "patience": 2,
+        "variance_learning_rate": 2e-3,
+        "weight_decay": 2e-4,
+        "bootstrap_repetitions": 9999,
+    }
+    for field, changed in config_changes.items():
+        assert original.value != phase_b_training._phase_b_fingerprint(
+            replace(config, **{field: changed}),
+            handoff,
+            bundle,
+            cache,
+            fold=0,
+            seed=20260723,
+        ).value, field
+
+    handoff_changes = {
+        "acceptance_sha256": "1" * 64,
+        "run_manifest_sha256": "2" * 64,
+        "phase_a_config_sha256": "3" * 64,
+        "training_fingerprint": "4" * 64,
+        "cache_sha256": "5" * 64,
+        "input_sha256": {"manifest": "6" * 64},
+    }
+    for field, changed in handoff_changes.items():
+        assert original.value != phase_b_training._phase_b_fingerprint(
+            config,
+            replace(handoff, **{field: changed}),
+            bundle,
+            cache,
+            fold=0,
+            seed=20260723,
+        ).value, field
+
+    changed_manifest = bundle.manifest.copy()
+    changed_manifest.loc[0, "n_rpm"] += 1.0
+    changed_folds = bundle.folds.copy()
+    changed_folds.loc[0, "fold"] = 4
+    changed_spectra = cache.spectra.copy()
+    changed_spectra[0, 0, 0] += 1.0
+    for changed_bundle, changed_cache in (
+        (replace(bundle, manifest=changed_manifest), cache),
+        (replace(bundle, folds=changed_folds), cache),
+        (bundle, replace(cache, spectra=changed_spectra)),
+    ):
+        assert original.value != phase_b_training._phase_b_fingerprint(
+            config,
+            handoff,
+            changed_bundle,
+            changed_cache,
+            fold=0,
+            seed=20260723,
+        ).value
+
+    monkeypatch.setattr(phase_b_training, "SCALE_MODELS", tuple(reversed(SCALE_MODELS)))
+    assert original.value != phase_b_training._phase_b_fingerprint(
+        config, handoff, bundle, cache, fold=0, seed=20260723
+    ).value
+    monkeypatch.setattr(phase_b_training, "PHASE_B_PROTOCOL", "wrong-protocol")
+    assert original.value != phase_b_training._phase_b_fingerprint(
+        config, handoff, bundle, cache, fold=0, seed=20260723
+    ).value
+
+
+def test_phase_b_completion_requires_exact_tree_and_every_registered_hash(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    fold_dir = marker_path.parent
+    expected_files = {
+        "mean/checkpoints/P1.pt",
+        "mean/checkpoints/R1.pt",
+        "mean/checkpoints/G1.pt",
+        "mean/history/P1.csv",
+        "mean/history/R1.csv",
+        "mean/history/G1.csv",
+        "scale/checkpoints/heteroscedastic.pt",
+        "scale/checkpoints/homoscedastic.pt",
+        "scale/history/heteroscedastic.csv",
+        "scale/history/homoscedastic.csv",
+        "scalers/process.npz",
+        "scalers/spectrum.npz",
+        "scalers/quality.npz",
+        "calibration/inner_folds.csv",
+        "calibration/oof_predictions.csv",
+        "calibration/group_scores.csv",
+        "calibration/quantiles.json",
+        "predictions.csv",
+        "state.json",
+        "complete.json",
+    }
+    assert {
+        path.relative_to(fold_dir).as_posix()
+        for path in fold_dir.rglob("*")
+        if path.is_file()
+    } == expected_files
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert set(marker["artifacts"]) == expected_files - {"complete.json"}
+    assert completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+    for model in ("P1", "R1", "G1", *SCALE_MODELS):
+        family = "mean" if model in {"P1", "R1", "G1"} else "scale"
+        checkpoint = torch.load(
+            fold_dir / family / "checkpoints" / f"{model}.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        assert checkpoint["protocol"] == "sgrpn-phase-b-v1"
+        assert checkpoint["fingerprint"] == expected_fingerprint
+        assert checkpoint["fold"] == 0
+        assert checkpoint["seed"] == 20260723
+        assert checkpoint["model"] == model
+        assert len(checkpoint["best_epochs"]) == 4
+        assert checkpoint["refit_epoch"] >= 1
+        assert len(checkpoint["mean_state_sha256"]) == 64
+
+    for relative in marker["artifacts"]:
+        path = fold_dir / relative
+        original = path.read_bytes()
+        path.unlink()
+        assert not completed_phase_b_fold_matches(
+            marker_path, expected_fingerprint, fold=0, seed=20260723
+        ), relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(original + b"corrupt")
+        assert not completed_phase_b_fold_matches(
+            marker_path, expected_fingerprint, fold=0, seed=20260723
+        ), relative
+        path.write_bytes(original)
+
+
+def test_phase_b_completion_deeply_reloads_registered_artifacts(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    checkpoint_path = marker_path.parent / "scale/checkpoints/heteroscedastic.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint["protocol"] = "wrong"
+    torch.save(checkpoint, checkpoint_path)
+    marker["artifacts"]["scale/checkpoints/heteroscedastic.pt"] = hashlib.sha256(
+        checkpoint_path.read_bytes()
+    ).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+def test_phase_b_publication_is_atomic_ordered_and_complete_marker_is_last(
+    tmp_path, monkeypatch
+):
+    from roughness.sgrpn import phase_b_training
+
+    published: list[str] = []
+    states: list[tuple[str, ...]] = []
+    original_bytes = phase_b_training._atomic_write_bytes
+    original_json = phase_b_training._atomic_write_json
+
+    def recording_bytes(path, content):
+        published.append(Path(path).name)
+        return original_bytes(path, content)
+
+    def recording_json(path, payload):
+        if Path(path).name == "state.json":
+            states.append(tuple(payload["completed_stages"]))
+        return original_json(path, payload)
+
+    monkeypatch.setattr(phase_b_training, "_atomic_write_bytes", recording_bytes)
+    monkeypatch.setattr(phase_b_training, "_atomic_write_json", recording_json)
+    marker_path, _artifacts, *_ = _persisted_phase_b_fold(tmp_path, monkeypatch)
+
+    assert states == [
+        ("mean",),
+        ("mean", "heteroscedastic"),
+        ("mean", "heteroscedastic", "homoscedastic"),
+        ("mean", "heteroscedastic", "homoscedastic", "calibration"),
+        ("mean", "heteroscedastic", "homoscedastic", "calibration", "prediction"),
+        (
+            "mean",
+            "heteroscedastic",
+            "homoscedastic",
+            "calibration",
+            "prediction",
+            "complete",
+        ),
+    ]
+    assert published[-1] == "complete.json"
+    assert not list(marker_path.parent.rglob("*.tmp-*"))
+
+
+def test_phase_b_resume_reuses_only_an_exact_completed_unit_before_training(
+    tmp_path, monkeypatch
+):
+    from roughness.sgrpn import phase_b_training
+
+    marker_path, first, config, phase_a, handoff, bundle, cache = _persisted_phase_b_fold(
+        tmp_path, monkeypatch
+    )
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("training must not run while validating resume")
+
+    monkeypatch.setattr(phase_b_training, "build_nested_calibration", forbidden)
+    monkeypatch.setattr(phase_b_training, "fit_g1_mean_path", forbidden)
+    resumed = run_phase_b_fold(
+        config,
+        handoff,
+        phase_a,
+        bundle,
+        cache,
+        0,
+        20260723,
+        device="cpu",
+        output_root=config.output_dir,
+    )
+    pd.testing.assert_frame_equal(first.predictions, resumed.predictions)
+    pd.testing.assert_frame_equal(
+        first.predictions.attrs["mean_predictions"],
+        resumed.predictions.attrs["mean_predictions"],
+    )
+
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    payload["fingerprint"] = "wrong"
+    marker_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="incompatible completed Phase B fold"):
+        run_phase_b_fold(
+            config,
+            handoff,
+            phase_a,
+            bundle,
+            cache,
+            0,
+            20260723,
+            device="cpu",
+            output_root=config.output_dir,
+        )
+    marker_path.write_text("{corrupt", encoding="utf-8")
+    with pytest.raises(ValueError, match="incompatible completed Phase B fold"):
+        run_phase_b_fold(
+            config,
+            handoff,
+            phase_a,
+            bundle,
+            cache,
+            0,
+            20260723,
+            device="cpu",
+            output_root=config.output_dir,
+        )
+    marker_path.unlink()
+    with pytest.raises(ValueError, match="incompatible partial Phase B fold"):
+        run_phase_b_fold(
+            config,
+            handoff,
+            phase_a,
+            bundle,
+            cache,
+            0,
+            20260723,
+            device="cpu",
+            output_root=config.output_dir,
+        )
+
+
+def _orchestration_fold_artifact(
+    bundle: DataBundle, fold: int, seed: int
+) -> PhaseBFoldArtifacts:
+    _, test_indices = outer_indices(bundle, fold)
+    frame = bundle.manifest.iloc[test_indices].reset_index(drop=True)
+    probability_rows = []
+    mean_rows = []
+    for row in frame.itertuples(index=False):
+        for scale_model in SCALE_MODELS:
+            probability_rows.append(
+                {
+                    "sample_id": str(row.sample_id),
+                    "group_id": str(row.group_id),
+                    "version": str(row.version),
+                    "fold": fold,
+                    "seed": seed,
+                    "scale_model": scale_model,
+                    "target_mean": float(row.ra_mean),
+                    "ra_1": float(row.ra_1),
+                    "ra_2": float(row.ra_2),
+                    "ra_3": float(row.ra_3),
+                    "sample_weight": float(row.sample_weight),
+                    "mu": 0.5,
+                    "sigma": 0.2,
+                    "gate": 0.5,
+                    "correction": 0.1,
+                    "raw_lower_90": 0.1,
+                    "raw_upper_90": 0.9,
+                    "raw_lower_95": 0.0,
+                    "raw_upper_95": 1.0,
+                    "conformal_q_90": 2.0,
+                    "conformal_lower_90": 0.1,
+                    "conformal_upper_90": 0.9,
+                    "conformal_q_95": 2.5,
+                    "conformal_lower_95": 0.0,
+                    "conformal_upper_95": 1.0,
+                }
+            )
+        for model in ("P1", "R1", "G1"):
+            mean_rows.append(
+                {
+                    "sample_id": str(row.sample_id),
+                    "group_id": str(row.group_id),
+                    "version": str(row.version),
+                    "fold": fold,
+                    "seed": seed,
+                    "model": model,
+                    "target_mean": float(row.ra_mean),
+                    "prediction": 0.5,
+                    "sample_weight": float(row.sample_weight),
+                    "process_mean": 0.4,
+                    "residual": 0.2,
+                    "gate": 0.5,
+                }
+            )
+    predictions = pd.DataFrame(probability_rows, columns=PHASE_B_PREDICTION_COLUMNS)
+    predictions.attrs["mean_predictions"] = pd.DataFrame(
+        mean_rows, columns=PHASE_B_MEAN_COLUMNS
+    )
+    digest = hashlib.sha256(f"{fold}:{seed}".encode("ascii")).hexdigest()
+    fingerprint = PhaseBRunFingerprint(
+        digest,
+        "1" * 64,
+        "2" * 64,
+        "3" * 64,
+        "4" * 64,
+        "5" * 64,
+        "6" * 64,
+        "7" * 64,
+    )
+    return PhaseBFoldArtifacts(predictions, {}, {}, {}, fingerprint)
+
+
+def test_run_phase_b_executes_exact_five_fold_three_seed_cartesian_and_writes_oof(
+    tmp_path, monkeypatch
+):
+    from roughness.sgrpn import phase_b_training
+
+    config, phase_a, handoff, bundle, cache = _fixture(tmp_path, group_count=585)
+    calls: list[tuple[int, int]] = []
+
+    def fake_fold(
+        actual_config,
+        actual_handoff,
+        actual_phase_a,
+        actual_bundle,
+        actual_cache,
+        fold,
+        seed,
+        **kwargs,
+    ):
+        assert actual_config is config
+        assert actual_handoff is handoff
+        assert actual_phase_a is phase_a
+        assert actual_bundle is bundle
+        assert actual_cache is cache
+        assert kwargs["output_root"] == config.output_dir
+        calls.append((fold, seed))
+        return _orchestration_fold_artifact(bundle, fold, seed)
+
+    monkeypatch.setattr(phase_b_training, "run_phase_b_fold", fake_fold)
+    result = run_phase_b(
+        config,
+        handoff,
+        phase_a,
+        bundle,
+        cache,
+        device="cpu",
+        batch_size=32,
+        output_root=config.output_dir,
+    )
+
+    expected_keys = {
+        (fold, seed) for fold in range(5) for seed in (20260723, 20260724, 20260725)
+    }
+    assert calls == [
+        (fold, seed) for fold in range(5) for seed in (20260723, 20260724, 20260725)
+    ]
+    assert set(result.fold_artifacts) == expected_keys
+    assert set(result.fingerprints) == expected_keys
+    assert len(result.probability_predictions) == 3516
+    assert len(result.mean_predictions) == 5274
+    assert not result.probability_predictions.duplicated(
+        ["sample_id", "seed", "scale_model"]
+    ).any()
+    assert not result.mean_predictions.duplicated(["sample_id", "seed", "model"]).any()
+    prediction_dir = config.output_dir / "predictions"
+    probability_path = prediction_dir / "oof_probability_predictions.csv"
+    mean_path = prediction_dir / "oof_mean_predictions.csv"
+    assert probability_path.is_file()
+    assert mean_path.is_file()
+    assert len(pd.read_csv(probability_path)) == 3516
+    assert len(pd.read_csv(mean_path)) == 5274
+    assert not list(prediction_dir.glob("*.tmp-*"))

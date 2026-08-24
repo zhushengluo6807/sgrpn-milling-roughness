@@ -1,18 +1,14 @@
-"""Phase B probability training.
-
-This module deliberately starts with the scale-head fitting primitive.  The
-nested calibration and outer-fold orchestration APIs are declared here so their
-public contracts are stable, but are implemented by the subsequent Task 6B
-batch.
-"""
+"""Phase B nested probability training, persistence, resume, and orchestration."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
+import io
 import json
 import math
 import random
+import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -50,9 +46,21 @@ from .probability import (
 from .training import MeanPathArtifacts, TrainingBackend, fit_g1_mean_path
 
 
-# The two registered Phase B scale variants.  Their order is also the persisted
-# output order used by the fold runner implemented in the next batch.
+# The two registered Phase B scale variants. Their order is persisted verbatim.
 SCALE_MODELS = ("heteroscedastic", "homoscedastic")
+MEAN_MODELS = ("P1", "R1", "G1")
+PHASE_B_MODELS = (*MEAN_MODELS, *SCALE_MODELS)
+PHASE_B_PROTOCOL = "sgrpn-phase-b-v1"
+PHASE_B_STATE_ORDER = (
+    "mean",
+    "heteroscedastic",
+    "homoscedastic",
+    "calibration",
+    "prediction",
+    "complete",
+)
+PHASE_B_SEEDS = (20260723, 20260724, 20260725)
+PHASE_B_ALPHAS = (0.10, 0.05)
 
 CALIBRATION_SCORE_COLUMNS = (
     "group_id",
@@ -886,6 +894,8 @@ def _select_and_refit_outer_scales(
         for parameter in refit.model.parameters():
             parameter.requires_grad_(False)
         refit.model.eval()
+        refit.model._phase_b_best_epochs = tuple(map(int, selected_epochs))
+        refit.model._phase_b_refit_epoch = int(refit_epochs)
         fitted[scale_name] = refit.model
         histories[scale_name] = refit.history
     return fitted, histories
@@ -1029,34 +1039,55 @@ def _phase_b_fingerprint(
     handoff: PhaseAHandoff,
     bundle: DataBundle,
     cache: OrderSpectrumCache,
+    *,
+    fold: int,
+    seed: int,
 ) -> PhaseBRunFingerprint:
-    """Bind the in-memory fold to its immutable handoff and consumed inputs."""
+    """Bind one Phase B unit to its protocol, handoff, and consumed inputs."""
     from .training import _cache_sha256, _frame_sha256
 
-    config_payload = {
-        name: str(value) if isinstance(value, Path) else value
-        for name, value in asdict(config).items()
-    }
+    def jsonable(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value.resolve())
+        if isinstance(value, Mapping):
+            return {str(name): jsonable(item) for name, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [jsonable(item) for item in value]
+        return value
+
+    def canonical(payload: Any) -> bytes:
+        return json.dumps(
+            jsonable(payload),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+    config_payload = jsonable(asdict(config))
     config_sha = hashlib.sha256(
-        json.dumps(config_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        canonical(config_payload)
     ).hexdigest()
     manifest_sha = _frame_sha256(bundle.manifest)
     folds_sha = _frame_sha256(bundle.folds)
     cache_sha = _cache_sha256(cache)
     value = hashlib.sha256(
-        json.dumps(
+        canonical(
             {
-                "config": config_sha,
-                "phase_a_acceptance": handoff.acceptance_sha256,
-                "phase_a_run_manifest": handoff.run_manifest_sha256,
-                "phase_a_training": handoff.training_fingerprint,
-                "manifest": manifest_sha,
-                "folds": folds_sha,
-                "cache": cache_sha,
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        ).encode("utf-8")
+                "protocol": PHASE_B_PROTOCOL,
+                "phase_b_config": config_payload,
+                "phase_b_config_sha256": config_sha,
+                "phase_b_seeds": list(config.seeds),
+                "phase_b_alphas": list(config.alphas),
+                "models": [*MEAN_MODELS, *SCALE_MODELS],
+                "fold": fold,
+                "seed": seed,
+                "phase_a_handoff": asdict(handoff),
+                "manifest_sha256": manifest_sha,
+                "folds_sha256": folds_sha,
+                "cache_sha256": cache_sha,
+            }
+        )
     ).hexdigest()
     return PhaseBRunFingerprint(
         value=value,
@@ -1068,6 +1099,591 @@ def _phase_b_fingerprint(
         folds_sha256=folds_sha,
         cache_sha256=cache_sha,
     )
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value.resolve())
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _temporary_sibling(path: Path) -> Path:
+    return path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
+
+
+def _atomic_write_bytes(path: str | Path, content: bytes) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_sibling(destination)
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
+
+
+def _atomic_write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
+    return _atomic_write_bytes(
+        Path(path),
+        json.dumps(
+            _jsonable(payload), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
+        ).encode("utf-8"),
+    )
+
+
+def _atomic_write_frame(path: str | Path, frame: pd.DataFrame) -> Path:
+    return _atomic_write_bytes(Path(path), frame.to_csv(index=False).encode("utf-8"))
+
+
+def _atomic_torch_save(path: str | Path, payload: Mapping[str, Any]) -> Path:
+    buffer = io.BytesIO()
+    torch.save(dict(payload), buffer)
+    return _atomic_write_bytes(Path(path), buffer.getvalue())
+
+
+def _atomic_save_npz(path: str | Path, **arrays: np.ndarray) -> Path:
+    buffer = io.BytesIO()
+    np.savez_compressed(buffer, **arrays)
+    return _atomic_write_bytes(Path(path), buffer.getvalue())
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _phase_b_artifact_paths(fold_dir: Path) -> dict[str, Path]:
+    relatives = [
+        *(f"mean/checkpoints/{model}.pt" for model in MEAN_MODELS),
+        *(f"mean/history/{model}.csv" for model in MEAN_MODELS),
+        *(f"scale/checkpoints/{model}.pt" for model in SCALE_MODELS),
+        *(f"scale/history/{model}.csv" for model in SCALE_MODELS),
+        "scalers/process.npz",
+        "scalers/spectrum.npz",
+        "scalers/quality.npz",
+        "calibration/inner_folds.csv",
+        "calibration/oof_predictions.csv",
+        "calibration/group_scores.csv",
+        "calibration/quantiles.json",
+        "predictions.csv",
+        "state.json",
+    ]
+    return {relative: fold_dir / relative for relative in relatives}
+
+
+def _phase_b_state_payload(
+    fingerprint: str,
+    fold: int,
+    seed: int,
+    completed_stages: Sequence[str],
+    *,
+    status: str = "in_progress",
+) -> dict[str, Any]:
+    return {
+        "protocol": PHASE_B_PROTOCOL,
+        "fingerprint": fingerprint,
+        "fold": int(fold),
+        "seed": int(seed),
+        "models": list(PHASE_B_MODELS),
+        "completed_stages": list(completed_stages),
+        "status": status,
+    }
+
+
+def _write_phase_b_state(
+    fold_dir: Path,
+    fingerprint: str,
+    fold: int,
+    seed: int,
+    completed_stages: Sequence[str],
+) -> Path:
+    status = "complete" if tuple(completed_stages) == PHASE_B_STATE_ORDER else "in_progress"
+    return _atomic_write_json(
+        fold_dir / "state.json",
+        _phase_b_state_payload(
+            fingerprint, fold, seed, completed_stages, status=status
+        ),
+    )
+
+
+def _phase_b_identity_matches(
+    payload: Any,
+    fingerprint: str,
+    fold: int,
+    seed: int,
+    *,
+    complete: bool,
+) -> bool:
+    stages = list(PHASE_B_STATE_ORDER if complete else PHASE_B_STATE_ORDER[:-1])
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("protocol") == PHASE_B_PROTOCOL
+        and payload.get("fingerprint") == fingerprint
+        and isinstance(payload.get("fold"), int)
+        and not isinstance(payload.get("fold"), bool)
+        and payload.get("fold") == fold
+        and isinstance(payload.get("seed"), int)
+        and not isinstance(payload.get("seed"), bool)
+        and payload.get("seed") == seed
+        and payload.get("models") == list(PHASE_B_MODELS)
+        and payload.get("completed_stages") == stages
+        and payload.get("status") == ("complete" if complete else "in_progress")
+    )
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    return payload
+
+
+def _validate_phase_b_checkpoint(
+    path: Path,
+    *,
+    model: str,
+    fingerprint: str,
+    fold: int,
+    seed: int,
+) -> dict[str, Any]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        raise ValueError(f"Phase B checkpoint {model} cannot be loaded") from error
+    best_epochs = payload.get("best_epochs") if isinstance(payload, dict) else None
+    refit_epoch = payload.get("refit_epoch") if isinstance(payload, dict) else None
+    mean_hash = payload.get("mean_state_sha256") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("protocol") != PHASE_B_PROTOCOL
+        or payload.get("fingerprint") != fingerprint
+        or payload.get("fold") != fold
+        or isinstance(payload.get("fold"), bool)
+        or payload.get("seed") != seed
+        or isinstance(payload.get("seed"), bool)
+        or payload.get("model") != model
+        or not isinstance(best_epochs, list)
+        or len(best_epochs) != 4
+        or any(type(epoch) is not int or epoch < 1 for epoch in best_epochs)
+        or type(refit_epoch) is not int
+        or refit_epoch != median_best_epoch(best_epochs)
+        or not isinstance(mean_hash, str)
+        or len(mean_hash) != 64
+        or any(character not in "0123456789abcdef" for character in mean_hash)
+    ):
+        raise ValueError(f"Phase B checkpoint {model} metadata is incompatible")
+    model_state = payload.get("model_state")
+    if not isinstance(model_state, dict) or not model_state:
+        raise ValueError(f"Phase B checkpoint {model} model state is missing")
+    if any(
+        not isinstance(value, Tensor) or not bool(torch.isfinite(value).all())
+        for value in model_state.values()
+    ):
+        raise ValueError(f"Phase B checkpoint {model} model state is invalid")
+    return payload
+
+
+def _validate_phase_b_history(
+    path: Path, *, model: str, checkpoint: Mapping[str, Any]
+) -> None:
+    try:
+        history = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except Exception as error:
+        raise ValueError(f"Phase B history {model} cannot be loaded") from error
+    metadata_columns = {
+        "epoch",
+        "protocol",
+        "fingerprint",
+        "fold",
+        "seed",
+        "model",
+        "best_epochs",
+        "refit_epoch",
+        "mean_state_sha256",
+    }
+    if history.empty or not metadata_columns.issubset(history.columns):
+        raise ValueError(f"Phase B history {model} schema is incompatible")
+    try:
+        epochs = pd.to_numeric(history["epoch"], errors="raise").to_numpy(dtype=np.float64)
+        folds = pd.to_numeric(history["fold"], errors="raise").to_numpy(dtype=np.float64)
+        seeds = pd.to_numeric(history["seed"], errors="raise").to_numpy(dtype=np.float64)
+        refits = pd.to_numeric(history["refit_epoch"], errors="raise").to_numpy(
+            dtype=np.float64
+        )
+        parsed_best = [json.loads(value) for value in history["best_epochs"]]
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"Phase B history {model} values are incompatible") from error
+    if (
+        not np.isfinite(np.concatenate((epochs, folds, seeds, refits))).all()
+        or np.any(epochs < 1)
+        or np.any(epochs != np.floor(epochs))
+        or set(history["protocol"]) != {PHASE_B_PROTOCOL}
+        or set(history["fingerprint"]) != {str(checkpoint["fingerprint"])}
+        or set(folds) != {float(checkpoint["fold"])}
+        or set(seeds) != {float(checkpoint["seed"])}
+        or set(history["model"]) != {model}
+        or any(value != checkpoint["best_epochs"] for value in parsed_best)
+        or set(refits) != {float(checkpoint["refit_epoch"])}
+        or set(history["mean_state_sha256"]) != {str(checkpoint["mean_state_sha256"])}
+    ):
+        raise ValueError(f"Phase B history {model} metadata is incompatible")
+    for column in history.columns:
+        if column in metadata_columns or column in {"phase"}:
+            continue
+        try:
+            values = pd.to_numeric(history[column], errors="raise").to_numpy(dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Phase B history {model} numeric values are invalid") from error
+        if not np.isfinite(values).all():
+            raise ValueError(f"Phase B history {model} numeric values are invalid")
+
+
+def _validate_phase_b_scaler(
+    path: Path,
+    *,
+    name: str,
+    fingerprint: str,
+    fold: int,
+    seed: int,
+) -> None:
+    expected_shapes = {"process": (9,), "spectrum": (3, 361), "quality": (7,)}
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if set(archive.files) != {"mean", "scale", "metadata_json"}:
+                raise ValueError("schema")
+            mean = archive["mean"]
+            scale = archive["scale"]
+            metadata_value = archive["metadata_json"]
+    except Exception as error:
+        raise ValueError(f"Phase B scaler {name} cannot be loaded") from error
+    try:
+        metadata = json.loads(str(metadata_value.item()))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"Phase B scaler {name} metadata is invalid") from error
+    if (
+        mean.shape != expected_shapes[name]
+        or scale.shape != expected_shapes[name]
+        or not np.isfinite(mean).all()
+        or not np.isfinite(scale).all()
+        or np.any(scale <= 0.0)
+        or metadata
+        != {
+            "protocol": PHASE_B_PROTOCOL,
+            "fingerprint": fingerprint,
+            "fold": fold,
+            "seed": seed,
+            "scaler": name,
+        }
+    ):
+        raise ValueError(f"Phase B scaler {name} is incompatible")
+
+
+def _read_phase_b_probability_predictions(path: Path) -> pd.DataFrame:
+    frame = pd.read_csv(
+        path,
+        dtype={
+            "sample_id": str,
+            "group_id": str,
+            "version": str,
+            "scale_model": str,
+        },
+    )
+    if tuple(frame.columns) != PHASE_B_PREDICTION_COLUMNS or frame.empty:
+        raise ValueError("Phase B persisted predictions schema is incompatible")
+    numeric = frame.select_dtypes(include=[np.number]).to_numpy(dtype=np.float64)
+    if (
+        not np.isfinite(numeric).all()
+        or frame.duplicated(["sample_id", "seed", "scale_model"]).any()
+        or set(frame["scale_model"]) != set(SCALE_MODELS)
+        or (frame["sigma"] <= 0.0).any()
+    ):
+        raise ValueError("Phase B persisted predictions values are incompatible")
+    for suffix in ("90", "95"):
+        if (
+            frame[f"raw_lower_{suffix}"] > frame[f"raw_upper_{suffix}"]
+        ).any() or (
+            frame[f"conformal_lower_{suffix}"] > frame[f"conformal_upper_{suffix}"]
+        ).any():
+            raise ValueError("Phase B persisted prediction bounds are incompatible")
+    return frame
+
+
+def _phase_b_mean_frame_from_checkpoint(payload: Mapping[str, Any]) -> pd.DataFrame:
+    raw = payload.get("mean_predictions")
+    if not isinstance(raw, dict) or set(raw) != set(PHASE_B_MEAN_COLUMNS):
+        raise ValueError("Phase B G1 checkpoint mean predictions are missing")
+    frame = pd.DataFrame(raw, columns=PHASE_B_MEAN_COLUMNS)
+    if frame.empty or frame.duplicated(["sample_id", "seed", "model"]).any():
+        raise ValueError("Phase B persisted mean predictions are incompatible")
+    if set(frame["model"]) != set(MEAN_MODELS):
+        raise ValueError("Phase B persisted mean model coverage is incompatible")
+    numeric = frame.select_dtypes(include=[np.number]).to_numpy(dtype=np.float64)
+    if not np.isfinite(numeric).all():
+        raise ValueError("Phase B persisted mean predictions must be finite")
+    return frame
+
+
+def _validate_phase_b_calibration(
+    fold_dir: Path, *, fingerprint: str, fold: int, seed: int
+) -> None:
+    calibration_dir = fold_dir / "calibration"
+    definitions = pd.read_csv(calibration_dir / "inner_folds.csv")
+    definition_columns = {
+        "record_type",
+        "fold",
+        "seed",
+        "predictor_fold",
+        "scale_model",
+        "train_sample_ids",
+        "validation_sample_ids",
+        "train_group_ids",
+        "validation_group_ids",
+    }
+    if (
+        definitions.empty
+        or not definition_columns.issubset(definitions.columns)
+        or set(pd.to_numeric(definitions["fold"], errors="raise")) != {fold}
+        or set(pd.to_numeric(definitions["seed"], errors="raise")) != {seed}
+        or set(definitions["record_type"].dropna().astype(str))
+        != {"predictor", "scale_selection"}
+        or set(definitions["scale_model"].dropna().astype(str)) != set(SCALE_MODELS)
+    ):
+        raise ValueError("Phase B inner-fold definitions are incompatible")
+    for column in (
+        "train_sample_ids",
+        "validation_sample_ids",
+        "train_group_ids",
+        "validation_group_ids",
+    ):
+        try:
+            parsed = [json.loads(str(value)) for value in definitions[column]]
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("Phase B inner-fold definition IDs are invalid") from error
+        if any(not isinstance(value, list) for value in parsed):
+            raise ValueError("Phase B inner-fold definition IDs are invalid")
+
+    oof = pd.read_csv(
+        calibration_dir / "oof_predictions.csv",
+        dtype={"sample_id": str, "group_id": str, "scale_model": str},
+    )
+    expected_oof_columns = (
+        "sample_id",
+        "group_id",
+        "fold",
+        "seed",
+        "inner_fold",
+        "scale_model",
+        "target_mean",
+        "ra_1",
+        "ra_2",
+        "ra_3",
+        "mu",
+        "sigma",
+    )
+    if (
+        tuple(oof.columns) != expected_oof_columns
+        or oof.empty
+        or set(oof["fold"]) != {fold}
+        or set(oof["seed"]) != {seed}
+        or set(oof["scale_model"]) != set(SCALE_MODELS)
+        or oof.duplicated(["sample_id", "scale_model"]).any()
+        or not np.isfinite(
+            oof.select_dtypes(include=[np.number]).to_numpy(dtype=np.float64)
+        ).all()
+        or (oof["sigma"] <= 0.0).any()
+    ):
+        raise ValueError("Phase B calibration OOF predictions are incompatible")
+    sample_sets = {
+        model: set(oof.loc[oof["scale_model"] == model, "sample_id"])
+        for model in SCALE_MODELS
+    }
+    if sample_sets[SCALE_MODELS[0]] != sample_sets[SCALE_MODELS[1]]:
+        raise ValueError("Phase B calibration model sample coverage is incompatible")
+
+    scores = pd.read_csv(
+        calibration_dir / "group_scores.csv",
+        dtype={"group_id": str, "scale_model": str},
+    )
+    if (
+        tuple(scores.columns) != CALIBRATION_SCORE_COLUMNS
+        or scores.empty
+        or set(scores["outer_fold"]) != {fold}
+        or set(scores["seed"]) != {seed}
+        or set(scores["scale_model"]) != set(SCALE_MODELS)
+        or scores.duplicated(["group_id", "scale_model"]).any()
+        or not np.isfinite(
+            scores.select_dtypes(include=[np.number]).to_numpy(dtype=np.float64)
+        ).all()
+        or (scores["score"] < 0.0).any()
+        or (scores["reading_count"] != 3 * scores["region_count"]).any()
+    ):
+        raise ValueError("Phase B calibration group scores are incompatible")
+
+    quantiles = _load_json_object(calibration_dir / "quantiles.json")
+    if (
+        quantiles.get("protocol") != PHASE_B_PROTOCOL
+        or quantiles.get("fingerprint") != fingerprint
+        or quantiles.get("fold") != fold
+        or quantiles.get("seed") != seed
+        or quantiles.get("models") != list(SCALE_MODELS)
+        or quantiles.get("alphas") != list(PHASE_B_ALPHAS)
+        or not isinstance(quantiles.get("quantiles"), dict)
+        or set(quantiles["quantiles"]) != set(SCALE_MODELS)
+    ):
+        raise ValueError("Phase B calibration quantiles metadata is incompatible")
+    expected_alpha_keys = {f"{alpha:.2f}" for alpha in PHASE_B_ALPHAS}
+    for model in SCALE_MODELS:
+        model_quantiles = quantiles["quantiles"][model]
+        if not isinstance(model_quantiles, dict) or set(model_quantiles) != expected_alpha_keys:
+            raise ValueError("Phase B calibration quantile coverage is incompatible")
+        group_count = len(scores.loc[scores["scale_model"] == model])
+        for alpha_key, raw in model_quantiles.items():
+            alpha = float(alpha_key)
+            if (
+                not isinstance(raw, dict)
+                or raw.get("alpha") != alpha
+                or raw.get("group_count") != group_count
+                or type(raw.get("order_index")) is not int
+                or not 1 <= raw["order_index"] <= group_count
+                or isinstance(raw.get("quantile"), bool)
+                or not isinstance(raw.get("quantile"), (int, float))
+                or not math.isfinite(float(raw["quantile"]))
+                or float(raw["quantile"]) < 0.0
+            ):
+                raise ValueError("Phase B calibration quantile values are incompatible")
+
+
+def _validate_completed_phase_b_artifacts(
+    fold_dir: Path,
+    marker: Mapping[str, Any],
+    fingerprint: str,
+    fold: int,
+    seed: int,
+    *,
+    marker_published: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not _phase_b_identity_matches(marker, fingerprint, fold, seed, complete=True):
+        raise ValueError("Phase B completion identity is incompatible")
+    expected = _phase_b_artifact_paths(fold_dir)
+    hashes = marker.get("artifacts")
+    if not isinstance(hashes, dict) or set(hashes) != set(expected):
+        raise ValueError("Phase B completion artifact set is incompatible")
+    actual_files = {
+        path.relative_to(fold_dir).as_posix()
+        for path in fold_dir.rglob("*")
+        if path.is_file()
+    }
+    expected_files = set(expected)
+    if marker_published:
+        expected_files.add("complete.json")
+    if actual_files != expected_files:
+        raise ValueError("Phase B completion directory tree is incompatible")
+    for relative, path in expected.items():
+        if not path.is_file() or hashes.get(relative) != _sha256_file(path):
+            raise ValueError(f"Phase B completion artifact hash mismatch: {relative}")
+
+    state = _load_json_object(fold_dir / "state.json")
+    if not _phase_b_identity_matches(state, fingerprint, fold, seed, complete=True):
+        raise ValueError("Phase B completed state is incompatible")
+
+    checkpoints: dict[str, dict[str, Any]] = {}
+    for model in PHASE_B_MODELS:
+        family = "mean" if model in MEAN_MODELS else "scale"
+        checkpoint = _validate_phase_b_checkpoint(
+            fold_dir / family / "checkpoints" / f"{model}.pt",
+            model=model,
+            fingerprint=fingerprint,
+            fold=fold,
+            seed=seed,
+        )
+        checkpoints[model] = checkpoint
+        _validate_phase_b_history(
+            fold_dir / family / "history" / f"{model}.csv",
+            model=model,
+            checkpoint=checkpoint,
+        )
+    mean_hash = _state_sha256(checkpoints["G1"]["model_state"])
+    if any(checkpoint["mean_state_sha256"] != mean_hash for checkpoint in checkpoints.values()):
+        raise ValueError("Phase B checkpoint mean-state binding is incompatible")
+
+    for scaler in ("process", "spectrum", "quality"):
+        _validate_phase_b_scaler(
+            fold_dir / "scalers" / f"{scaler}.npz",
+            name=scaler,
+            fingerprint=fingerprint,
+            fold=fold,
+            seed=seed,
+        )
+    _validate_phase_b_calibration(
+        fold_dir, fingerprint=fingerprint, fold=fold, seed=seed
+    )
+    predictions = _read_phase_b_probability_predictions(fold_dir / "predictions.csv")
+    mean_predictions = _phase_b_mean_frame_from_checkpoint(checkpoints["G1"])
+    if (
+        (
+            "probability_rows" in marker
+            and (
+                type(marker.get("probability_rows")) is not int
+                or marker.get("probability_rows") != len(predictions)
+            )
+        )
+        or (
+            "mean_rows" in marker
+            and (
+                type(marker.get("mean_rows")) is not int
+                or marker.get("mean_rows") != len(mean_predictions)
+            )
+        )
+        or set(predictions["fold"]) != {fold}
+        or set(predictions["seed"]) != {seed}
+        or set(mean_predictions["fold"]) != {fold}
+        or set(mean_predictions["seed"]) != {seed}
+        or set(predictions["sample_id"]) != set(mean_predictions["sample_id"])
+        or len(predictions) * len(MEAN_MODELS)
+        != len(mean_predictions) * len(SCALE_MODELS)
+    ):
+        raise ValueError("Phase B persisted outer prediction coverage is incompatible")
+    return predictions, mean_predictions
+
+
+def completed_phase_b_fold_matches(
+    marker: str | Path,
+    fingerprint: str | PhaseBRunFingerprint,
+    *,
+    fold: int,
+    seed: int,
+) -> bool:
+    """Return true only for an exact, deeply valid completed Phase B unit."""
+    if type(fold) is not int or type(seed) is not int:
+        return False
+    expected_fingerprint = (
+        fingerprint.value if isinstance(fingerprint, PhaseBRunFingerprint) else str(fingerprint)
+    )
+    marker_path = Path(marker)
+    try:
+        payload = _load_json_object(marker_path)
+        _validate_completed_phase_b_artifacts(
+            marker_path.parent,
+            payload,
+            expected_fingerprint,
+            fold,
+            seed,
+            marker_published=True,
+        )
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+    return True
 
 
 def _validate_fold_predictions(
@@ -1102,6 +1718,330 @@ def _validate_fold_predictions(
             raise ValueError("Phase B intervals must have ordered bounds")
 
 
+def _checkpoint_metadata(
+    *,
+    fingerprint: str,
+    fold: int,
+    seed: int,
+    model: str,
+    best_epochs: Sequence[int],
+    refit_epoch: int,
+    mean_state_sha256: str,
+) -> dict[str, Any]:
+    epochs = list(map(int, best_epochs))
+    if len(epochs) != 4 or any(epoch < 1 for epoch in epochs):
+        raise ValueError(f"Phase B {model} requires four positive best epochs")
+    if int(refit_epoch) != median_best_epoch(epochs):
+        raise ValueError(f"Phase B {model} refit epoch is incompatible")
+    return {
+        "protocol": PHASE_B_PROTOCOL,
+        "fingerprint": fingerprint,
+        "fold": int(fold),
+        "seed": int(seed),
+        "model": model,
+        "best_epochs": epochs,
+        "refit_epoch": int(refit_epoch),
+        "mean_state_sha256": mean_state_sha256,
+    }
+
+
+def _history_with_metadata(
+    history: pd.DataFrame, metadata: Mapping[str, Any]
+) -> pd.DataFrame:
+    if not isinstance(history, pd.DataFrame) or history.empty or "epoch" not in history:
+        raise ValueError(f"Phase B {metadata['model']} history must be non-empty")
+    persisted = history.reset_index(drop=True).copy()
+    persisted["protocol"] = metadata["protocol"]
+    persisted["fingerprint"] = metadata["fingerprint"]
+    persisted["fold"] = metadata["fold"]
+    persisted["seed"] = metadata["seed"]
+    persisted["model"] = metadata["model"]
+    persisted["best_epochs"] = json.dumps(
+        metadata["best_epochs"], separators=(",", ":")
+    )
+    persisted["refit_epoch"] = metadata["refit_epoch"]
+    persisted["mean_state_sha256"] = metadata["mean_state_sha256"]
+    return persisted
+
+
+def _serialize_inner_fold_definitions(frame: pd.DataFrame) -> pd.DataFrame:
+    persisted = frame.reset_index(drop=True).copy()
+    for column in persisted.columns:
+        if column.endswith("_ids"):
+            persisted[column] = persisted[column].map(
+                lambda value: json.dumps(list(value), ensure_ascii=False, separators=(",", ":"))
+            )
+    return persisted
+
+
+def _mean_model_state(
+    full_state: Mapping[str, Tensor], model: str
+) -> dict[str, Tensor]:
+    prefix = {"P1": "process_expert.", "R1": "residual_expert."}.get(model)
+    if prefix is None:
+        selected = dict(full_state)
+    else:
+        selected = {
+            name[len(prefix) :]: value for name, value in full_state.items() if name.startswith(prefix)
+        }
+        if not selected:
+            selected = dict(full_state)
+    return {name: value.detach().cpu().clone() for name, value in selected.items()}
+
+
+def _publish_phase_b_fold(
+    *,
+    fold_dir: Path,
+    fingerprint: PhaseBRunFingerprint,
+    fold: int,
+    seed: int,
+    mean_path: MeanPathArtifacts,
+    scale_models: Mapping[str, nn.Module],
+    scale_histories: Mapping[str, pd.DataFrame],
+    calibration: Mapping[str, CalibrationArtifacts],
+    predictions: pd.DataFrame,
+    mean_predictions: pd.DataFrame,
+) -> None:
+    if set(scale_models) != set(SCALE_MODELS) or set(scale_histories) != set(SCALE_MODELS):
+        raise ValueError("Phase B final scale model set is incompatible")
+    if set(calibration) != set(SCALE_MODELS):
+        raise ValueError("Phase B calibration model set is incompatible")
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    full_mean_state = {
+        name: value.detach().cpu().clone()
+        for name, value in mean_path.model.state_dict().items()
+    }
+    if not full_mean_state:
+        raise ValueError("Phase B final mean model state is empty")
+    mean_hash = _state_sha256(full_mean_state)
+
+    for model in MEAN_MODELS:
+        best_epochs = tuple(map(int, mean_path.best_epochs[model]))
+        refit_epoch = median_best_epoch(best_epochs)
+        metadata = _checkpoint_metadata(
+            fingerprint=fingerprint.value,
+            fold=fold,
+            seed=seed,
+            model=model,
+            best_epochs=best_epochs,
+            refit_epoch=refit_epoch,
+            mean_state_sha256=mean_hash,
+        )
+        checkpoint = {
+            **metadata,
+            "model_state": _mean_model_state(full_mean_state, model),
+        }
+        if model == "G1":
+            checkpoint["mean_predictions"] = mean_predictions.to_dict(orient="list")
+        _atomic_torch_save(
+            fold_dir / "mean" / "checkpoints" / f"{model}.pt", checkpoint
+        )
+        _atomic_write_frame(
+            fold_dir / "mean" / "history" / f"{model}.csv",
+            _history_with_metadata(mean_path.histories[model], metadata),
+        )
+
+    scaler_metadata = {
+        "protocol": PHASE_B_PROTOCOL,
+        "fingerprint": fingerprint.value,
+        "fold": fold,
+        "seed": seed,
+    }
+    for name, scaler in (
+        ("process", mean_path.process_scaler),
+        ("spectrum", mean_path.spectrum_scaler),
+        ("quality", mean_path.quality_scaler),
+    ):
+        metadata_json = json.dumps(
+            {**scaler_metadata, "scaler": name},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        _atomic_save_npz(
+            fold_dir / "scalers" / f"{name}.npz",
+            mean=np.asarray(scaler.mean),
+            scale=np.asarray(scaler.scale),
+            metadata_json=np.asarray(metadata_json),
+        )
+    _write_phase_b_state(fold_dir, fingerprint.value, fold, seed, ("mean",))
+
+    for index, model in enumerate(SCALE_MODELS):
+        history = scale_histories[model]
+        if not isinstance(history, pd.DataFrame) or history.empty:
+            raise ValueError(f"Phase B {model} history must be non-empty")
+        refit_epoch = int(getattr(scale_models[model], "_phase_b_refit_epoch", 0))
+        if refit_epoch < 1:
+            refit_epoch = int(pd.to_numeric(history["epoch"], errors="raise").max())
+        best_epochs = tuple(
+            map(
+                int,
+                getattr(scale_models[model], "_phase_b_best_epochs", (refit_epoch,) * 4),
+            )
+        )
+        metadata = _checkpoint_metadata(
+            fingerprint=fingerprint.value,
+            fold=fold,
+            seed=seed,
+            model=model,
+            best_epochs=best_epochs,
+            refit_epoch=refit_epoch,
+            mean_state_sha256=mean_hash,
+        )
+        _atomic_torch_save(
+            fold_dir / "scale" / "checkpoints" / f"{model}.pt",
+            {
+                **metadata,
+                "model_state": {
+                    name: value.detach().cpu().clone()
+                    for name, value in scale_models[model].state_dict().items()
+                },
+            },
+        )
+        _atomic_write_frame(
+            fold_dir / "scale" / "history" / f"{model}.csv",
+            _history_with_metadata(history, metadata),
+        )
+        _write_phase_b_state(
+            fold_dir,
+            fingerprint.value,
+            fold,
+            seed,
+            PHASE_B_STATE_ORDER[: 2 + index],
+        )
+
+    definitions = calibration[SCALE_MODELS[0]].inner_fold_definitions
+    for model in SCALE_MODELS[1:]:
+        if not definitions.equals(calibration[model].inner_fold_definitions):
+            raise ValueError("Phase B calibration inner-fold definitions disagree")
+    oof_predictions = pd.concat(
+        [calibration[model].predictions for model in SCALE_MODELS], ignore_index=True
+    )
+    group_scores = pd.concat(
+        [calibration[model].group_scores for model in SCALE_MODELS], ignore_index=True
+    )
+    quantiles_payload = {
+        "protocol": PHASE_B_PROTOCOL,
+        "fingerprint": fingerprint.value,
+        "fold": fold,
+        "seed": seed,
+        "models": list(SCALE_MODELS),
+        "alphas": list(PHASE_B_ALPHAS),
+        "quantiles": {
+            model: {
+                f"{alpha:.2f}": asdict(calibration[model].quantiles[alpha])
+                for alpha in PHASE_B_ALPHAS
+            }
+            for model in SCALE_MODELS
+        },
+    }
+    _atomic_write_frame(
+        fold_dir / "calibration" / "inner_folds.csv",
+        _serialize_inner_fold_definitions(definitions),
+    )
+    _atomic_write_frame(
+        fold_dir / "calibration" / "oof_predictions.csv", oof_predictions
+    )
+    _atomic_write_frame(
+        fold_dir / "calibration" / "group_scores.csv", group_scores
+    )
+    _atomic_write_json(fold_dir / "calibration" / "quantiles.json", quantiles_payload)
+    _write_phase_b_state(
+        fold_dir, fingerprint.value, fold, seed, PHASE_B_STATE_ORDER[:4]
+    )
+
+    _atomic_write_frame(fold_dir / "predictions.csv", predictions)
+    _write_phase_b_state(
+        fold_dir, fingerprint.value, fold, seed, PHASE_B_STATE_ORDER[:5]
+    )
+    _write_phase_b_state(
+        fold_dir, fingerprint.value, fold, seed, PHASE_B_STATE_ORDER
+    )
+    marker = _phase_b_state_payload(
+        fingerprint.value,
+        fold,
+        seed,
+        PHASE_B_STATE_ORDER,
+        status="complete",
+    )
+    marker["artifacts"] = {
+        relative: _sha256_file(path)
+        for relative, path in _phase_b_artifact_paths(fold_dir).items()
+    }
+    marker["probability_rows"] = len(predictions)
+    marker["mean_rows"] = len(mean_predictions)
+    _validate_completed_phase_b_artifacts(
+        fold_dir,
+        marker,
+        fingerprint.value,
+        fold,
+        seed,
+        marker_published=False,
+    )
+    _atomic_write_json(fold_dir / "complete.json", marker)
+
+
+def _load_phase_b_calibration(fold_dir: Path) -> dict[str, CalibrationArtifacts]:
+    calibration_dir = fold_dir / "calibration"
+    definitions = pd.read_csv(calibration_dir / "inner_folds.csv")
+    for column in definitions.columns:
+        if column.endswith("_ids"):
+            definitions[column] = definitions[column].map(
+                lambda value: tuple(json.loads(str(value)))
+            )
+    oof = pd.read_csv(
+        calibration_dir / "oof_predictions.csv",
+        dtype={"sample_id": str, "group_id": str, "scale_model": str},
+    )
+    scores = pd.read_csv(
+        calibration_dir / "group_scores.csv",
+        dtype={"group_id": str, "scale_model": str},
+    )
+    raw_quantiles = _load_json_object(calibration_dir / "quantiles.json")["quantiles"]
+    return {
+        model: CalibrationArtifacts(
+            predictions=oof.loc[oof["scale_model"] == model].reset_index(drop=True),
+            group_scores=scores.loc[scores["scale_model"] == model].reset_index(drop=True),
+            quantiles={
+                float(alpha): GroupConformalResult(**payload)
+                for alpha, payload in raw_quantiles[model].items()
+            },
+            inner_fold_definitions=definitions.copy(),
+        )
+        for model in SCALE_MODELS
+    }
+
+
+def _load_completed_phase_b_fold(
+    fold_dir: Path,
+    fingerprint: PhaseBRunFingerprint,
+    fold: int,
+    seed: int,
+) -> PhaseBFoldArtifacts:
+    marker = _load_json_object(fold_dir / "complete.json")
+    predictions, mean_predictions = _validate_completed_phase_b_artifacts(
+        fold_dir,
+        marker,
+        fingerprint.value,
+        fold,
+        seed,
+        marker_published=True,
+    )
+    predictions.attrs["mean_predictions"] = mean_predictions
+    return PhaseBFoldArtifacts(
+        predictions=predictions,
+        calibration=_load_phase_b_calibration(fold_dir),
+        checkpoint_paths={
+            model: fold_dir / "scale" / "checkpoints" / f"{model}.pt"
+            for model in SCALE_MODELS
+        },
+        history_paths={
+            model: fold_dir / "scale" / "history" / f"{model}.csv"
+            for model in SCALE_MODELS
+        },
+        fingerprint=fingerprint,
+    )
+
+
 def run_phase_b_fold(
     config: PhaseBConfig,
     handoff: PhaseAHandoff,
@@ -1133,10 +2073,27 @@ def run_phase_b_fold(
         raise ValueError("fold must be an integer")
     if type(seed) is not int or seed not in tuple(config.seeds):
         raise ValueError("seed must be a registered Phase B seed")
+    if tuple(config.seeds) != PHASE_B_SEEDS:
+        raise ValueError("Phase B seeds must match the exact registered sequence")
+    if tuple(map(float, config.alphas)) != PHASE_B_ALPHAS:
+        raise ValueError("Phase B alphas must match the exact registered sequence")
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
     selected_device: str | torch.device = "cpu" if device is None else device
     root = validate_phase_b_output_root(config.output_dir, output_root=output_root)
+    fingerprint = _phase_b_fingerprint(
+        config, handoff, bundle, cache, fold=fold, seed=seed
+    )
+    fold_dir = root / "folds" / f"fold_{fold}" / f"seed_{seed}"
+    marker_path = fold_dir / "complete.json"
+    if marker_path.exists():
+        if not completed_phase_b_fold_matches(
+            marker_path, fingerprint, fold=fold, seed=seed
+        ):
+            raise ValueError("incompatible completed Phase B fold")
+        return _load_completed_phase_b_fold(fold_dir, fingerprint, fold, seed)
+    if fold_dir.exists() and any(fold_dir.iterdir()):
+        raise ValueError("incompatible partial Phase B fold artifacts")
 
     outer_train_index, outer_test_index = outer_indices(bundle, fold)
     outer_train = bundle.manifest.iloc[outer_train_index].reset_index(drop=True).copy()
@@ -1220,17 +2177,26 @@ def run_phase_b_fold(
     mean_predictions = mean_predictions.loc[:, PHASE_B_MEAN_COLUMNS]
     predictions.attrs["mean_predictions"] = mean_predictions
 
-    fingerprint = _phase_b_fingerprint(config, handoff, bundle, cache)
-    fold_dir = root / "folds" / f"fold_{fold}" / f"seed_{seed}"
+    _publish_phase_b_fold(
+        fold_dir=fold_dir,
+        fingerprint=fingerprint,
+        fold=fold,
+        seed=seed,
+        mean_path=final_mean,
+        scale_models=final_scales,
+        scale_histories=scale_histories,
+        calibration=calibration,
+        predictions=predictions,
+        mean_predictions=mean_predictions,
+    )
     checkpoint_paths = {
-        name: fold_dir / "checkpoints" / f"{name}.pt" for name in SCALE_MODELS
+        name: fold_dir / "scale" / "checkpoints" / f"{name}.pt"
+        for name in SCALE_MODELS
     }
     history_paths = {
-        name: fold_dir / "history" / f"{name}.csv" for name in SCALE_MODELS
+        name: fold_dir / "scale" / "history" / f"{name}.csv"
+        for name in SCALE_MODELS
     }
-    # The histories remain deliberately in-memory for Task 6; retain them in
-    # local scope to make the no-write contract explicit until Task 7 persists.
-    del scale_histories
     return PhaseBFoldArtifacts(
         predictions=predictions,
         calibration=calibration,
@@ -1240,16 +2206,149 @@ def run_phase_b_fold(
     )
 
 
-def run_phase_b(*args: Any, **kwargs: Any) -> PhaseBRunArtifacts:
-    """Reserved for Task 7's all-fold/all-seed orchestration implementation."""
-    del args, kwargs
-    raise NotImplementedError("run_phase_b is implemented in Task 7")
+def _validate_phase_b_oof_cartesian(
+    probability: pd.DataFrame,
+    mean: pd.DataFrame,
+    bundle: DataBundle,
+) -> None:
+    if tuple(probability.columns) != PHASE_B_PREDICTION_COLUMNS:
+        raise ValueError("combined Phase B probability columns are incompatible")
+    if tuple(mean.columns) != PHASE_B_MEAN_COLUMNS:
+        raise ValueError("combined Phase B mean columns are incompatible")
+    if len(bundle.manifest) != 586 or len(probability) != 3516 or len(mean) != 5274:
+        raise ValueError("combined Phase B OOF row counts are incompatible")
+    if (
+        probability.duplicated(["sample_id", "seed", "scale_model"]).any()
+        or mean.duplicated(["sample_id", "seed", "model"]).any()
+        or set(probability["seed"]) != set(PHASE_B_SEEDS)
+        or set(mean["seed"]) != set(PHASE_B_SEEDS)
+        or set(probability["scale_model"]) != set(SCALE_MODELS)
+        or set(mean["model"]) != set(MEAN_MODELS)
+    ):
+        raise ValueError("combined Phase B OOF Cartesian keys are incompatible")
+    expected_ids = set(bundle.manifest["sample_id"].astype(str))
+    if set(probability["sample_id"].astype(str)) != expected_ids or set(
+        mean["sample_id"].astype(str)
+    ) != expected_ids:
+        raise ValueError("combined Phase B OOF sample coverage is incompatible")
+    for seed in PHASE_B_SEEDS:
+        for model in SCALE_MODELS:
+            rows = probability.loc[
+                (probability["seed"] == seed) & (probability["scale_model"] == model)
+            ]
+            if set(rows["sample_id"].astype(str)) != expected_ids or len(rows) != 586:
+                raise ValueError("combined Phase B probability Cartesian coverage is incomplete")
+        for model in MEAN_MODELS:
+            rows = mean.loc[(mean["seed"] == seed) & (mean["model"] == model)]
+            if set(rows["sample_id"].astype(str)) != expected_ids or len(rows) != 586:
+                raise ValueError("combined Phase B mean Cartesian coverage is incomplete")
+
+    fold_rows = bundle.folds.loc[:, ["sample_id", "fold"]].copy()
+    fold_rows["sample_id"] = fold_rows["sample_id"].astype(str)
+    if fold_rows["sample_id"].duplicated().any() or set(fold_rows["sample_id"]) != expected_ids:
+        raise ValueError("combined Phase B fold assignments are incompatible")
+    expected_fold = fold_rows.set_index("sample_id")["fold"].astype(int)
+    for frame in (probability, mean):
+        actual_fold = frame["sample_id"].astype(str).map(expected_fold)
+        if not np.array_equal(
+            pd.to_numeric(frame["fold"], errors="raise").to_numpy(dtype=np.int64),
+            actual_fold.to_numpy(dtype=np.int64),
+        ):
+            raise ValueError("combined Phase B row fold binding is incompatible")
+        numeric = frame.select_dtypes(include=[np.number]).to_numpy(dtype=np.float64)
+        if not np.isfinite(numeric).all():
+            raise ValueError("combined Phase B OOF numeric values must be finite")
+
+
+def run_phase_b(
+    config: PhaseBConfig,
+    handoff: PhaseAHandoff,
+    phase_a_config: SGRPNConfig,
+    bundle: DataBundle,
+    cache: OrderSpectrumCache,
+    *,
+    device: str | torch.device | None = None,
+    backend: TrainingBackend | None = None,
+    batch_size: int = 8,
+    output_root: str | Path | None = None,
+) -> PhaseBRunArtifacts:
+    """Run the fixed five-fold, three-seed Phase B protocol without selection."""
+    if not isinstance(config, PhaseBConfig) or not isinstance(handoff, PhaseAHandoff):
+        raise ValueError("run_phase_b requires Phase B configuration and Phase A handoff")
+    if not isinstance(phase_a_config, SGRPNConfig):
+        raise ValueError("run_phase_b requires a Phase A configuration")
+    if not isinstance(bundle, DataBundle) or not isinstance(cache, OrderSpectrumCache):
+        raise ValueError("run_phase_b requires a DataBundle and OrderSpectrumCache")
+    if tuple(config.seeds) != PHASE_B_SEEDS or tuple(map(float, config.alphas)) != PHASE_B_ALPHAS:
+        raise ValueError("run_phase_b requires the exact registered seeds and alphas")
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    root = validate_phase_b_output_root(config.output_dir, output_root=output_root)
+    fold_values = pd.to_numeric(bundle.folds["fold"], errors="raise")
+    if (
+        not np.equal(fold_values, np.floor(fold_values)).all()
+        or set(fold_values.astype(int)) != set(range(5))
+    ):
+        raise ValueError("run_phase_b requires exactly outer folds 0 through 4")
+
+    fold_artifacts: dict[tuple[int, int], PhaseBFoldArtifacts] = {}
+    fingerprints: dict[tuple[int, int], PhaseBRunFingerprint] = {}
+    for fold in range(5):
+        for seed in PHASE_B_SEEDS:
+            artifact = run_phase_b_fold(
+                config,
+                handoff,
+                phase_a_config,
+                bundle,
+                cache,
+                fold,
+                seed,
+                device=device,
+                backend=backend,
+                batch_size=batch_size,
+                output_root=root,
+            )
+            key = (fold, seed)
+            fold_artifacts[key] = artifact
+            fingerprints[key] = artifact.fingerprint
+
+    probability_blocks: list[pd.DataFrame] = []
+    for key in fold_artifacts:
+        block = fold_artifacts[key].predictions.copy()
+        block.attrs = {}
+        probability_blocks.append(block)
+    probability = pd.concat(probability_blocks, ignore_index=True)
+    mean = pd.concat(
+        [
+            fold_artifacts[key].predictions.attrs["mean_predictions"]
+            for key in fold_artifacts
+        ],
+        ignore_index=True,
+    )
+    probability = probability.loc[:, PHASE_B_PREDICTION_COLUMNS]
+    mean = mean.loc[:, PHASE_B_MEAN_COLUMNS]
+    _validate_phase_b_oof_cartesian(probability, mean, bundle)
+    prediction_dir = root / "predictions"
+    _atomic_write_frame(
+        prediction_dir / "oof_probability_predictions.csv", probability
+    )
+    _atomic_write_frame(prediction_dir / "oof_mean_predictions.csv", mean)
+    return PhaseBRunArtifacts(
+        probability_predictions=probability,
+        mean_predictions=mean,
+        fold_artifacts=fold_artifacts,
+        fingerprints=fingerprints,
+    )
 
 
 __all__ = [
     "CALIBRATION_SCORE_COLUMNS",
+    "MEAN_MODELS",
     "PHASE_B_MEAN_COLUMNS",
+    "PHASE_B_MODELS",
     "PHASE_B_PREDICTION_COLUMNS",
+    "PHASE_B_PROTOCOL",
+    "PHASE_B_STATE_ORDER",
     "SCALE_MODELS",
     "CalibrationArtifacts",
     "PhaseBFoldArtifacts",
@@ -1257,6 +2356,7 @@ __all__ = [
     "PhaseBRunFingerprint",
     "ScaleFit",
     "build_nested_calibration",
+    "completed_phase_b_fold_matches",
     "fit_scale_model",
     "run_phase_b",
     "run_phase_b_fold",
