@@ -47,7 +47,7 @@ from .probability import (
     group_conformal_scores,
     raw_gaussian_interval,
 )
-from .training import MeanPathArtifacts, fit_g1_mean_path
+from .training import MeanPathArtifacts, TrainingBackend, fit_g1_mean_path
 
 
 # The two registered Phase B scale variants.  Their order is also the persisted
@@ -56,23 +56,34 @@ SCALE_MODELS = ("heteroscedastic", "homoscedastic")
 
 CALIBRATION_SCORE_COLUMNS = (
     "group_id",
+    "outer_fold",
+    "inner_fold",
+    "seed",
+    "scale_model",
+    "score",
     "region_count",
     "reading_count",
-    "score",
 )
 
 PHASE_B_MEAN_COLUMNS = (
     "sample_id",
     "group_id",
+    "version",
     "fold",
     "seed",
     "model",
-    "mu",
+    "target_mean",
+    "prediction",
+    "sample_weight",
+    "process_mean",
+    "residual",
+    "gate",
 )
 
 PHASE_B_PREDICTION_COLUMNS = (
     "sample_id",
     "group_id",
+    "version",
     "fold",
     "seed",
     "scale_model",
@@ -80,14 +91,19 @@ PHASE_B_PREDICTION_COLUMNS = (
     "ra_1",
     "ra_2",
     "ra_3",
+    "sample_weight",
     "mu",
     "sigma",
+    "gate",
+    "correction",
     "raw_lower_90",
     "raw_upper_90",
     "raw_lower_95",
     "raw_upper_95",
+    "conformal_q_90",
     "conformal_lower_90",
     "conformal_upper_90",
+    "conformal_q_95",
     "conformal_lower_95",
     "conformal_upper_95",
 )
@@ -360,7 +376,99 @@ def fit_scale_model(
     )
 
 
-def build_nested_calibration(*args: Any, **kwargs: Any) -> Mapping[str, CalibrationArtifacts]:
+def _refit_scale_model_exact_epochs(
+    *,
+    mean_model: SelectiveGatedModel,
+    scale_model: nn.Module,
+    train_loader: Iterable[Mapping[str, Any]],
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    device: str | torch.device,
+    seed: int,
+) -> ScaleFit:
+    """Train a fresh scale head for the registered epoch count without selection."""
+    if not isinstance(mean_model, SelectiveGatedModel):
+        raise ValueError("mean_model must be a SelectiveGatedModel")
+    if not isinstance(scale_model, nn.Module):
+        raise ValueError("scale_model must be an nn.Module")
+    if type(epochs) is not int or epochs < 1:
+        raise ValueError("epochs must be a positive integer")
+    if not all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        for value in (learning_rate, weight_decay)
+    ) or float(learning_rate) <= 0.0 or float(weight_decay) < 0.0:
+        raise ValueError(
+            "learning_rate must be positive and weight_decay non-negative finite values"
+        )
+
+    selected_device = torch.device(device)
+    _set_scale_seed(seed)
+    mean_snapshot = _freeze_mean_state(mean_model)
+    mean_hash = _state_sha256(mean_snapshot)
+    mean_model.to(selected_device)
+    scale_model.to(selected_device)
+    parameters = [parameter for parameter in scale_model.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise ValueError("scale_model must expose trainable parameters")
+    optimizer = torch.optim.AdamW(
+        parameters, lr=float(learning_rate), weight_decay=float(weight_decay)
+    )
+    history_rows: list[dict[str, float | int]] = []
+
+    for epoch in range(1, epochs + 1):
+        scale_model.train()
+        train_total = 0.0
+        train_weight = 0.0
+        batch_count = 0
+        for raw_batch in train_loader:
+            batch = _device_batch(raw_batch, selected_device)
+            process, quality, readings, weight = _required_scale_tensors(batch)
+            with torch.no_grad():
+                output = _current_orientation_output(mean_model, batch)
+                features = build_scale_features(output, process, quality)
+            optimizer.zero_grad(set_to_none=True)
+            loss = repeated_gaussian_nll(
+                output.prediction, scale_model(features), readings, weight
+            )
+            if not bool(torch.isfinite(loss)):
+                raise ValueError("training NLL must be finite")
+            loss.backward()
+            optimizer.step()
+            weight_sum = float(weight.detach().sum().cpu())
+            train_total += float(loss.detach().cpu()) * weight_sum
+            train_weight += weight_sum
+            batch_count += 1
+        if batch_count == 0 or not math.isfinite(train_weight) or train_weight <= 0.0:
+            raise ValueError("training loader must contain positive sample weight")
+        train_nll = train_total / train_weight
+        if not math.isfinite(train_nll):
+            raise ValueError("training NLL must be finite")
+        history_rows.append({"epoch": epoch, "train_nll": train_nll})
+
+    assert_mean_model_unchanged(mean_model, mean_snapshot)
+    return ScaleFit(
+        model=scale_model,
+        best_epoch=epochs,
+        history=pd.DataFrame(history_rows, columns=["epoch", "train_nll"]),
+        mean_state_sha256=mean_hash,
+    )
+
+
+def build_nested_calibration(
+    config: PhaseBConfig,
+    phase_a_config: SGRPNConfig,
+    bundle: DataBundle,
+    cache: OrderSpectrumCache,
+    fold: int,
+    seed: int,
+    *,
+    device: str | torch.device,
+    backend: TrainingBackend | None = None,
+    batch_size: int = 8,
+) -> Mapping[str, CalibrationArtifacts]:
     """Build group-confined OOF calibration scores for the two scale variants.
 
     This deliberately stops at calibration: it neither fits the final outer
@@ -369,9 +477,12 @@ def build_nested_calibration(*args: Any, **kwargs: Any) -> Mapping[str, Calibrat
     training partition.  In particular, the held-out block's labels are only
     touched after its mean and scale predictions have been materialised.
     """
-    config, phase_a, bundle, cache, fold, seed, device, batch_size = _nested_arguments(
-        *args, **kwargs
-    )
+    if not isinstance(config, PhaseBConfig) or not isinstance(phase_a_config, SGRPNConfig):
+        raise ValueError("nested calibration requires Phase B and Phase A configurations")
+    if not isinstance(bundle, DataBundle) or not isinstance(cache, OrderSpectrumCache):
+        raise ValueError("nested calibration requires a DataBundle and OrderSpectrumCache")
+    if type(fold) is not int:
+        raise ValueError("fold must be an integer")
     if type(seed) is not int or seed not in (20260723, 20260724, 20260725) or seed not in tuple(config.seeds):
         raise ValueError("seed must be a registered Phase B seed")
     if type(config.inner_splits) is not int or config.inner_splits != 4:
@@ -407,13 +518,14 @@ def build_nested_calibration(*args: Any, **kwargs: Any) -> Mapping[str, Calibrat
         # The exact sequence is part of the protocol boundary: fit_g1_mean_path
         # checks it against the registered outer-train universe itself.
         mean_path = fit_g1_mean_path(
-            phase_a,
+            phase_a_config,
             bundle,
             cache,
             int(fold),
             seed,
             train_ids,
             device=device,
+            backend=backend,
             batch_size=batch_size,
         )
         if tuple(mean_path.train_sample_ids) != train_ids:
@@ -471,13 +583,11 @@ def build_nested_calibration(*args: Any, **kwargs: Any) -> Mapping[str, Calibrat
                     )
                 )
             refit_epochs = median_best_epoch(selected_epochs)
-            refit = fit_scale_model(
+            refit = _refit_scale_model_exact_epochs(
                 mean_model=mean_path.model,
                 scale_model=factory(),
                 train_loader=train_batches,
-                valid_loader=train_batches,
-                max_epochs=refit_epochs,
-                patience=max(1, min(config.patience, refit_epochs)),
+                epochs=refit_epochs,
                 learning_rate=config.variance_learning_rate,
                 weight_decay=config.weight_decay,
                 device=device,
@@ -510,6 +620,7 @@ def build_nested_calibration(*args: Any, **kwargs: Any) -> Mapping[str, Calibrat
                     mean_model=mean_path.model,
                     fold=int(fold),
                     seed=seed,
+                    inner_fold=predictor_fold,
                     scale_name=scale_name,
                     device=torch.device(device),
                 )
@@ -533,39 +644,6 @@ def build_nested_calibration(*args: Any, **kwargs: Any) -> Mapping[str, Calibrat
             inner_fold_definitions=definitions.copy(),
         )
     return results
-
-
-def _nested_arguments(*args: Any, **kwargs: Any) -> tuple[
-    PhaseBConfig, SGRPNConfig, DataBundle, OrderSpectrumCache, int, int, str | torch.device, int
-]:
-    """Normalize the deliberately compact public calibration call signature."""
-    names = ("config", "phase_a", "bundle", "cache", "fold", "seed")
-    if len(args) > len(names):
-        raise TypeError("build_nested_calibration received too many positional arguments")
-    values = dict(zip(names, args))
-    for name in names:
-        if name in kwargs:
-            if name in values:
-                raise TypeError(f"build_nested_calibration received {name!r} twice")
-            values[name] = kwargs.pop(name)
-    missing = [name for name in names if name not in values]
-    if missing:
-        raise TypeError(f"build_nested_calibration is missing required arguments: {missing}")
-    device = kwargs.pop("device", None)
-    batch_size = kwargs.pop("batch_size", 8)
-    if kwargs:
-        raise TypeError(f"unexpected build_nested_calibration arguments: {sorted(kwargs)}")
-    config = values["config"]
-    phase_a = values["phase_a"]
-    bundle = values["bundle"]
-    cache = values["cache"]
-    if not isinstance(config, PhaseBConfig) or not isinstance(phase_a, SGRPNConfig):
-        raise ValueError("nested calibration requires Phase B and Phase A configurations")
-    if not isinstance(bundle, DataBundle) or not isinstance(cache, OrderSpectrumCache):
-        raise ValueError("nested calibration requires a DataBundle and OrderSpectrumCache")
-    if type(values["fold"]) is not int:
-        raise ValueError("fold must be an integer")
-    return config, phase_a, bundle, cache, values["fold"], values["seed"], ("cpu" if device is None else device), batch_size
 
 
 def _scale_factories() -> Mapping[str, type[nn.Module]]:
@@ -638,6 +716,7 @@ def _calibration_predictions(
     mean_model: SelectiveGatedModel,
     fold: int,
     seed: int,
+    inner_fold: int,
     scale_name: str,
     device: torch.device,
 ) -> pd.DataFrame:
@@ -661,6 +740,7 @@ def _calibration_predictions(
                         "group_id": str(batch["group_id"][index]),
                         "fold": fold,
                         "seed": seed,
+                        "inner_fold": inner_fold,
                         "scale_model": scale_name,
                         "target_mean": float(batch["target"][index].detach().cpu()),
                         "ra_1": float(batch["readings"][index, 0].detach().cpu()),
@@ -733,9 +813,15 @@ def _calibration_group_scores(predictions: pd.DataFrame) -> pd.DataFrame:
         predictions["sigma"].to_numpy(dtype=np.float64),
         readings,
     )
-    counts = predictions.groupby("group_id", as_index=False, sort=True, observed=True).size()
-    counts = counts.rename(columns={"size": "region_count"})
-    scored = counts.merge(base, on="group_id", how="inner", validate="one_to_one")
+    grouped = predictions.groupby("group_id", sort=True, observed=True)
+    provenance_columns = ("fold", "inner_fold", "seed", "scale_model")
+    if any((grouped[column].nunique(dropna=False) != 1).any() for column in provenance_columns):
+        raise ValueError("calibration group provenance must be unique within each group")
+    provenance = grouped[list(provenance_columns)].first().reset_index()
+    provenance = provenance.rename(columns={"fold": "outer_fold"})
+    counts = grouped.size().reset_index(name="region_count")
+    scored = provenance.merge(counts, on="group_id", how="inner", validate="one_to_one")
+    scored = scored.merge(base, on="group_id", how="inner", validate="one_to_one")
     scored["reading_count"] = 3 * scored["region_count"]
     scored = scored.loc[:, CALIBRATION_SCORE_COLUMNS]
     if (
@@ -745,51 +831,6 @@ def _calibration_group_scores(predictions: pd.DataFrame) -> pd.DataFrame:
     ):
         raise ValueError("calibration group scores must be unique, finite, and non-negative")
     return scored
-
-
-def _fold_arguments(*args: Any, **kwargs: Any) -> tuple[
-    PhaseBConfig,
-    PhaseAHandoff,
-    SGRPNConfig,
-    DataBundle,
-    OrderSpectrumCache,
-    int,
-    int,
-    str | torch.device,
-    int,
-    str | Path | None,
-]:
-    names = ("config", "handoff", "phase_a", "bundle", "cache")
-    if len(args) > len(names):
-        raise TypeError("run_phase_b_fold received too many positional arguments")
-    values = dict(zip(names, args))
-    for name in names:
-        if name in kwargs:
-            if name in values:
-                raise TypeError(f"run_phase_b_fold received {name!r} twice")
-            values[name] = kwargs.pop(name)
-    missing = [name for name in names if name not in values]
-    if missing:
-        raise TypeError(f"run_phase_b_fold is missing required arguments: {missing}")
-    fold = kwargs.pop("fold", None)
-    seed = kwargs.pop("seed", None)
-    device = kwargs.pop("device", "cpu")
-    batch_size = kwargs.pop("batch_size", 8)
-    output_root = kwargs.pop("output_root", None)
-    if kwargs:
-        raise TypeError(f"unexpected run_phase_b_fold arguments: {sorted(kwargs)}")
-    if not isinstance(values["config"], PhaseBConfig) or not isinstance(values["handoff"], PhaseAHandoff):
-        raise ValueError("run_phase_b_fold requires Phase B configuration and Phase A handoff")
-    if not isinstance(values["phase_a"], SGRPNConfig):
-        raise ValueError("run_phase_b_fold requires a Phase A configuration")
-    if not isinstance(values["bundle"], DataBundle) or not isinstance(values["cache"], OrderSpectrumCache):
-        raise ValueError("run_phase_b_fold requires a DataBundle and OrderSpectrumCache")
-    if type(fold) is not int:
-        raise ValueError("fold must be an integer")
-    return (
-        values["config"], values["handoff"], values["phase_a"], values["bundle"], values["cache"],
-        fold, seed, device, batch_size, output_root,
-    )
 
 
 def _select_and_refit_outer_scales(
@@ -831,13 +872,12 @@ def _select_and_refit_outer_scales(
                 seed=seed,
             )
             selected_epochs.append(selected.best_epoch)
-        refit = fit_scale_model(
+        refit_epochs = median_best_epoch(selected_epochs)
+        refit = _refit_scale_model_exact_epochs(
             mean_model=mean_path.model,
             scale_model=factory(),
             train_loader=final_batches,
-            valid_loader=final_batches,
-            max_epochs=median_best_epoch(selected_epochs),
-            patience=max(1, min(config.patience, median_best_epoch(selected_epochs))),
+            epochs=refit_epochs,
             learning_rate=config.variance_learning_rate,
             weight_decay=config.weight_decay,
             device=device,
@@ -898,17 +938,36 @@ def _outer_inference(
         for raw_batch in batches:
             batch = _device_batch(raw_batch, device)
             output = average_swap_predictions(mean_model, batch)
-            if output.process_mean is None or output.residual is None:
-                raise ValueError("final G1 output must contain process mean and residual")
+            if output.process_mean is None or output.residual is None or output.gate is None:
+                raise ValueError(
+                    "final G1 output must contain process mean, residual, and gate"
+                )
+            process_mean = output.process_mean.detach().cpu().numpy().astype(
+                np.float64, copy=False
+            )
+            residual = output.residual.detach().cpu().numpy().astype(
+                np.float64, copy=False
+            )
+            gate = output.gate.detach().cpu().numpy().astype(np.float64, copy=False)
+            prediction = output.prediction.detach().cpu().numpy().astype(
+                np.float64, copy=False
+            )
+            if not np.isfinite(
+                np.column_stack((process_mean, residual, gate, prediction))
+            ).all():
+                raise ValueError("final mean predictions must be finite")
+            zeros = np.zeros(len(prediction), dtype=np.float64)
+            ones = np.ones(len(prediction), dtype=np.float64)
             values = {
-                "P1": output.process_mean,
-                "R1": output.process_mean + output.residual,
-                "G1": output.prediction,
+                "P1": (process_mean, process_mean, zeros, zeros),
+                "R1": (process_mean + residual, process_mean, residual, ones),
+                "G1": (prediction, process_mean, residual, gate),
             }
-            for model_name, model_values in values.items():
-                result = model_values.detach().cpu().numpy().astype(np.float64, copy=False)
-                if not np.isfinite(result).all():
-                    raise ValueError("final mean predictions must be finite")
+            weights = batch["sample_weight"].detach().cpu().numpy().astype(
+                np.float64, copy=False
+            )
+            for model_name, components in values.items():
+                model_prediction, model_process, model_residual, model_gate = components
                 mean_rows.extend(
                     {
                         "sample_id": str(batch["sample_id"][index]),
@@ -916,12 +975,17 @@ def _outer_inference(
                         "fold": fold,
                         "seed": seed,
                         "model": model_name,
-                        "mu": float(result[index]),
+                        "prediction": float(model_prediction[index]),
+                        "sample_weight": float(weights[index]),
+                        "process_mean": float(model_process[index]),
+                        "residual": float(model_residual[index]),
+                        "gate": float(model_gate[index]),
                     }
-                    for index in range(len(result))
+                    for index in range(len(prediction))
                 )
             features = build_scale_features(output, batch["process"], batch["quality"])
-            mu = output.prediction.detach().cpu().numpy().astype(np.float64, copy=False)
+            mu = prediction
+            correction = prediction - process_mean
             for scale_name in SCALE_MODELS:
                 scale_values = scale_models[scale_name](features).detach().cpu().numpy().astype(np.float64, copy=False)
                 if not np.isfinite(scale_values).all() or np.any(scale_values <= 0.0):
@@ -934,8 +998,11 @@ def _outer_inference(
                             "fold": fold,
                             "seed": seed,
                             "scale_model": scale_name,
+                            "sample_weight": float(weights[index]),
                             "mu": float(mu[index]),
                             "sigma": float(scale_values[index]),
+                            "gate": float(gate[index]),
+                            "correction": float(correction[index]),
                         }
                     )
     probabilities = pd.DataFrame(probability_rows)
@@ -949,6 +1016,9 @@ def _outer_inference(
             conformal_lower, conformal_upper = conformal_interval(
                 rows["mu"], rows["sigma"], quantile=calibration[scale_name].quantiles[alpha]
             )
+            probabilities.loc[mask, f"conformal_q_{suffix}"] = calibration[
+                scale_name
+            ].quantiles[alpha].quantile
             probabilities.loc[mask, f"conformal_lower_{suffix}"] = conformal_lower
             probabilities.loc[mask, f"conformal_upper_{suffix}"] = conformal_upper
     return probabilities, pd.DataFrame(mean_rows)
@@ -1032,7 +1102,20 @@ def _validate_fold_predictions(
             raise ValueError("Phase B intervals must have ordered bounds")
 
 
-def run_phase_b_fold(*args: Any, **kwargs: Any) -> PhaseBFoldArtifacts:
+def run_phase_b_fold(
+    config: PhaseBConfig,
+    handoff: PhaseAHandoff,
+    phase_a_config: SGRPNConfig,
+    bundle: DataBundle,
+    cache: OrderSpectrumCache,
+    fold: int,
+    seed: int,
+    *,
+    device: str | torch.device | None = None,
+    backend: TrainingBackend | None = None,
+    batch_size: int = 8,
+    output_root: str | Path | None = None,
+) -> PhaseBFoldArtifacts:
     """Train one probability fold entirely in memory.
 
     Calibration deliberately completes before this function asks the final G1
@@ -1040,13 +1123,19 @@ def run_phase_b_fold(*args: Any, **kwargs: Any) -> PhaseBFoldArtifacts:
     feature-only batches until both scale models and conformal quantiles are
     final, which keeps their labels on the scoring side of the boundary.
     """
-    config, handoff, phase_a, bundle, cache, fold, seed, device, batch_size, output_root = (
-        _fold_arguments(*args, **kwargs)
-    )
+    if not isinstance(config, PhaseBConfig) or not isinstance(handoff, PhaseAHandoff):
+        raise ValueError("run_phase_b_fold requires Phase B configuration and Phase A handoff")
+    if not isinstance(phase_a_config, SGRPNConfig):
+        raise ValueError("run_phase_b_fold requires a Phase A configuration")
+    if not isinstance(bundle, DataBundle) or not isinstance(cache, OrderSpectrumCache):
+        raise ValueError("run_phase_b_fold requires a DataBundle and OrderSpectrumCache")
+    if type(fold) is not int:
+        raise ValueError("fold must be an integer")
     if type(seed) is not int or seed not in tuple(config.seeds):
         raise ValueError("seed must be a registered Phase B seed")
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
+    selected_device: str | torch.device = "cpu" if device is None else device
     root = validate_phase_b_output_root(config.output_dir, output_root=output_root)
 
     outer_train_index, outer_test_index = outer_indices(bundle, fold)
@@ -1056,20 +1145,35 @@ def run_phase_b_fold(*args: Any, **kwargs: Any) -> PhaseBFoldArtifacts:
     # This is intentionally first: no final model is selected from a path that
     # had access to an outer-test reading.
     calibration = build_nested_calibration(
-        config, phase_a, bundle, cache, fold, seed, device=device, batch_size=batch_size
+        config,
+        phase_a_config,
+        bundle,
+        cache,
+        fold,
+        seed,
+        device=selected_device,
+        backend=backend,
+        batch_size=batch_size,
     )
     final_mean = fit_g1_mean_path(
-        phase_a,
+        phase_a_config,
         bundle,
         cache,
         fold,
         seed,
         tuple(outer_train["sample_id"]),
-        device=device,
+        device=selected_device,
+        backend=backend,
         batch_size=batch_size,
     )
     final_scales, scale_histories = _select_and_refit_outer_scales(
-        config, outer_train, cache, final_mean, seed=seed, device=device, batch_size=batch_size
+        config,
+        outer_train,
+        cache,
+        final_mean,
+        seed=seed,
+        device=selected_device,
+        batch_size=batch_size,
     )
 
     # Do not call repeat_measure_batch on this frame before all fitted state and
@@ -1086,15 +1190,18 @@ def run_phase_b_fold(*args: Any, **kwargs: Any) -> PhaseBFoldArtifacts:
         calibration=calibration,
         fold=fold,
         seed=seed,
-        device=torch.device(device),
+        device=torch.device(selected_device),
     )
 
     # This is the sole outer-test readout.  It is joined after inference and
     # therefore cannot influence a fitted model, scaler, or quantile.
     outer_labels = repeat_measure_batch(outer_test_features)
-    label_frame = outer_test_features.loc[:, ["sample_id", "group_id"]].copy()
+    label_frame = outer_test_features.loc[
+        :, ["sample_id", "group_id", "version"]
+    ].copy()
     label_frame["sample_id"] = label_frame["sample_id"].astype(str)
     label_frame["group_id"] = label_frame["group_id"].astype(str)
+    label_frame["version"] = label_frame["version"].astype(str)
     label_frame["target_mean"] = outer_labels.mean
     label_frame["ra_1"] = outer_labels.readings[:, 0]
     label_frame["ra_2"] = outer_labels.readings[:, 1]
@@ -1104,6 +1211,12 @@ def run_phase_b_fold(*args: Any, **kwargs: Any) -> PhaseBFoldArtifacts:
     )
     predictions = predictions.loc[:, PHASE_B_PREDICTION_COLUMNS]
     _validate_fold_predictions(predictions, outer_test_features, fold=fold, seed=seed)
+    mean_predictions = mean_predictions.merge(
+        label_frame.loc[:, ["sample_id", "group_id", "version", "target_mean"]],
+        on=["sample_id", "group_id"],
+        how="inner",
+        validate="many_to_one",
+    )
     mean_predictions = mean_predictions.loc[:, PHASE_B_MEAN_COLUMNS]
     predictions.attrs["mean_predictions"] = mean_predictions
 
