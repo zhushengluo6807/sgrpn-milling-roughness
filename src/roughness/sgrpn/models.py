@@ -297,6 +297,119 @@ class SelectiveGatedModel(nn.Module):
         )
 
 
+class VarianceHead(nn.Module):
+    """Heteroscedastic Gaussian scale head for frozen G1 means."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(82, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, features: Tensor) -> Tensor:
+        _require_finite_matrix(features, name="scale_features", width=82)
+        return F.softplus(self.network(features).squeeze(1)) + 1e-4
+
+
+class GlobalScale(nn.Module):
+    """Homoscedastic ablation with exactly one learned positive scale."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raw_scale = nn.Parameter(torch.zeros(()))
+
+    def forward(self, features: Tensor) -> Tensor:
+        _require_finite_matrix(features, name="scale_features", width=82)
+        return (F.softplus(self.raw_scale) + 1e-4).expand(features.shape[0])
+
+
+def _require_finite_vector(value: Tensor, *, name: str) -> None:
+    if not isinstance(value, Tensor) or value.ndim != 1 or value.numel() == 0:
+        raise ValueError(f"{name} must have shape [B]")
+    if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+        raise ValueError(f"{name} must be floating point and finite")
+
+
+def build_scale_features(output: ModelOutput, process: Tensor, quality: Tensor) -> Tensor:
+    """Assemble the registered 64+9+7+1+1 scale-regression features."""
+    if not isinstance(output, ModelOutput):
+        raise ValueError("output must be a ModelOutput")
+    required = ("prediction", "process_mean", "embedding", "gate")
+    if any(getattr(output, name) is None for name in required):
+        raise ValueError("output must contain prediction, process_mean, embedding, and gate")
+    prediction = output.prediction
+    process_mean = output.process_mean
+    embedding = output.embedding
+    gate = output.gate
+    assert process_mean is not None and embedding is not None and gate is not None
+    _require_finite_vector(prediction, name="prediction")
+    _require_finite_vector(process_mean, name="process_mean")
+    _require_finite_vector(gate, name="gate")
+    _require_finite_matrix(embedding, name="embedding", width=64)
+    _require_finite_matrix(process, name="process", width=9)
+    _require_finite_matrix(quality, name="quality", width=7)
+    _require_same_batch(
+        ("prediction", prediction),
+        ("process_mean", process_mean),
+        ("embedding", embedding),
+        ("gate", gate),
+        ("process", process),
+        ("quality", quality),
+    )
+    if bool(((gate < 0) | (gate > 1)).any()):
+        raise ValueError("gate must lie in [0, 1]")
+    correction_abs = (prediction - process_mean).abs()
+    return torch.cat([embedding, process, quality, gate[:, None], correction_abs[:, None]], dim=1)
+
+
+def repeated_gaussian_nll(mu: Tensor, sigma: Tensor, readings: Tensor, weight: Tensor) -> Tensor:
+    """Weight region-averaged Gaussian NLL over exactly three Ra readings."""
+    _require_finite_vector(mu, name="mu")
+    _require_finite_vector(sigma, name="sigma")
+    _require_finite_vector(weight, name="weight")
+    if not isinstance(readings, Tensor) or readings.ndim != 2 or readings.shape[1] != 3:
+        raise ValueError("readings must have shape [B, 3]")
+    if not readings.is_floating_point() or not bool(torch.isfinite(readings).all()):
+        raise ValueError("readings must be floating point and finite")
+    _require_same_batch(("mu", mu), ("sigma", sigma), ("readings", readings), ("weight", weight))
+    if bool((sigma <= 0).any()):
+        raise ValueError("sigma must be positive")
+    if bool((weight <= 0).any()):
+        raise ValueError("weight must be positive")
+    per_read = 0.5 * torch.log(2.0 * math.pi * sigma[:, None].square())
+    per_read = per_read + 0.5 * ((readings - mu[:, None]) / sigma[:, None]).square()
+    return (weight * per_read.mean(dim=1)).sum() / weight.sum()
+
+
+def freeze_mean_model(model: SelectiveGatedModel) -> dict[str, Tensor]:
+    """Freeze all G1 mean parameters and snapshot parameters plus buffers."""
+    if not isinstance(model, SelectiveGatedModel):
+        raise ValueError("model must be a SelectiveGatedModel")
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.eval()
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def assert_mean_model_unchanged(model: SelectiveGatedModel, snapshot: Mapping[str, Tensor]) -> None:
+    """Assert that every frozen-mean parameter and buffer matches its snapshot."""
+    if not isinstance(model, SelectiveGatedModel):
+        raise ValueError("model must be a SelectiveGatedModel")
+    current = model.state_dict()
+    if set(current) != set(snapshot):
+        raise AssertionError("mean model state keys changed")
+    for name, expected in snapshot.items():
+        actual = current[name]
+        if actual.dtype != expected.dtype or actual.shape != expected.shape:
+            raise AssertionError(f"mean model state tensor {name} changed shape or dtype")
+        if not torch.equal(actual.detach().cpu(), expected):
+            raise AssertionError(f"mean model state tensor {name} changed")
+
+
 def weighted_huber(
     prediction: Tensor,
     target: Tensor,
@@ -403,6 +516,7 @@ def average_swap_predictions(model: nn.Module, batch: dict[str, Any]) -> ModelOu
 
 __all__ = [
     "DirectFusionModel",
+    "GlobalScale",
     "ModelOutput",
     "OrderSpectrumEncoder",
     "ProcessMLP",
@@ -410,8 +524,13 @@ __all__ = [
     "ResidualFusionModel",
     "SelectiveGatedModel",
     "VibrationOnlyModel",
+    "VarianceHead",
+    "assert_mean_model_unchanged",
     "average_swap_predictions",
+    "build_scale_features",
     "combine_prediction",
     "sgrpn_loss",
+    "freeze_mean_model",
+    "repeated_gaussian_nll",
     "weighted_huber",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 
 import pytest
 import torch
@@ -8,6 +9,7 @@ from torch import nn
 
 from roughness.sgrpn.models import (
     DirectFusionModel,
+    GlobalScale,
     ModelOutput,
     OrderSpectrumEncoder,
     ProcessMLP,
@@ -15,11 +17,102 @@ from roughness.sgrpn.models import (
     ResidualFusionModel,
     SelectiveGatedModel,
     VibrationOnlyModel,
+    VarianceHead,
+    assert_mean_model_unchanged,
     average_swap_predictions,
+    build_scale_features,
     combine_prediction,
     sgrpn_loss,
+    freeze_mean_model,
+    repeated_gaussian_nll,
     weighted_huber,
 )
+
+
+def test_scale_features_are_exactly_registered_82_values():
+    output = ModelOutput(
+        prediction=torch.tensor([1.1]),
+        process_mean=torch.tensor([1.0]),
+        residual=torch.tensor([-0.4]),
+        gate=torch.tensor([0.25]),
+        embedding=torch.zeros(1, 64),
+    )
+    features = build_scale_features(output, torch.zeros(1, 9), torch.zeros(1, 7))
+    assert features.shape == (1, 82)
+    assert features[0, -2].item() == pytest.approx(0.25)
+    assert features[0, -1].item() == pytest.approx(0.10)
+
+
+def test_scale_features_use_absolute_averaged_correction_not_averaged_gate_residual():
+    class AntiCorrelatedOrientations(nn.Module):
+        def forward(self, spectrum, window_mask, process, quality):
+            del window_mask, process, quality
+            gate = spectrum[:, :, 0].mean(dim=(1, 2))
+            residual = 4.0 * gate - 2.0
+            return ModelOutput(
+                prediction=gate * residual,
+                process_mean=torch.zeros_like(gate),
+                residual=residual,
+                gate=gate,
+                embedding=torch.zeros(gate.shape[0], 64),
+            )
+
+    spectrum, mask, process, quality = _inputs(batch_size=1, windows=1)
+    spectrum[:, :, 0] = 1.0
+    batch = {
+        "spectrum": spectrum,
+        "window_mask": mask,
+        "process": process,
+        "quality": quality,
+        "target": torch.zeros(1),
+        "sample_weight": torch.ones(1),
+        "sample_id": ["sample"],
+        "group_id": ["group"],
+    }
+    output = average_swap_predictions(AntiCorrelatedOrientations(), batch)
+    features = build_scale_features(output, torch.zeros(1, 9), torch.zeros(1, 7))
+    # Orientations (gate, residual) = (1, 2), (0, -2) make mean(g) *
+    # mean(residual) zero while mean(g * residual) is one.
+    assert output.gate is not None and output.residual is not None
+    assert (output.gate * output.residual).item() == pytest.approx(0.0)
+    assert features[0, -1].item() == pytest.approx(1.0)
+
+
+def test_variance_head_is_finite_and_bounded_away_from_zero():
+    sigma = VarianceHead()(torch.zeros(4, 82))
+    assert sigma.shape == (4,)
+    assert torch.isfinite(sigma).all()
+    assert torch.all(sigma >= 1e-4)
+
+
+def test_global_scale_learns_one_shared_positive_scalar():
+    scale = GlobalScale()
+    sigma = scale(torch.zeros(4, 82))
+    assert list(scale.state_dict()) == ["raw_scale"]
+    assert sigma.shape == (4,)
+    assert torch.all(sigma == sigma[0])
+    assert torch.all(sigma >= 1e-4)
+
+
+def test_repeated_nll_averages_reads_before_region_weighting():
+    mu = torch.tensor([0.0, 1.0])
+    sigma = torch.ones(2)
+    readings = torch.tensor([[0.0, 1.0, 2.0], [1.0, 1.0, 1.0]])
+    weight = torch.tensor([0.5, 0.25])
+    per_read = 0.5 * math.log(2.0 * math.pi) + 0.5 * (readings - mu[:, None]).square()
+    expected = (weight * per_read.mean(dim=1)).sum() / weight.sum()
+    assert repeated_gaussian_nll(mu, sigma, readings, weight) == pytest.approx(expected)
+
+
+def test_freeze_mean_model_snapshots_and_detects_parameter_or_buffer_changes():
+    model = SelectiveGatedModel(ProcessMLP(), ResidualExpert(OrderSpectrumEncoder()))
+    snapshot = freeze_mean_model(model)
+    assert not model.training
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+    assert_mean_model_unchanged(model, snapshot)
+    model.residual_expert.encoder.window_encoder[1].running_mean.add_(1)
+    with pytest.raises(AssertionError, match="changed"):
+        assert_mean_model_unchanged(model, snapshot)
 
 
 def _inputs(batch_size: int = 2, windows: int = 3) -> tuple[torch.Tensor, ...]:
