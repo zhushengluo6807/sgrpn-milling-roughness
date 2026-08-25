@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import pytest
 import inspect
+import math
+
+import roughness.sgrpn.evaluation as evaluation
 
 from roughness.sgrpn.evaluation import (
     AcceptanceInputs,
@@ -625,7 +628,7 @@ def _phase_b_fixture(sample_count=586):
                 )
             for model in MEAN_MODELS:
                 if model == "P1":
-                    prediction, model_residual, model_gate = process_mean, 0.0, 0.0
+                    prediction, model_residual, model_gate = process_mean, residual, 0.0
                 elif model == "R1":
                     prediction, model_residual, model_gate = process_mean + residual, residual, 1.0
                 else:
@@ -654,11 +657,83 @@ def _phase_b_fixture(sample_count=586):
     )
 
 
+def _phase_b_calibration_fixture(manifest, folds):
+    sample_folds = folds.set_index("sample_id")["fold"]
+    group_metadata = (
+        manifest.assign(fold=manifest["sample_id"].map(sample_folds))
+        .groupby("group_id", sort=True, observed=True)
+        .agg(fold=("fold", "first"), region_count=("sample_id", "size"))
+    )
+    assert (
+        manifest.assign(fold=manifest["sample_id"].map(sample_folds))
+        .groupby("group_id", observed=True)["fold"]
+        .nunique()
+        .eq(1)
+        .all()
+    )
+    score_rows = []
+    quantile_rows = []
+    for fold in range(5):
+        outer_groups = group_metadata.loc[group_metadata["fold"] != fold]
+        group_count = len(outer_groups)
+        order_90 = math.ceil((group_count + 1) * 0.90)
+        order_95 = math.ceil((group_count + 1) * 0.95)
+        scores = np.full(group_count, 2.5, dtype=np.float64)
+        scores[: order_90 - 1] = 1.0
+        scores[order_90 - 1 : order_95 - 1] = 2.0
+        for seed in PHASE_B_SEEDS:
+            for scale_model in SCALE_MODELS:
+                for index, ((group_id, metadata), score) in enumerate(
+                    zip(outer_groups.iterrows(), scores, strict=True)
+                ):
+                    score_rows.append(
+                        {
+                            "group_id": group_id,
+                            "outer_fold": fold,
+                            "inner_fold": index % 4,
+                            "seed": seed,
+                            "scale_model": scale_model,
+                            "score": score,
+                            "region_count": int(metadata["region_count"]),
+                            "reading_count": 3 * int(metadata["region_count"]),
+                        }
+                    )
+                quantile_rows.extend(
+                    [
+                        {
+                            "fold": fold,
+                            "seed": seed,
+                            "scale_model": scale_model,
+                            "alpha": 0.10,
+                            "group_count": group_count,
+                            "order_index": order_90,
+                            "quantile": 2.0,
+                        },
+                        {
+                            "fold": fold,
+                            "seed": seed,
+                            "scale_model": scale_model,
+                            "alpha": 0.05,
+                            "group_count": group_count,
+                            "order_index": order_95,
+                            "quantile": 2.5,
+                        },
+                    ]
+                )
+    return pd.DataFrame(score_rows), pd.DataFrame(quantile_rows)
+
+
 def test_phase_b_cartesian_validation_enforces_registered_probability_and_mean_rows():
     manifest, folds, probability, mean = _phase_b_fixture()
+    scores, quantiles = _phase_b_calibration_fixture(manifest, folds)
 
     validated = validate_phase_b_prediction_cartesian(
-        probability, manifest=manifest, folds=folds, mean_predictions=mean
+        probability,
+        manifest=manifest,
+        folds=folds,
+        mean_predictions=mean,
+        calibration_scores=scores,
+        calibration_quantiles=quantiles,
     )
     assert len(validated) == 3516
     assert validated["sample_id"].iloc[0] == "s000"
@@ -694,53 +769,212 @@ def test_phase_b_cartesian_validation_enforces_registered_probability_and_mean_r
     for bad in bad_frames:
         with pytest.raises(ValueError):
             validate_phase_b_prediction_cartesian(
-                bad, manifest=manifest, folds=folds, mean_predictions=mean
+                bad,
+                manifest=manifest,
+                folds=folds,
+                mean_predictions=mean,
+                calibration_scores=scores,
+                calibration_quantiles=quantiles,
             )
 
     bad_mean = mean.copy()
     bad_mean.loc[bad_mean["model"] == "G1", "gate"] = 1.5
     with pytest.raises(ValueError, match="mean"):
         validate_phase_b_prediction_cartesian(
-            probability, manifest=manifest, folds=folds, mean_predictions=bad_mean
+            probability,
+            manifest=manifest,
+            folds=folds,
+            mean_predictions=bad_mean,
+            calibration_scores=scores,
+            calibration_quantiles=quantiles,
         )
 
 
-def test_probability_table_contains_every_registered_measure():
-    rows = []
-    for group_id, mu in (("g1", 0.5), ("g2", 0.8)):
-        for scale_model in SCALE_MODELS:
-            rows.append(
-                {
-                    "sample_id": group_id,
-                    "group_id": group_id,
-                    "version": "v3",
-                    "fold": 0,
-                    "seed": 20260723,
-                    "scale_model": scale_model,
-                    "target_mean": mu,
-                    "ra_1": mu - 0.1,
-                    "ra_2": mu,
-                    "ra_3": mu + 0.1,
-                    "sample_weight": 1.0,
-                    "mu": mu,
-                    "sigma": 0.2,
-                    "gate": 0.5,
-                    "correction": 0.0,
-                    "raw_lower_90": mu - 0.4,
-                    "raw_upper_90": mu + 0.4,
-                    "raw_lower_95": mu - 0.5,
-                    "raw_upper_95": mu + 0.5,
-                    "conformal_q_90": 2.0,
-                    "conformal_lower_90": mu - 0.4,
-                    "conformal_upper_90": mu + 0.4,
-                    "conformal_q_95": 2.5,
-                    "conformal_lower_95": mu - 0.5,
-                    "conformal_upper_95": mu + 0.5,
-                }
-            )
-    table = probability_metric_table(
-        pd.DataFrame(rows, columns=PHASE_B_PREDICTION_COLUMNS)
+def test_phase_b_validator_consumes_scores_and_recomputes_persisted_quantiles():
+    manifest, folds, probability, mean = _phase_b_fixture()
+    scores, quantiles = _phase_b_calibration_fixture(manifest, folds)
+
+    validated = validate_phase_b_prediction_cartesian(
+        probability,
+        manifest=manifest,
+        folds=folds,
+        mean_predictions=mean,
+        calibration_scores=scores,
+        calibration_quantiles=quantiles,
     )
+    assert len(validated) == 3516
+
+    stale_scores = scores.copy()
+    stale_scores.loc[
+        (stale_scores["outer_fold"] == 0)
+        & (stale_scores["seed"] == PHASE_B_SEEDS[0])
+        & (stale_scores["scale_model"] == SCALE_MODELS[0]),
+        "score",
+    ] += 1.0
+    with pytest.raises(ValueError, match="quantile"):
+        validate_phase_b_prediction_cartesian(
+            probability,
+            manifest=manifest,
+            folds=folds,
+            mean_predictions=mean,
+            calibration_scores=stale_scores,
+            calibration_quantiles=quantiles,
+        )
+
+    forged_probability = probability.copy()
+    forged_quantiles = quantiles.copy()
+    quantile_mask = (
+        (forged_quantiles["fold"] == 0)
+        & (forged_quantiles["seed"] == PHASE_B_SEEDS[0])
+        & (forged_quantiles["scale_model"] == SCALE_MODELS[0])
+        & (forged_quantiles["alpha"] == 0.10)
+    )
+    forged_quantiles.loc[quantile_mask, "quantile"] = 2.25
+    prediction_mask = (
+        (forged_probability["fold"] == 0)
+        & (forged_probability["seed"] == PHASE_B_SEEDS[0])
+        & (forged_probability["scale_model"] == SCALE_MODELS[0])
+    )
+    forged_probability.loc[prediction_mask, "conformal_q_90"] = 2.25
+    forged_probability.loc[prediction_mask, "conformal_lower_90"] = (
+        forged_probability.loc[prediction_mask, "mu"]
+        - 2.25 * forged_probability.loc[prediction_mask, "sigma"]
+    )
+    forged_probability.loc[prediction_mask, "conformal_upper_90"] = (
+        forged_probability.loc[prediction_mask, "mu"]
+        + 2.25 * forged_probability.loc[prediction_mask, "sigma"]
+    )
+    with pytest.raises(ValueError, match="quantile"):
+        validate_phase_b_prediction_cartesian(
+            forged_probability,
+            manifest=manifest,
+            folds=folds,
+            mean_predictions=mean,
+            calibration_scores=scores,
+            calibration_quantiles=forged_quantiles,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "column", "delta", "message"),
+    [
+        ("P1", "prediction", 0.1, "P1"),
+        ("R1", "prediction", 0.1, "R1"),
+        ("G1", "prediction", 0.1, "G1"),
+        ("P1", "process_mean", 0.1, "shared process"),
+        ("P1", "residual", 0.1, "shared residual"),
+        ("P1", "gate", 0.1, "gate semantics"),
+        ("R1", "gate", -0.1, "gate semantics"),
+    ],
+)
+def test_phase_b_mean_arithmetic_rejects_targeted_corruption(
+    model, column, delta, message
+):
+    manifest, folds, probability, mean = _phase_b_fixture()
+    scores, quantiles = _phase_b_calibration_fixture(manifest, folds)
+    corrupted = mean.copy()
+    row = corrupted.index[
+        (corrupted["sample_id"] == "s000")
+        & (corrupted["seed"] == PHASE_B_SEEDS[0])
+        & (corrupted["model"] == model)
+    ][0]
+    corrupted.loc[row, column] += delta
+
+    with pytest.raises(ValueError, match=message):
+        validate_phase_b_prediction_cartesian(
+            probability,
+            manifest=manifest,
+            folds=folds,
+            mean_predictions=corrupted,
+            calibration_scores=scores,
+            calibration_quantiles=quantiles,
+        )
+
+
+def test_phase_b_probability_all_seed_rejects_incomplete_cartesian_first():
+    _, _, probability, _ = _phase_b_fixture()
+
+    for incomplete in (
+        probability.loc[probability["seed"] != PHASE_B_SEEDS[-1]],
+        probability.iloc[:-1],
+    ):
+        with pytest.raises(ValueError, match="3516|Cartesian|three registered seeds"):
+            probability_metric_table(incomplete)
+
+
+def test_phase_b_mean_evaluation_chain_covers_registered_outputs():
+    manifest, _, _, mean = _phase_b_fixture()
+    quality = pd.DataFrame(
+        {
+            "sample_id": manifest["sample_id"],
+            **{
+                f"quality_{index}": (
+                    np.arange(len(manifest), dtype=np.float64) % (index + 4)
+                )
+                for index in range(7)
+            },
+        }
+    )
+
+    metrics = evaluation.phase_b_mean_metric_table(mean)
+    seed_zero = metrics.loc[
+        (metrics["aggregation"] == "seed")
+        & (metrics["seed"] == PHASE_B_SEEDS[0])
+    ].set_index(["model", "metric"])["value"]
+    assert set(metrics["metric"]) == {"mean_mae", "mean_rmse", "mean_r2"}
+    assert set(metrics["model"]) == set(MEAN_MODELS)
+    assert set(metrics["aggregation"]) == {"fold", "seed", "all_seed"}
+    assert seed_zero.loc[("P1", "mean_mae")] == pytest.approx(0.02)
+    assert seed_zero.loc[("P1", "mean_rmse")] == pytest.approx(0.02)
+    assert seed_zero.loc[("G1", "mean_r2")] == pytest.approx(1.0)
+
+    transfers = evaluation.phase_b_negative_transfer_table(mean)
+    assert set(transfers["candidate"]) == {"R1", "G1"}
+    assert set(transfers["aggregation"]) == {"seed", "all_seed"}
+    g1_seed_zero = transfers.loc[
+        (transfers["aggregation"] == "seed")
+        & (transfers["seed"] == PHASE_B_SEEDS[0])
+        & (transfers["candidate"] == "G1")
+    ].iloc[0]
+    assert g1_seed_zero["raw_rate"] == 0.0
+    assert g1_seed_zero["material_rate"] == 0.0
+
+    bootstraps = evaluation.phase_b_mean_bootstrap_table(mean)
+    assert set(bootstraps["candidate"]) == {"R1", "G1"}
+    assert set(bootstraps["repetitions"]) == {10_000}
+    assert set(bootstraps["seed"]) == {20260723}
+    assert set(bootstraps["resampling_unit"]) == {"group_id"}
+    assert bootstraps.loc[
+        bootstraps["candidate"] == "G1", "point_estimate"
+    ].item() > 0.0
+    with pytest.raises(ValueError, match="exactly 10000"):
+        evaluation.paired_phase_b_mean_bootstrap(
+            mean, candidate="G1", repetitions=9999
+        )
+
+    gates = evaluation.phase_b_gate_statistics(mean, manifest, quality)
+    assert set(gates["dimension"]) == {
+        "overall",
+        "n_rpm",
+        "fz_mm_per_tooth",
+        "ap_mm",
+        *(f"quality_{index}" for index in range(7)),
+    }
+    assert {
+        "prediction_count",
+        "sample_count",
+        "weight_sum",
+        "gate_mean",
+        "gate_weighted_mean",
+        "gate_p05",
+        "gate_median",
+        "gate_p95",
+    }.issubset(gates.columns)
+
+
+def test_probability_table_contains_every_registered_measure():
+    _, _, probability, _ = _phase_b_fixture()
+    table = probability_metric_table(probability)
     assert set(table["metric"]) == {
         "mean_mae",
         "mean_rmse",
@@ -758,7 +992,7 @@ def test_probability_table_contains_every_registered_measure():
 
 
 def test_probability_all_seed_metrics_average_seed_replicates():
-    _, _, probability, _ = _phase_b_fixture(sample_count=4)
+    _, _, probability, _ = _phase_b_fixture()
     table = probability_metric_table(probability)
     seed_rows = table.loc[
         (table["aggregation"] == "seed")
@@ -816,25 +1050,17 @@ def test_probability_bootstrap_is_exact_group_paired_and_reproducible(
     }
     first = paired_probability_bootstrap(probability, **kwargs)
     second = paired_probability_bootstrap(probability, **kwargs)
-
-    table = probability_metric_table(probability)
-    matching = table.loc[
-        (table["aggregation"] == "all_seed")
-        & (table["metric"] == metric)
-    ]
-    if interval_type is not None:
-        matching = matching.loc[
-            (matching["interval_type"] == interval_type)
-            & (matching["nominal_coverage"] == nominal_coverage)
-        ]
-    expected = {
-        row.scale_model: row.value for row in matching.itertuples(index=False)
-    }
+    expected_point = {
+        ("gaussian_nll", None, None): -0.19295605131420973,
+        ("gaussian_crps", None, None): -0.009142278913736972,
+        ("mean_interval_width", "raw", 0.90): -0.16448536269514713,
+        ("mean_interval_width", "conformal", 0.95): -0.25,
+        ("winkler_score", "raw", 0.90): -0.16448536269514713,
+        ("winkler_score", "conformal", 0.95): -0.25,
+    }[(metric, interval_type, nominal_coverage)]
 
     assert first == second
-    assert first.point_estimate == pytest.approx(
-        expected["heteroscedastic"] - expected["homoscedastic"]
-    )
+    assert first.point_estimate == pytest.approx(expected_point)
     assert first.repetitions == BOOTSTRAP_REPETITIONS == 10_000
     assert first.seed == 20260723
     assert first.resampling_unit == "group_id"

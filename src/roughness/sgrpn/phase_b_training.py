@@ -983,7 +983,7 @@ def _outer_inference(
             zeros = np.zeros(len(prediction), dtype=np.float64)
             ones = np.ones(len(prediction), dtype=np.float64)
             values = {
-                "P1": (process_mean, process_mean, zeros, zeros),
+                "P1": (process_mean, process_mean, residual, zeros),
                 "R1": (process_mean + residual, process_mean, residual, ones),
                 "G1": (prediction, process_mean, residual, gate),
             }

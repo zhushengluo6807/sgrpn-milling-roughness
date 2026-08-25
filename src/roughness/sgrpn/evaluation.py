@@ -11,13 +11,16 @@ import numpy as np
 import pandas as pd
 
 from .phase_b_training import (
+    CALIBRATION_SCORE_COLUMNS,
     MEAN_MODELS,
+    PHASE_B_ALPHAS,
     PHASE_B_MEAN_COLUMNS,
     PHASE_B_PREDICTION_COLUMNS,
     PHASE_B_SEEDS,
     SCALE_MODELS,
 )
 from .probability import (
+    finite_sample_group_quantile,
     gaussian_crps,
     mean_interval_width,
     simultaneous_group_coverage,
@@ -578,6 +581,15 @@ _PHASE_B_INTERVAL_METRICS = (
     "mean_interval_width",
     "winkler_score",
 )
+_PHASE_B_QUANTILE_COLUMNS = (
+    "fold",
+    "seed",
+    "scale_model",
+    "alpha",
+    "group_count",
+    "order_index",
+    "quantile",
+)
 
 
 def _phase_b_canonical_integers(values: pd.Series, column: str) -> np.ndarray:
@@ -672,6 +684,228 @@ def _phase_b_expected_sample_metadata(manifest: pd.DataFrame, folds: pd.DataFram
     return expected.merge(fold_values, on="sample_id", how="inner", validate="one_to_one")
 
 
+def _validate_phase_b_calibration_artifacts(
+    calibration_scores: pd.DataFrame,
+    calibration_quantiles: pd.DataFrame,
+    *,
+    expected: pd.DataFrame,
+    probability: pd.DataFrame,
+) -> None:
+    if tuple(calibration_scores.columns) != CALIBRATION_SCORE_COLUMNS:
+        raise ValueError("Phase B calibration score schema is incompatible")
+    if tuple(calibration_quantiles.columns) != _PHASE_B_QUANTILE_COLUMNS:
+        raise ValueError("Phase B calibration quantile schema is incompatible")
+
+    scores = calibration_scores.copy()
+    if scores["group_id"].isna().any() or scores["scale_model"].isna().any():
+        raise ValueError("Phase B calibration score IDs must not be missing")
+    scores["group_id"] = scores["group_id"].astype(str)
+    scores["scale_model"] = scores["scale_model"].astype(str)
+    for column in ("outer_fold", "inner_fold", "seed"):
+        scores[column] = _phase_b_canonical_integers(scores[column], column)
+    score_numeric = _phase_b_numeric_frame(
+        scores, ("score", "region_count", "reading_count"), label="calibration score"
+    )
+    for column in ("region_count", "reading_count"):
+        values = score_numeric[column].to_numpy()
+        if np.any(values <= 0.0) or not np.equal(values, np.floor(values)).all():
+            raise ValueError("Phase B calibration score counts must be positive integral")
+    if np.any(score_numeric["score"] < 0.0):
+        raise ValueError("Phase B calibration scores must be non-negative")
+    if not np.array_equal(
+        score_numeric["reading_count"].to_numpy(),
+        3.0 * score_numeric["region_count"].to_numpy(),
+    ):
+        raise ValueError("Phase B calibration reading counts are incompatible")
+    if (
+        scores.duplicated(["group_id", "outer_fold", "seed", "scale_model"]).any()
+        or set(scores["outer_fold"]) != set(range(5))
+        or set(scores["seed"]) != set(PHASE_B_SEEDS)
+        or set(scores["scale_model"]) != set(SCALE_MODELS)
+        or not set(scores["inner_fold"]).issubset(set(range(4)))
+    ):
+        raise ValueError("Phase B calibration score Cartesian keys are incompatible")
+
+    expected_groups = expected.groupby("group_id", sort=True, observed=True).agg(
+        fold=("fold", "first"),
+        fold_count=("fold", "nunique"),
+        region_count=("sample_id", "size"),
+    )
+    if (expected_groups["fold_count"] != 1).any():
+        raise ValueError("Phase B registered groups must remain confined to one outer fold")
+    expected_score_keys = {
+        (str(group_id), outer_fold, seed, scale_model)
+        for outer_fold in range(5)
+        for group_id, metadata in expected_groups.iterrows()
+        if int(metadata["fold"]) != outer_fold
+        for seed in PHASE_B_SEEDS
+        for scale_model in SCALE_MODELS
+    }
+    actual_score_keys = set(
+        zip(
+            scores["group_id"],
+            scores["outer_fold"],
+            scores["seed"],
+            scores["scale_model"],
+            strict=True,
+        )
+    )
+    if len(scores) != len(expected_score_keys) or actual_score_keys != expected_score_keys:
+        raise ValueError("Phase B calibration score Cartesian coverage is incomplete")
+    expected_region_counts = scores["group_id"].map(expected_groups["region_count"])
+    if not np.array_equal(
+        score_numeric["region_count"].to_numpy(),
+        expected_region_counts.to_numpy(dtype=np.float64),
+    ):
+        raise ValueError("Phase B calibration score region counts are incompatible")
+    if scores.groupby(
+        ["outer_fold", "seed", "group_id"], observed=True
+    )["inner_fold"].nunique(dropna=False).gt(1).any():
+        raise ValueError("Phase B calibration inner-fold provenance is incompatible")
+    if scores.groupby(
+        ["outer_fold", "seed", "scale_model"], observed=True
+    )["inner_fold"].agg(set).ne(set(range(4))).any():
+        raise ValueError("Phase B calibration requires all four inner folds")
+
+    quantiles = calibration_quantiles.copy()
+    if quantiles["scale_model"].isna().any():
+        raise ValueError("Phase B calibration quantile model must not be missing")
+    quantiles["scale_model"] = quantiles["scale_model"].astype(str)
+    for column in ("fold", "seed", "group_count", "order_index"):
+        quantiles[column] = _phase_b_canonical_integers(quantiles[column], column)
+    quantile_numeric = _phase_b_numeric_frame(
+        quantiles, ("alpha", "quantile"), label="calibration quantile"
+    )
+    quantiles["alpha"] = quantile_numeric["alpha"]
+    quantiles["quantile"] = quantile_numeric["quantile"]
+    expected_quantile_keys = {
+        (fold, seed, scale_model, alpha)
+        for fold in range(5)
+        for seed in PHASE_B_SEEDS
+        for scale_model in SCALE_MODELS
+        for alpha in PHASE_B_ALPHAS
+    }
+    actual_quantile_keys = set(
+        zip(
+            quantiles["fold"],
+            quantiles["seed"],
+            quantiles["scale_model"],
+            quantiles["alpha"],
+            strict=True,
+        )
+    )
+    if (
+        len(quantiles) != len(expected_quantile_keys)
+        or quantiles.duplicated(["fold", "seed", "scale_model", "alpha"]).any()
+        or actual_quantile_keys != expected_quantile_keys
+        or np.any(quantiles["quantile"] < 0.0)
+    ):
+        raise ValueError("Phase B calibration quantile Cartesian coverage is incompatible")
+
+    for row in quantiles.itertuples(index=False):
+        model_scores = scores.loc[
+            (scores["outer_fold"] == row.fold)
+            & (scores["seed"] == row.seed)
+            & (scores["scale_model"] == row.scale_model),
+            ["group_id", "score"],
+        ]
+        recomputed = finite_sample_group_quantile(model_scores, alpha=float(row.alpha))
+        if (
+            int(row.group_count) != recomputed.group_count
+            or int(row.order_index) != recomputed.order_index
+            or not np.isclose(
+                float(row.quantile), recomputed.quantile, rtol=0.0, atol=1e-12
+            )
+        ):
+            raise ValueError("Phase B persisted calibration quantile is stale or forged")
+        suffix = {0.10: "90", 0.05: "95"}[float(row.alpha)]
+        prediction_rows = probability.loc[
+            (probability["fold"] == row.fold)
+            & (probability["seed"] == row.seed)
+            & (probability["scale_model"] == row.scale_model),
+            f"conformal_q_{suffix}",
+        ].to_numpy(dtype=np.float64)
+        if prediction_rows.size == 0 or not np.allclose(
+            prediction_rows, recomputed.quantile, rtol=0.0, atol=1e-12
+        ):
+            raise ValueError("Phase B prediction quantile does not match calibration")
+
+
+def _validate_phase_b_mean_semantics(
+    mean: pd.DataFrame, *, probability: pd.DataFrame | None = None
+) -> None:
+    components = mean.pivot(
+        index=["sample_id", "seed"],
+        columns="model",
+        values=["prediction", "process_mean", "residual", "gate"],
+    )
+    for model in MEAN_MODELS:
+        if not np.allclose(
+            components[("process_mean", model)],
+            components[("process_mean", "P1")],
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("Phase B mean shared process values are incompatible")
+        if not np.allclose(
+            components[("residual", model)],
+            components[("residual", "P1")],
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("Phase B mean shared residual values are incompatible")
+    if not np.allclose(components[("gate", "P1")], 0.0, rtol=0.0, atol=1e-12) or not np.allclose(
+        components[("gate", "R1")], 1.0, rtol=0.0, atol=1e-12
+    ):
+        raise ValueError("Phase B mean gate semantics are incompatible")
+    expected_predictions = {
+        "P1": components[("process_mean", "P1")],
+        "R1": components[("process_mean", "R1")] + components[("residual", "R1")],
+        "G1": components[("process_mean", "G1")]
+        + components[("gate", "G1")] * components[("residual", "G1")],
+    }
+    for model, expected_prediction in expected_predictions.items():
+        if not np.allclose(
+            components[("prediction", model)],
+            expected_prediction,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(f"Phase B mean {model} arithmetic is incompatible")
+
+    if probability is None:
+        return
+    g1 = mean.loc[
+        mean["model"] == "G1",
+        ["sample_id", "seed", "prediction", "process_mean", "residual", "gate"],
+    ].rename(
+        columns={
+            "prediction": "g1_prediction",
+            "process_mean": "g1_process_mean",
+            "residual": "g1_residual",
+            "gate": "g1_gate",
+        }
+    )
+    linked = probability.merge(
+        g1, on=["sample_id", "seed"], how="left", validate="many_to_one"
+    )
+    expected_correction = linked["g1_gate"] * linked["g1_residual"]
+    if (
+        len(linked) != len(probability)
+        or linked["g1_prediction"].isna().any()
+        or not np.allclose(linked["mu"], linked["g1_prediction"], rtol=0.0, atol=1e-12)
+        or not np.allclose(linked["gate"], linked["g1_gate"], rtol=0.0, atol=1e-12)
+        or not np.allclose(linked["correction"], expected_correction, rtol=0.0, atol=1e-12)
+        or not np.allclose(
+            linked["correction"],
+            linked["g1_prediction"] - linked["g1_process_mean"],
+            rtol=0.0,
+            atol=1e-12,
+        )
+    ):
+        raise ValueError("Phase B probability rows do not match G1 mean arithmetic")
+
+
 def _phase_b_validate_probability_values(
     values: pd.DataFrame, *, enforce_registered_intervals: bool = False
 ) -> None:
@@ -708,6 +942,8 @@ def validate_phase_b_prediction_cartesian(
     manifest: pd.DataFrame,
     folds: pd.DataFrame,
     mean_predictions: pd.DataFrame,
+    calibration_scores: pd.DataFrame,
+    calibration_quantiles: pd.DataFrame,
 ) -> pd.DataFrame:
     """Validate the registered 586×3×2 probability and 586×3×3 OOF products."""
     probability = _validate_phase_b_schema(predictions, PHASE_B_PREDICTION_COLUMNS, label="probability")
@@ -743,6 +979,7 @@ def validate_phase_b_prediction_cartesian(
     mean_numeric = _phase_b_numeric_frame(mean, ("target_mean", "prediction", "sample_weight", "process_mean", "residual", "gate"), label="mean")
     if np.any(mean_numeric["sample_weight"] <= 0.0) or not np.all((mean_numeric["gate"] >= 0.0) & (mean_numeric["gate"] <= 1.0)):
         raise ValueError("Phase B mean weights/gates are incompatible")
+    _validate_phase_b_mean_semantics(mean, probability=probability)
     for frame, label, metadata in ((probability, "probability", ("group_id", "version", "fold", "target_mean", "ra_1", "ra_2", "ra_3", "sample_weight")), (mean, "mean", ("group_id", "version", "fold", "target_mean", "sample_weight"))):
         joined = frame.merge(expected, on="sample_id", how="left", suffixes=("", "_expected"), validate="many_to_one")
         if len(joined) != len(frame) or joined["group_id_expected"].isna().any():
@@ -755,6 +992,12 @@ def validate_phase_b_prediction_cartesian(
                 matches = np.isclose(joined[column].to_numpy(dtype=np.float64), joined[expected_column].to_numpy(dtype=np.float64), rtol=0.0, atol=1e-12)
             if not np.all(matches):
                 raise ValueError(f"Phase B {label} metadata does not match manifest/folds")
+    _validate_phase_b_calibration_artifacts(
+        calibration_scores,
+        calibration_quantiles,
+        expected=expected,
+        probability=probability,
+    )
     return probability
 
 
@@ -787,15 +1030,60 @@ def _probability_metrics(values: pd.DataFrame, interval_type: str | None = None,
     return output
 
 
+def _validate_phase_b_probability_metric_cartesian(values: pd.DataFrame) -> None:
+    sample_ids = tuple(values["sample_id"].unique())
+    expected_keys = {
+        (sample_id, seed, scale_model)
+        for sample_id in sample_ids
+        for seed in PHASE_B_SEEDS
+        for scale_model in SCALE_MODELS
+    }
+    actual_keys = set(
+        zip(values["sample_id"], values["seed"], values["scale_model"], strict=True)
+    )
+    if (
+        len(sample_ids) != 586
+        or len(values) != 3516
+        or values.duplicated(["sample_id", "seed", "scale_model"]).any()
+        or set(values["seed"]) != set(PHASE_B_SEEDS)
+        or set(values["scale_model"]) != set(SCALE_MODELS)
+        or actual_keys != expected_keys
+        or set(values["fold"]) != set(range(5))
+    ):
+        raise ValueError(
+            "Phase B probability metrics require the exact 3516-row Cartesian contract"
+        )
+    sample_metadata = (
+        "group_id",
+        "version",
+        "fold",
+        "target_mean",
+        "ra_1",
+        "ra_2",
+        "ra_3",
+        "sample_weight",
+    )
+    if values.groupby("sample_id", observed=True)[list(sample_metadata)].nunique(
+        dropna=False
+    ).gt(1).any().any():
+        raise ValueError("Phase B probability metric sample metadata is inconsistent")
+    if values.groupby("group_id", observed=True)["fold"].nunique(dropna=False).gt(1).any():
+        raise ValueError("Phase B probability metric groups cross outer folds")
+    paired_metadata = ("mu", "gate", "correction")
+    if values.groupby(["sample_id", "seed"], observed=True)[
+        list(paired_metadata)
+    ].nunique(dropna=False).gt(1).any().any():
+        raise ValueError("Phase B probability scale-model means are inconsistent")
+    _phase_b_validate_probability_values(values, enforce_registered_intervals=True)
+
+
 def probability_metric_table(predictions: pd.DataFrame) -> pd.DataFrame:
     """Calculate fold, seed, and seed-replicate-average probability metrics."""
     values = _validate_phase_b_schema(predictions, PHASE_B_PREDICTION_COLUMNS, label="probability")
     values["seed"] = _phase_b_canonical_integers(values["seed"], "seed")
     values["fold"] = _phase_b_canonical_integers(values["fold"], "fold")
     values["scale_model"] = values["scale_model"].astype(str)
-    if values.duplicated(["sample_id", "seed", "scale_model"]).any() or not set(values["scale_model"]).issubset(set(SCALE_MODELS)) or not set(values["seed"]).issubset(set(PHASE_B_SEEDS)):
-        raise ValueError("Phase B probability metrics require registered unique model/seed rows")
-    _phase_b_validate_probability_values(values)
+    _validate_phase_b_probability_metric_cartesian(values)
     rows: list[dict[str, Any]] = []
 
     def append_metrics(frame: pd.DataFrame, aggregation: str, seed: int | None, fold: int | None) -> None:
@@ -820,6 +1108,411 @@ def probability_metric_table(predictions: pd.DataFrame) -> pd.DataFrame:
         scale_model, interval_type, coverage, metric = keys
         rows.append({"aggregation": "all_seed", "seed": None, "fold": None, "scale_model": scale_model, "interval_type": interval_type, "nominal_coverage": coverage, "metric": metric, "value": float(subset["value"].mean())})
     return pd.DataFrame(rows, columns=("aggregation", "seed", "fold", "scale_model", "interval_type", "nominal_coverage", "metric", "value"))
+
+
+def _registered_phase_b_mean_rows(mean_predictions: pd.DataFrame) -> pd.DataFrame:
+    values = _validate_phase_b_schema(
+        mean_predictions, PHASE_B_MEAN_COLUMNS, label="mean evaluation"
+    )
+    values["model"] = values["model"].astype(str)
+    values["seed"] = _phase_b_canonical_integers(values["seed"], "seed")
+    values["fold"] = _phase_b_canonical_integers(values["fold"], "fold")
+    numeric_columns = (
+        "target_mean",
+        "prediction",
+        "sample_weight",
+        "process_mean",
+        "residual",
+        "gate",
+    )
+    numeric = _phase_b_numeric_frame(values, numeric_columns, label="mean evaluation")
+    values.loc[:, numeric_columns] = numeric
+    sample_ids = tuple(values["sample_id"].unique())
+    expected_keys = {
+        (sample_id, seed, model)
+        for sample_id in sample_ids
+        for seed in PHASE_B_SEEDS
+        for model in MEAN_MODELS
+    }
+    actual_keys = set(
+        zip(values["sample_id"], values["seed"], values["model"], strict=True)
+    )
+    if (
+        len(sample_ids) != 586
+        or len(values) != 5274
+        or values.duplicated(["sample_id", "seed", "model"]).any()
+        or set(values["seed"]) != set(PHASE_B_SEEDS)
+        or set(values["model"]) != set(MEAN_MODELS)
+        or set(values["fold"]) != set(range(5))
+        or actual_keys != expected_keys
+    ):
+        raise ValueError("Phase B mean evaluation requires the exact 5274-row Cartesian contract")
+    if np.any(numeric["sample_weight"] <= 0.0) or not np.all(
+        (numeric["gate"] >= 0.0) & (numeric["gate"] <= 1.0)
+    ):
+        raise ValueError("Phase B mean evaluation weights/gates are incompatible")
+    if values.groupby("sample_id", observed=True)[
+        ["group_id", "version", "fold", "target_mean", "sample_weight"]
+    ].nunique(dropna=False).gt(1).any().any():
+        raise ValueError("Phase B mean evaluation sample metadata is inconsistent")
+    if values.groupby("group_id", observed=True)["fold"].nunique(dropna=False).gt(1).any():
+        raise ValueError("Phase B mean evaluation groups cross outer folds")
+    _validate_phase_b_mean_semantics(values)
+    return values
+
+
+def phase_b_mean_metric_table(mean_predictions: pd.DataFrame) -> pd.DataFrame:
+    """Calculate registered P1/R1/G1 mean metrics with seeds as replicates."""
+    values = _registered_phase_b_mean_rows(mean_predictions)
+    rows: list[dict[str, Any]] = []
+
+    def append_metrics(
+        frame: pd.DataFrame, aggregation: str, seed: int | None, fold: int | None
+    ) -> None:
+        for model, model_rows in frame.groupby("model", sort=True, observed=True):
+            metrics = weighted_metrics(
+                model_rows["target_mean"],
+                model_rows["prediction"],
+                model_rows["sample_weight"],
+            )
+            for metric, source in (
+                ("mean_mae", "weighted_mae"),
+                ("mean_rmse", "weighted_rmse"),
+                ("mean_r2", "weighted_r2"),
+            ):
+                rows.append(
+                    {
+                        "aggregation": aggregation,
+                        "seed": seed,
+                        "fold": fold,
+                        "model": model,
+                        "metric": metric,
+                        "value": metrics[source],
+                    }
+                )
+
+    for (seed, fold), subset in values.groupby(
+        ["seed", "fold"], sort=True, observed=True
+    ):
+        append_metrics(subset, "fold", int(seed), int(fold))
+    for seed, subset in values.groupby("seed", sort=True, observed=True):
+        append_metrics(subset, "seed", int(seed), None)
+    seed_rows = pd.DataFrame(rows).loc[lambda frame: frame["aggregation"] == "seed"]
+    for (model, metric), subset in seed_rows.groupby(
+        ["model", "metric"], sort=True, observed=True
+    ):
+        rows.append(
+            {
+                "aggregation": "all_seed",
+                "seed": None,
+                "fold": None,
+                "model": model,
+                "metric": metric,
+                "value": float(subset["value"].mean()),
+            }
+        )
+    return pd.DataFrame(
+        rows, columns=("aggregation", "seed", "fold", "model", "metric", "value")
+    )
+
+
+def _phase_b_negative_transfer_for_seed(
+    values: pd.DataFrame, *, seed: int, candidate: str
+) -> NegativeTransferResult:
+    subset = values.loc[
+        (values["seed"] == seed) & values["model"].isin(("P1", candidate))
+    ]
+    baseline = subset.loc[
+        subset["model"] == "P1",
+        ["sample_id", "group_id", "target_mean", "prediction", "sample_weight"],
+    ].rename(columns={"prediction": "p1_prediction"})
+    candidate_rows = subset.loc[
+        subset["model"] == candidate,
+        ["sample_id", "group_id", "target_mean", "prediction", "sample_weight"],
+    ].rename(
+        columns={
+            "group_id": "candidate_group_id",
+            "target_mean": "candidate_target",
+            "prediction": "candidate_prediction",
+            "sample_weight": "candidate_weight",
+        }
+    )
+    paired = baseline.merge(
+        candidate_rows, on="sample_id", how="outer", validate="one_to_one", indicator=True
+    )
+    if (
+        len(paired) != 586
+        or not (paired["_merge"] == "both").all()
+        or not (paired["group_id"] == paired["candidate_group_id"]).all()
+        or not np.allclose(
+            paired["target_mean"], paired["candidate_target"], rtol=0.0, atol=1e-12
+        )
+        or not np.allclose(
+            paired["sample_weight"], paired["candidate_weight"], rtol=0.0, atol=1e-12
+        )
+    ):
+        raise ValueError("Phase B mean negative-transfer pairing is incompatible")
+    return negative_transfer(
+        pd.DataFrame(
+            {
+                "group_id": paired["group_id"],
+                "p1_abs_error": np.abs(
+                    paired["target_mean"] - paired["p1_prediction"]
+                ),
+                "candidate_abs_error": np.abs(
+                    paired["candidate_target"] - paired["candidate_prediction"]
+                ),
+                "sample_weight": paired["sample_weight"],
+            }
+        )
+    )
+
+
+def phase_b_negative_transfer_table(mean_predictions: pd.DataFrame) -> pd.DataFrame:
+    """Calculate raw and >0.01 um group transfer rates relative to P1."""
+    values = _registered_phase_b_mean_rows(mean_predictions)
+    rows: list[dict[str, Any]] = []
+    for seed in PHASE_B_SEEDS:
+        for candidate in ("R1", "G1"):
+            result = _phase_b_negative_transfer_for_seed(
+                values, seed=seed, candidate=candidate
+            )
+            rows.append(
+                {
+                    "aggregation": "seed",
+                    "seed": seed,
+                    "baseline": "P1",
+                    "candidate": candidate,
+                    **result.to_dict(),
+                    "material_margin_um": MATERIAL_MARGIN_UM,
+                }
+            )
+    seed_table = pd.DataFrame(rows)
+    for candidate, subset in seed_table.groupby("candidate", sort=True, observed=True):
+        if subset["group_count"].nunique() != 1:
+            raise ValueError("Phase B mean transfer group counts differ across seeds")
+        rows.append(
+            {
+                "aggregation": "all_seed",
+                "seed": None,
+                "baseline": "P1",
+                "candidate": candidate,
+                "raw_rate": float(subset["raw_rate"].mean()),
+                "material_rate": float(subset["material_rate"].mean()),
+                "group_count": int(subset["group_count"].iloc[0]),
+                "material_margin_um": MATERIAL_MARGIN_UM,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def paired_phase_b_mean_bootstrap(
+    mean_predictions: pd.DataFrame,
+    *,
+    candidate: str,
+    repetitions: int = BOOTSTRAP_REPETITIONS,
+    seed: int = BOOTSTRAP_SEED,
+) -> BootstrapResult:
+    """Bootstrap P1-minus-candidate weighted MAE in whole group blocks."""
+    if (
+        isinstance(repetitions, (bool, np.bool_))
+        or not isinstance(repetitions, (int, np.integer))
+        or int(repetitions) != BOOTSTRAP_REPETITIONS
+    ):
+        raise ValueError("Phase B mean bootstrap requires exactly 10000 repetitions")
+    if (
+        isinstance(seed, (bool, np.bool_))
+        or not isinstance(seed, (int, np.integer))
+        or int(seed) != BOOTSTRAP_SEED
+    ):
+        raise ValueError("Phase B mean bootstrap requires seed 20260723")
+    candidate_name = str(candidate)
+    if candidate_name not in {"R1", "G1"}:
+        raise ValueError("Phase B mean bootstrap candidate must be R1 or G1")
+    values = _registered_phase_b_mean_rows(mean_predictions)
+    baseline = values.loc[
+        values["model"] == "P1",
+        ["sample_id", "seed", "group_id", "target_mean", "prediction", "sample_weight"],
+    ].rename(columns={"prediction": "p1_prediction"})
+    candidate_rows = values.loc[
+        values["model"] == candidate_name,
+        ["sample_id", "seed", "group_id", "target_mean", "prediction", "sample_weight"],
+    ].rename(
+        columns={
+            "group_id": "candidate_group_id",
+            "target_mean": "candidate_target",
+            "prediction": "candidate_prediction",
+            "sample_weight": "candidate_weight",
+        }
+    )
+    paired = baseline.merge(
+        candidate_rows,
+        on=["sample_id", "seed"],
+        how="outer",
+        validate="one_to_one",
+        indicator=True,
+    )
+    if (
+        len(paired) != 586 * len(PHASE_B_SEEDS)
+        or not (paired["_merge"] == "both").all()
+        or not (paired["group_id"] == paired["candidate_group_id"]).all()
+        or not np.allclose(
+            paired["target_mean"], paired["candidate_target"], rtol=0.0, atol=1e-12
+        )
+        or not np.allclose(
+            paired["sample_weight"], paired["candidate_weight"], rtol=0.0, atol=1e-12
+        )
+    ):
+        raise ValueError("Phase B mean bootstrap pairing is incompatible")
+    weight = paired["sample_weight"].to_numpy(dtype=np.float64)
+    paired["p1_weighted_error"] = (
+        np.abs(paired["target_mean"] - paired["p1_prediction"]) * weight
+    )
+    paired["candidate_weighted_error"] = (
+        np.abs(paired["candidate_target"] - paired["candidate_prediction"]) * weight
+    )
+    grouped = paired.groupby("group_id", sort=True, observed=True).agg(
+        p1_error=("p1_weighted_error", "sum"),
+        candidate_error=("candidate_weighted_error", "sum"),
+        weight=("sample_weight", "sum"),
+        seed_count=("seed", "nunique"),
+    )
+    if grouped.empty or not grouped["seed_count"].eq(len(PHASE_B_SEEDS)).all():
+        raise ValueError("Phase B mean bootstrap must preserve all seeds inside each group")
+    p1_error = grouped["p1_error"].to_numpy(dtype=np.float64)
+    candidate_error = grouped["candidate_error"].to_numpy(dtype=np.float64)
+    weights = grouped["weight"].to_numpy(dtype=np.float64)
+    point = float((p1_error.sum() - candidate_error.sum()) / weights.sum())
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    group_count = len(grouped)
+    sampled = rng.integers(
+        0, group_count, size=(BOOTSTRAP_REPETITIONS, group_count)
+    )
+    draws = (
+        p1_error[sampled].sum(axis=1) - candidate_error[sampled].sum(axis=1)
+    ) / weights[sampled].sum(axis=1)
+    if not np.isfinite(point) or not np.isfinite(draws).all():
+        raise ValueError("Phase B mean bootstrap estimates must remain finite")
+    return BootstrapResult(
+        point_estimate=point,
+        lower=float(np.quantile(draws, 0.025)),
+        upper=float(np.quantile(draws, 0.975)),
+        repetitions=BOOTSTRAP_REPETITIONS,
+        resampling_unit=BOOTSTRAP_UNIT,
+        seed=BOOTSTRAP_SEED,
+    )
+
+
+def phase_b_mean_bootstrap_table(mean_predictions: pd.DataFrame) -> pd.DataFrame:
+    """Return both registered P1-versus-R1/G1 group-paired comparisons."""
+    rows = []
+    for candidate in ("R1", "G1"):
+        result = paired_phase_b_mean_bootstrap(
+            mean_predictions,
+            candidate=candidate,
+            repetitions=BOOTSTRAP_REPETITIONS,
+            seed=BOOTSTRAP_SEED,
+        )
+        rows.append(
+            {
+                "baseline": "P1",
+                "candidate": candidate,
+                "metric": "weighted_mae_improvement_um",
+                **result.to_dict(),
+                "confidence_level": 0.95,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def phase_b_gate_statistics(
+    mean_predictions: pd.DataFrame,
+    manifest: pd.DataFrame,
+    quality_features: pd.DataFrame,
+) -> pd.DataFrame:
+    """Describe G1 gates overall, by process settings, and seven quality features."""
+    values = _registered_phase_b_mean_rows(mean_predictions)
+    required_manifest = {"sample_id", "n_rpm", "fz_mm_per_tooth", "ap_mm"}
+    missing = sorted(required_manifest - set(manifest.columns))
+    if missing:
+        raise ValueError(f"Phase B gate manifest missing columns: {missing}")
+    conditions = manifest.loc[
+        :, ["sample_id", "n_rpm", "fz_mm_per_tooth", "ap_mm"]
+    ].copy()
+    if conditions["sample_id"].isna().any():
+        raise ValueError("Phase B gate manifest sample IDs must not be missing")
+    conditions["sample_id"] = conditions["sample_id"].astype(str)
+    if (
+        len(conditions) != 586
+        or conditions["sample_id"].duplicated().any()
+        or set(conditions["sample_id"]) != set(values["sample_id"])
+    ):
+        raise ValueError("Phase B gate manifest must exactly cover OOF samples")
+    condition_columns = ("n_rpm", "fz_mm_per_tooth", "ap_mm")
+    condition_numeric = _phase_b_numeric_frame(
+        conditions, condition_columns, label="gate condition"
+    )
+    conditions.loc[:, condition_columns] = condition_numeric
+
+    quality_names = tuple(f"quality_{index}" for index in range(7))
+    required_quality = {"sample_id", *quality_names}
+    missing = sorted(required_quality - set(quality_features.columns))
+    if missing:
+        raise ValueError(f"Phase B gate quality diagnostics missing columns: {missing}")
+    quality = quality_features.loc[:, ["sample_id", *quality_names]].copy()
+    if quality["sample_id"].isna().any():
+        raise ValueError("Phase B gate quality sample IDs must not be missing")
+    quality["sample_id"] = quality["sample_id"].astype(str)
+    quality_numeric = _phase_b_numeric_frame(
+        quality, quality_names, label="gate quality"
+    )
+    quality.loc[:, quality_names] = quality_numeric
+    if (
+        len(quality) != 586
+        or quality["sample_id"].duplicated().any()
+        or set(quality["sample_id"]) != set(values["sample_id"])
+    ):
+        raise ValueError("Phase B gate quality must exactly cover OOF samples")
+
+    gates = values.loc[
+        values["model"] == "G1", ["sample_id", "seed", "gate", "sample_weight"]
+    ].merge(conditions, on="sample_id", how="inner", validate="many_to_one")
+    gates = gates.merge(quality, on="sample_id", how="inner", validate="many_to_one")
+
+    def record(dimension: str, level: str, subset: pd.DataFrame) -> dict[str, Any]:
+        gate = subset["gate"].to_numpy(dtype=np.float64)
+        weight = subset["sample_weight"].to_numpy(dtype=np.float64)
+        return {
+            "dimension": dimension,
+            "level": level,
+            "prediction_count": int(len(subset)),
+            "sample_count": int(subset["sample_id"].nunique()),
+            "weight_sum": float(weight.sum()),
+            "gate_mean": float(gate.mean()),
+            "gate_weighted_mean": float(np.dot(gate, weight) / weight.sum()),
+            "gate_p05": float(np.quantile(gate, 0.05)),
+            "gate_median": float(np.median(gate)),
+            "gate_p95": float(np.quantile(gate, 0.95)),
+        }
+
+    rows = [record("overall", "all", gates)]
+    for dimension in condition_columns:
+        for level, subset in gates.groupby(
+            dimension, sort=True, dropna=False, observed=True
+        ):
+            rows.append(record(dimension, str(level), subset))
+    for dimension in quality_names:
+        quality_values = gates[dimension]
+        levels = (
+            pd.qcut(quality_values, q=4, duplicates="drop")
+            if quality_values.nunique() > 8
+            else quality_values
+        )
+        for level, subset in gates.assign(_level=levels).groupby(
+            "_level", sort=True, dropna=False, observed=True
+        ):
+            rows.append(record(dimension, str(level), subset))
+    return pd.DataFrame(rows)
 
 
 def seed_uncertainty_summary(predictions: pd.DataFrame) -> pd.DataFrame:
@@ -1165,7 +1858,12 @@ __all__ = [
     "build_acceptance_inputs",
     "negative_transfer",
     "paired_group_bootstrap",
+    "paired_phase_b_mean_bootstrap",
     "paired_probability_bootstrap",
+    "phase_b_gate_statistics",
+    "phase_b_mean_bootstrap_table",
+    "phase_b_mean_metric_table",
+    "phase_b_negative_transfer_table",
     "probability_metric_table",
     "seed_uncertainty_summary",
     "validate_phase_b_prediction_cartesian",

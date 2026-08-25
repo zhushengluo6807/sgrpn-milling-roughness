@@ -129,6 +129,20 @@ class TinyMean(SelectiveGatedModel):
         )
 
 
+class TinyNonzeroResidualMean(TinyMean):
+    def forward(self, spectrum, window_mask, process, quality):
+        output = super().forward(spectrum, window_mask, process, quality)
+        channel_summary = spectrum.mean(dim=(1, 3))
+        residual = 0.01 * (channel_summary[:, 0] + channel_summary[:, 1]) + 0.01
+        return ModelOutput(
+            prediction=output.process_mean + output.gate * residual,
+            process_mean=output.process_mean,
+            residual=residual,
+            gate=output.gate,
+            embedding=output.embedding,
+        )
+
+
 class RecordingScale(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -462,6 +476,7 @@ def _fake_mean_path(
     monkeypatch,
     calls: list[tuple[str, ...]],
     backend_calls: list[object] | None = None,
+    mean_type: type[TinyMean] = TinyMean,
 ):
     from roughness.sgrpn import phase_b_training
 
@@ -481,13 +496,13 @@ def _fake_mean_path(
         frame = indexed.loc[list(ids)].reset_index(drop=True)
         split = make_group_inner_splits(frame, 4, seed)
         shift = 0.05 * float(frame["ra_mean"].mean())
-        models = tuple(TinyMean(shift + inner * 0.001) for inner in range(4))
+        models = tuple(mean_type(shift + inner * 0.001) for inner in range(4))
         for model, (train_index, _valid_index) in zip(models, split, strict=True):
             model.checkpoint_metadata = {
                 "train_sample_ids": tuple(frame.iloc[train_index]["sample_id"].astype(str)),
                 "train_group_ids": tuple(frame.iloc[train_index]["group_id"].astype(str)),
             }
-        final = TinyMean(shift)
+        final = mean_type(shift)
         final.checkpoint_metadata = {
             "train_sample_ids": ids,
             "train_group_ids": tuple(frame["group_id"].astype(str)),
@@ -755,7 +770,7 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
 
     config, phase_a, handoff, bundle, cache = _fixture(tmp_path)
     fixture_hash = _phase_a_fixture_hash(phase_a, handoff, bundle, cache)
-    _fake_mean_path(monkeypatch, [])
+    _fake_mean_path(monkeypatch, [], mean_type=TinyNonzeroResidualMean)
     first = run_phase_b_fold(
         config,
         handoff,
@@ -777,7 +792,7 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
     changed_fixture_hash = _phase_a_fixture_hash(
         phase_a, handoff, changed_bundle, cache
     )
-    _fake_mean_path(monkeypatch, [])
+    _fake_mean_path(monkeypatch, [], mean_type=TinyNonzeroResidualMean)
     second = run_phase_b_fold(
         changed_config,
         handoff,
@@ -839,6 +854,18 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
         + mean_predictions["gate"] * mean_predictions["residual"]
     )
     np.testing.assert_allclose(mean_predictions["prediction"], reconstructed)
+    components = mean_predictions.pivot(
+        index="sample_id", columns="model", values=["process_mean", "residual", "gate"]
+    )
+    for model in ("R1", "G1"):
+        np.testing.assert_allclose(
+            components[("process_mean", model)], components[("process_mean", "P1")]
+        )
+        np.testing.assert_allclose(
+            components[("residual", model)], components[("residual", "P1")]
+        )
+    np.testing.assert_allclose(components[("gate", "P1")], 0.0)
+    np.testing.assert_allclose(components[("gate", "R1")], 1.0)
     g1 = mean_predictions.query("model == 'G1'").set_index("sample_id")
     probability = first.predictions.set_index("sample_id")
     np.testing.assert_allclose(
