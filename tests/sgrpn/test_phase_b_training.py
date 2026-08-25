@@ -85,6 +85,7 @@ EXPECTED_PHASE_B_MEAN_COLUMNS = (
     "process_mean",
     "residual",
     "gate",
+    "correction",
 )
 
 EXPECTED_CALIBRATION_SCORE_COLUMNS = (
@@ -851,7 +852,7 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
     ).all()
     reconstructed = (
         mean_predictions["process_mean"]
-        + mean_predictions["gate"] * mean_predictions["residual"]
+        + mean_predictions["correction"]
     )
     np.testing.assert_allclose(mean_predictions["prediction"], reconstructed)
     components = mean_predictions.pivot(
@@ -866,11 +867,16 @@ def test_one_fold_builds_exact_rows_without_outer_test_label_access(
         )
     np.testing.assert_allclose(components[("gate", "P1")], 0.0)
     np.testing.assert_allclose(components[("gate", "R1")], 1.0)
+    corrections = mean_predictions.pivot(
+        index="sample_id", columns="model", values="correction"
+    )
+    np.testing.assert_allclose(corrections["P1"], 0.0)
+    np.testing.assert_allclose(corrections["R1"], components[("residual", "R1")])
     g1 = mean_predictions.query("model == 'G1'").set_index("sample_id")
     probability = first.predictions.set_index("sample_id")
     np.testing.assert_allclose(
         probability["correction"],
-        probability.index.map(g1["prediction"] - g1["process_mean"]),
+        probability.index.map(g1["correction"]),
     )
     np.testing.assert_allclose(probability["gate"], probability.index.map(g1["gate"]))
 
@@ -1427,6 +1433,7 @@ def _orchestration_fold_artifact(
                     "process_mean": 0.4,
                     "residual": 0.2,
                     "gate": 0.5,
+                    "correction": 0.1,
                 }
             )
     predictions = pd.DataFrame(probability_rows, columns=PHASE_B_PREDICTION_COLUMNS)

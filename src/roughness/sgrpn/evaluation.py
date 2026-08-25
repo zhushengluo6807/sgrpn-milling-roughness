@@ -837,7 +837,7 @@ def _validate_phase_b_mean_semantics(
     components = mean.pivot(
         index=["sample_id", "seed"],
         columns="model",
-        values=["prediction", "process_mean", "residual", "gate"],
+        values=["prediction", "process_mean", "residual", "gate", "correction"],
     )
     for model in MEAN_MODELS:
         if not np.allclose(
@@ -858,18 +858,30 @@ def _validate_phase_b_mean_semantics(
         components[("gate", "R1")], 1.0, rtol=0.0, atol=1e-12
     ):
         raise ValueError("Phase B mean gate semantics are incompatible")
+    if not np.allclose(
+        components[("correction", "P1")], 0.0, rtol=0.0, atol=1e-12
+    ) or not np.allclose(
+        components[("correction", "R1")],
+        components[("residual", "R1")],
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("Phase B mean P1/R1 correction semantics are incompatible")
     expected_predictions = {
-        "P1": components[("process_mean", "P1")],
-        "R1": components[("process_mean", "R1")] + components[("residual", "R1")],
+        "P1": components[("process_mean", "P1")]
+        + components[("correction", "P1")],
+        "R1": components[("process_mean", "R1")]
+        + components[("correction", "R1")],
         "G1": components[("process_mean", "G1")]
-        + components[("gate", "G1")] * components[("residual", "G1")],
+        + components[("correction", "G1")],
     }
     for model, expected_prediction in expected_predictions.items():
+        rtol, atol = (1e-6, 1e-7) if model == "G1" else (0.0, 1e-12)
         if not np.allclose(
             components[("prediction", model)],
             expected_prediction,
-            rtol=0.0,
-            atol=1e-12,
+            rtol=rtol,
+            atol=atol,
         ):
             raise ValueError(f"Phase B mean {model} arithmetic is incompatible")
 
@@ -877,30 +889,28 @@ def _validate_phase_b_mean_semantics(
         return
     g1 = mean.loc[
         mean["model"] == "G1",
-        ["sample_id", "seed", "prediction", "process_mean", "residual", "gate"],
+        ["sample_id", "seed", "prediction", "process_mean", "gate", "correction"],
     ].rename(
         columns={
             "prediction": "g1_prediction",
             "process_mean": "g1_process_mean",
-            "residual": "g1_residual",
             "gate": "g1_gate",
+            "correction": "g1_correction",
         }
     )
     linked = probability.merge(
         g1, on=["sample_id", "seed"], how="left", validate="many_to_one"
     )
-    expected_correction = linked["g1_gate"] * linked["g1_residual"]
     if (
         len(linked) != len(probability)
         or linked["g1_prediction"].isna().any()
         or not np.allclose(linked["mu"], linked["g1_prediction"], rtol=0.0, atol=1e-12)
         or not np.allclose(linked["gate"], linked["g1_gate"], rtol=0.0, atol=1e-12)
-        or not np.allclose(linked["correction"], expected_correction, rtol=0.0, atol=1e-12)
         or not np.allclose(
             linked["correction"],
-            linked["g1_prediction"] - linked["g1_process_mean"],
-            rtol=0.0,
-            atol=1e-12,
+            linked["g1_correction"],
+            rtol=1e-6,
+            atol=1e-7,
         )
     ):
         raise ValueError("Phase B probability rows do not match G1 mean arithmetic")
@@ -976,7 +986,7 @@ def validate_phase_b_prediction_cartesian(
     if set(zip(probability["sample_id"], probability["seed"], probability["scale_model"], strict=True)) != expected_probability or set(zip(mean["sample_id"], mean["seed"], mean["model"], strict=True)) != expected_mean:
         raise ValueError("Phase B OOF Cartesian coverage is incomplete")
     _phase_b_validate_probability_values(probability, enforce_registered_intervals=True)
-    mean_numeric = _phase_b_numeric_frame(mean, ("target_mean", "prediction", "sample_weight", "process_mean", "residual", "gate"), label="mean")
+    mean_numeric = _phase_b_numeric_frame(mean, ("target_mean", "prediction", "sample_weight", "process_mean", "residual", "gate", "correction"), label="mean")
     if np.any(mean_numeric["sample_weight"] <= 0.0) or not np.all((mean_numeric["gate"] >= 0.0) & (mean_numeric["gate"] <= 1.0)):
         raise ValueError("Phase B mean weights/gates are incompatible")
     _validate_phase_b_mean_semantics(mean, probability=probability)
@@ -1124,6 +1134,7 @@ def _registered_phase_b_mean_rows(mean_predictions: pd.DataFrame) -> pd.DataFram
         "process_mean",
         "residual",
         "gate",
+        "correction",
     )
     numeric = _phase_b_numeric_frame(values, numeric_columns, label="mean evaluation")
     values.loc[:, numeric_columns] = numeric

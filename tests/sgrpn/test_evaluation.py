@@ -3,6 +3,8 @@ import pandas as pd
 import pytest
 import inspect
 import math
+import torch
+from torch import nn
 
 import roughness.sgrpn.evaluation as evaluation
 
@@ -22,6 +24,12 @@ from roughness.sgrpn.evaluation import (
     validate_phase_b_prediction_cartesian,
     validate_prediction_cartesian,
     weighted_metrics,
+)
+from roughness.sgrpn.dataset import swap_horizontal
+from roughness.sgrpn.models import (
+    ModelOutput,
+    SelectiveGatedModel,
+    average_swap_predictions,
 )
 from roughness.sgrpn.phase_b_training import (
     MEAN_MODELS,
@@ -628,11 +636,26 @@ def _phase_b_fixture(sample_count=586):
                 )
             for model in MEAN_MODELS:
                 if model == "P1":
-                    prediction, model_residual, model_gate = process_mean, residual, 0.0
+                    prediction, model_residual, model_gate, correction = (
+                        process_mean,
+                        residual,
+                        0.0,
+                        0.0,
+                    )
                 elif model == "R1":
-                    prediction, model_residual, model_gate = process_mean + residual, residual, 1.0
+                    prediction, model_residual, model_gate, correction = (
+                        process_mean + residual,
+                        residual,
+                        1.0,
+                        residual,
+                    )
                 else:
-                    prediction, model_residual, model_gate = mu, residual, gate
+                    prediction, model_residual, model_gate, correction = (
+                        mu,
+                        residual,
+                        gate,
+                        mu - process_mean,
+                    )
                 mean_rows.append(
                     {
                         "sample_id": sample_id,
@@ -647,6 +670,7 @@ def _phase_b_fixture(sample_count=586):
                         "process_mean": process_mean,
                         "residual": model_residual,
                         "gate": model_gate,
+                        "correction": correction,
                     }
                 )
     return (
@@ -790,6 +814,116 @@ def test_phase_b_cartesian_validation_enforces_registered_probability_and_mean_r
         )
 
 
+def test_phase_b_validator_accepts_real_noninvariant_swap_correction_with_float32_rounding():
+    class ConstantProcess(nn.Module):
+        def forward(self, process):
+            return torch.full_like(process[:, 0], 0.1)
+
+    class OrientationResidual(nn.Module):
+        def forward(self, spectrum, window_mask):
+            del window_mask
+            orientation = spectrum[:, :, 0].mean(dim=(1, 2))
+            residual = 4.0 * orientation - 2.0
+            embedding = torch.zeros(
+                orientation.shape[0], 64, dtype=orientation.dtype
+            )
+            embedding[:, 0] = orientation
+            return ModelOutput(
+                prediction=residual,
+                residual=residual,
+                embedding=embedding,
+            )
+
+    class OrientationGate(nn.Module):
+        def forward(self, gate_input):
+            return gate_input[:, 9:10]
+
+    model = SelectiveGatedModel()
+    model.process_expert = ConstantProcess()
+    model.residual_expert = OrientationResidual()
+    model.gate = OrientationGate()
+    model.eval()
+    batch = {
+        "spectrum": torch.zeros(1, 1, 3, 361, dtype=torch.float32),
+        "window_mask": torch.ones(1, 1, dtype=torch.bool),
+        "process": torch.zeros(1, 9, dtype=torch.float32),
+        "quality": torch.zeros(1, 7, dtype=torch.float32),
+        "target": torch.zeros(1, dtype=torch.float32),
+        "sample_weight": torch.ones(1, dtype=torch.float32),
+        "sample_id": ["s000"],
+        "group_id": ["g000"],
+    }
+    batch["spectrum"][:, :, 0] = 1.0
+
+    original = model(
+        batch["spectrum"], batch["window_mask"], batch["process"], batch["quality"]
+    )
+    swapped_batch = swap_horizontal(batch)
+    swapped = model(
+        swapped_batch["spectrum"],
+        swapped_batch["window_mask"],
+        swapped_batch["process"],
+        swapped_batch["quality"],
+    )
+    averaged = average_swap_predictions(model, batch)
+    assert averaged.process_mean is not None
+    assert averaged.residual is not None
+    assert averaged.gate is not None
+    actual_correction = (
+        original.gate * original.residual + swapped.gate * swapped.residual
+    ) / 2.0
+    descriptive_product = averaged.gate * averaged.residual
+    torch.testing.assert_close(actual_correction, torch.tensor([1.0]))
+    torch.testing.assert_close(descriptive_product, torch.tensor([0.0]))
+    assert float(averaged.prediction) != float(averaged.process_mean) + float(
+        actual_correction
+    )
+
+    manifest, folds, probability, mean = _phase_b_fixture()
+    probability_mask = (probability["sample_id"] == "s000") & (
+        probability["seed"] == PHASE_B_SEEDS[0]
+    )
+    mu = float(averaged.prediction)
+    process_mean = float(averaged.process_mean)
+    gate = float(averaged.gate)
+    residual = float(averaged.residual)
+    correction = float(actual_correction)
+    probability.loc[
+        probability_mask, ["mu", "gate", "correction"]
+    ] = [mu, gate, correction]
+    for suffix, multiplier in (("90", 1.6448536269514722), ("95", 1.959963984540054)):
+        sigma = probability.loc[probability_mask, "sigma"]
+        probability.loc[probability_mask, f"raw_lower_{suffix}"] = mu - multiplier * sigma
+        probability.loc[probability_mask, f"raw_upper_{suffix}"] = mu + multiplier * sigma
+        quantile = {"90": 2.0, "95": 2.5}[suffix]
+        probability.loc[probability_mask, f"conformal_lower_{suffix}"] = mu - quantile * sigma
+        probability.loc[probability_mask, f"conformal_upper_{suffix}"] = mu + quantile * sigma
+
+    mean_mask = (mean["sample_id"] == "s000") & (
+        mean["seed"] == PHASE_B_SEEDS[0]
+    )
+    mean.loc[mean_mask, ["process_mean", "residual"]] = [process_mean, residual]
+    for model_name, prediction, model_gate, model_correction in (
+        ("P1", process_mean, 0.0, 0.0),
+        ("R1", process_mean + residual, 1.0, residual),
+        ("G1", mu, gate, correction),
+    ):
+        row_mask = mean_mask & (mean["model"] == model_name)
+        mean.loc[row_mask, ["prediction", "gate"]] = [prediction, model_gate]
+        if "correction" in mean.columns:
+            mean.loc[row_mask, "correction"] = model_correction
+
+    scores, quantiles = _phase_b_calibration_fixture(manifest, folds)
+    validate_phase_b_prediction_cartesian(
+        probability,
+        manifest=manifest,
+        folds=folds,
+        mean_predictions=mean,
+        calibration_scores=scores,
+        calibration_quantiles=quantiles,
+    )
+
+
 def test_phase_b_validator_consumes_scores_and_recomputes_persisted_quantiles():
     manifest, folds, probability, mean = _phase_b_fixture()
     scores, quantiles = _phase_b_calibration_fixture(manifest, folds)
@@ -865,6 +999,9 @@ def test_phase_b_validator_consumes_scores_and_recomputes_persisted_quantiles():
         ("P1", "residual", 0.1, "shared residual"),
         ("P1", "gate", 0.1, "gate semantics"),
         ("R1", "gate", -0.1, "gate semantics"),
+        ("P1", "correction", 0.1, "P1/R1 correction"),
+        ("R1", "correction", 0.1, "P1/R1 correction"),
+        ("G1", "correction", 0.1, "G1"),
     ],
 )
 def test_phase_b_mean_arithmetic_rejects_targeted_corruption(

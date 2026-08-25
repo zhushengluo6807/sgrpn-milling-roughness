@@ -100,6 +100,7 @@ PHASE_B_MEAN_COLUMNS = (
     "process_mean",
     "residual",
     "gate",
+    "correction",
 )
 
 PHASE_B_PREDICTION_COLUMNS = (
@@ -976,22 +977,37 @@ def _outer_inference(
             prediction = output.prediction.detach().cpu().numpy().astype(
                 np.float64, copy=False
             )
+            correction = prediction - process_mean
             if not np.isfinite(
-                np.column_stack((process_mean, residual, gate, prediction))
+                np.column_stack(
+                    (process_mean, residual, gate, correction, prediction)
+                )
             ).all():
                 raise ValueError("final mean predictions must be finite")
             zeros = np.zeros(len(prediction), dtype=np.float64)
             ones = np.ones(len(prediction), dtype=np.float64)
             values = {
-                "P1": (process_mean, process_mean, residual, zeros),
-                "R1": (process_mean + residual, process_mean, residual, ones),
-                "G1": (prediction, process_mean, residual, gate),
+                "P1": (process_mean, process_mean, residual, zeros, zeros),
+                "R1": (
+                    process_mean + residual,
+                    process_mean,
+                    residual,
+                    ones,
+                    residual,
+                ),
+                "G1": (prediction, process_mean, residual, gate, correction),
             }
             weights = batch["sample_weight"].detach().cpu().numpy().astype(
                 np.float64, copy=False
             )
             for model_name, components in values.items():
-                model_prediction, model_process, model_residual, model_gate = components
+                (
+                    model_prediction,
+                    model_process,
+                    model_residual,
+                    model_gate,
+                    model_correction,
+                ) = components
                 mean_rows.extend(
                     {
                         "sample_id": str(batch["sample_id"][index]),
@@ -1004,12 +1020,12 @@ def _outer_inference(
                         "process_mean": float(model_process[index]),
                         "residual": float(model_residual[index]),
                         "gate": float(model_gate[index]),
+                        "correction": float(model_correction[index]),
                     }
                     for index in range(len(prediction))
                 )
             features = build_scale_features(output, batch["process"], batch["quality"])
             mu = prediction
-            correction = prediction - process_mean
             for scale_name in SCALE_MODELS:
                 scale_values = scale_models[scale_name](features).detach().cpu().numpy().astype(np.float64, copy=False)
                 if not np.isfinite(scale_values).all() or np.any(scale_values <= 0.0):
