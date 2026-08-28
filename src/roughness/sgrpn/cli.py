@@ -1,9 +1,9 @@
-"""Command-line orchestration for SGRPN Phase A only."""
+"""Command-line orchestration for immutable SGRPN Phase A and Phase B runs."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 from importlib.metadata import PackageNotFoundError, version as package_version
 import json
@@ -18,7 +18,16 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .config import SGRPNConfig, config_fingerprint, load_sgrpn_config
+from .config import (
+    PhaseAHandoff,
+    PhaseBConfig,
+    SGRPNConfig,
+    config_fingerprint,
+    load_phase_b_config,
+    load_sgrpn_config,
+    validate_phase_b_handoff,
+    validate_phase_b_output_root,
+)
 from .data import load_data_bundle
 from .evaluation import PREDICTION_COLUMNS, validate_prediction_cartesian
 from .order_spectrum import (
@@ -26,7 +35,14 @@ from .order_spectrum import (
     load_order_cache,
     save_order_cache,
 )
-from .reporting import write_phase_a_report
+from .reporting import (
+    _phase_b_flatten_quantiles,
+    _phase_b_saved_fold_inputs,
+    validate_phase_b_outputs,
+    write_phase_a_report,
+    write_phase_b_report,
+)
+from .phase_b_training import run_phase_b, run_phase_b_fold
 from .training import (
     MODEL_SEQUENCE,
     RunFingerprint,
@@ -515,6 +531,114 @@ def _evaluate(config: SGRPNConfig) -> None:
     print(json.dumps(acceptance, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _preflight_phase_b(config: PhaseBConfig) -> tuple[PhaseAHandoff, SGRPNConfig, Any, Any]:
+    """Validate immutable prerequisites before touching the Phase B output tree."""
+    handoff = validate_phase_b_handoff(config)
+    phase_a_config = load_sgrpn_config(config.phase_a_config_path)
+    bundle = load_data_bundle(phase_a_config)
+    cache = load_order_cache(bundle, phase_a_config)
+    bundle.manifest.attrs["quality_features"] = pd.DataFrame(
+        {
+            "sample_id": tuple(cache.segment_ids),
+            **{
+                f"quality_{index}": cache.quality[:, index]
+                for index in range(cache.quality.shape[1])
+            },
+        }
+    )
+    return handoff, phase_a_config, bundle, cache
+
+
+def _train_phase_b(
+    config: PhaseBConfig,
+    context: tuple[PhaseAHandoff, SGRPNConfig, Any, Any],
+    *,
+    fold: int | None = None,
+    seed: int | None = None,
+    device: str = "auto",
+    resume: bool = False,
+) -> None:
+    del resume  # The fold runner itself only reuses deeply valid completed artifacts.
+    handoff, phase_a_config, bundle, cache = context
+    output = validate_phase_b_output_root(config.output_dir)
+    if fold is not None and fold not in range(5):
+        raise ValueError("Phase B fold must be one of 0,1,2,3,4")
+    if seed is not None and seed not in tuple(config.seeds):
+        raise ValueError("Phase B seed must be one of the three registered seeds")
+    selected = _selected_device(device)
+    output.mkdir(parents=True, exist_ok=True)
+    if fold is None:
+        run_phase_b(
+            config,
+            handoff,
+            phase_a_config,
+            bundle,
+            cache,
+            device=selected,
+            output_root=output,
+        )
+    else:
+        run_phase_b_fold(
+            config,
+            handoff,
+            phase_a_config,
+            bundle,
+            cache,
+            fold,
+            config.seeds[0] if seed is None else seed,
+            device=selected,
+            output_root=output,
+        )
+    manifest_path = output / "run_manifest.json"
+    manifest = _read_json(manifest_path, "Phase B run manifest") if manifest_path.is_file() else {}
+    recorded = manifest.get("selected_device_by_fold_seed", {})
+    if not isinstance(recorded, dict):
+        raise ValueError("Phase B run manifest device records are incompatible")
+    trained_keys = (
+        [f"fold_{outer_fold}/seed_{outer_seed}" for outer_fold in range(5) for outer_seed in config.seeds]
+        if fold is None
+        else [f"fold_{fold}/seed_{config.seeds[0] if seed is None else seed}"]
+    )
+    manifest.update(
+        {
+            "schema_version": "sgrpn-phase-b-run-v1",
+            "training_status": "complete" if fold is None else "partial",
+            "selected_device_by_fold_seed": {
+                **{str(key): str(value) for key, value in recorded.items()},
+                **{key: selected for key in trained_keys},
+            },
+        }
+    )
+    _atomic_json(manifest_path, manifest)
+    print(json.dumps({"training_status": "complete" if fold is None else "partial", "fold": fold, "seed": seed, "device": selected}))
+
+
+def _evaluate_phase_b(
+    config: PhaseBConfig, context: tuple[PhaseAHandoff, SGRPNConfig, Any, Any]
+) -> None:
+    handoff, _phase_a_config, bundle, _cache = context
+    output = validate_phase_b_output_root(config.output_dir)
+    if not output.is_dir():
+        raise ValueError("Phase B output root is missing; training must complete before evaluation")
+    probability, mean, scores, _inner = _phase_b_saved_fold_inputs(config, handoff, bundle)
+    quantiles = _phase_b_flatten_quantiles(output)
+    written = write_phase_b_report(
+        config, handoff, bundle, mean, probability, scores, quantiles
+    )
+    print(json.dumps(_read_json(written["claim_decision"], "Phase B claim decision"), ensure_ascii=False, sort_keys=True))
+
+
+def _phase_b_evaluation_complete(config: PhaseBConfig) -> bool:
+    output = validate_phase_b_output_root(config.output_dir)
+    path = output / "run_manifest.json"
+    if not path.is_file():
+        return False
+    try:
+        return _read_json(path, "Phase B run manifest").get("evaluation_status") == "complete"
+    except ValueError:
+        return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="roughness-sgrpn")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -530,31 +654,70 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", required=True)
     run.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     run.add_argument("--resume", action="store_true")
+    preflight_b = subparsers.add_parser("preflight-phase-b")
+    preflight_b.add_argument("--config", required=True)
+    train_b = subparsers.add_parser("train-phase-b")
+    train_b.add_argument("--config", required=True)
+    train_b.add_argument("--fold", type=int, choices=range(5))
+    train_b.add_argument("--seed", type=int, choices=(20260723, 20260724, 20260725))
+    train_b.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    train_b.add_argument("--resume", action="store_true")
+    evaluate_b = subparsers.add_parser("evaluate-phase-b")
+    evaluate_b.add_argument("--config", required=True)
+    run_b = subparsers.add_parser("run-phase-b")
+    run_b.add_argument("--config", required=True)
+    run_b.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    run_b.add_argument("--resume", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        config = load_sgrpn_config(args.config)
-        if args.command == "audit":
-            _audit(config)
-        elif args.command == "features":
-            _features(config)
-        elif args.command == "train-phase-a":
-            _train(
-                config,
-                fold=args.fold,
-                device=args.device,
-                resume=args.resume,
-            )
-        elif args.command == "evaluate-phase-a":
-            _evaluate(config)
-        elif args.command == "run-phase-a":
-            _audit(config)
-            _features(config)
-            _train(config, device=args.device, resume=args.resume)
-            _evaluate(config)
+        if args.command.endswith("phase-b"):
+            config = load_phase_b_config(args.config)
+            context = _preflight_phase_b(config)
+            if args.command == "preflight-phase-b":
+                handoff = context[0]
+                print(json.dumps(asdict(handoff), ensure_ascii=False, sort_keys=True))
+            elif args.command == "train-phase-b":
+                _train_phase_b(
+                    config,
+                    context,
+                    fold=args.fold,
+                    seed=args.seed,
+                    device=args.device,
+                    resume=args.resume,
+                )
+            elif args.command == "evaluate-phase-b":
+                _evaluate_phase_b(config, context)
+            elif args.command == "run-phase-b":
+                if args.resume and _phase_b_evaluation_complete(config):
+                    validate_phase_b_outputs(config)
+                else:
+                    _train_phase_b(config, context, device=args.device, resume=args.resume)
+                    _evaluate_phase_b(config, context)
+                    validate_phase_b_outputs(config)
+        else:
+            config = load_sgrpn_config(args.config)
+            if args.command == "audit":
+                _audit(config)
+            elif args.command == "features":
+                _features(config)
+            elif args.command == "train-phase-a":
+                _train(
+                    config,
+                    fold=args.fold,
+                    device=args.device,
+                    resume=args.resume,
+                )
+            elif args.command == "evaluate-phase-a":
+                _evaluate(config)
+            elif args.command == "run-phase-a":
+                _audit(config)
+                _features(config)
+                _train(config, device=args.device, resume=args.resume)
+                _evaluate(config)
         return 0
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

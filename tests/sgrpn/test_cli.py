@@ -14,14 +14,33 @@ from roughness.sgrpn.reporting import _atomic_csv
 from roughness.sgrpn.training import MODEL_SEQUENCE, RunFingerprint
 
 
-def test_parser_exposes_only_registered_phase_a_commands():
+def test_parser_exposes_registered_phase_a_and_phase_b_commands():
     parser = cli.build_parser()
     choices = parser._subparsers._group_actions[0].choices
-    assert set(choices) == {"audit", "features", "train-phase-a", "evaluate-phase-a", "run-phase-a"}
+    assert set(choices) == {
+        "audit",
+        "features",
+        "train-phase-a",
+        "evaluate-phase-a",
+        "run-phase-a",
+        "preflight-phase-b",
+        "train-phase-b",
+        "evaluate-phase-b",
+        "run-phase-b",
+    }
     train = parser.parse_args(["train-phase-a", "--config", "x.yaml", "--fold", "0", "--device", "auto", "--resume"])
     assert train.fold == 0
     assert train.device == "auto"
     assert train.resume is True
+    phase_b = parser.parse_args(
+        ["train-phase-b", "--config", "x.yaml", "--fold", "0", "--seed", "20260723", "--device", "auto", "--resume"]
+    )
+    assert (phase_b.fold, phase_b.seed, phase_b.device, phase_b.resume) == (
+        0,
+        20260723,
+        "auto",
+        True,
+    )
 
 
 def test_evaluate_never_calls_training(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -508,3 +527,89 @@ def test_formal_loader_rejects_rehashed_malformed_full_cache_before_marker_trust
     with pytest.raises(ValueError, match="cache|spectr|offset|duration|binding"):
         cli.load_formal_phase_a_predictions(config, output_root=config.output_dir)
     assert marker_reads == []
+
+
+@pytest.mark.parametrize("command", ("train-phase-b", "evaluate-phase-b", "run-phase-b"))
+def test_phase_b_gate_runs_before_any_output_root_creation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+):
+    output = tmp_path / "outputs" / "sgrpn" / "phase_b"
+    config = SimpleNamespace(output_dir=output)
+    events: list[str] = []
+    monkeypatch.setattr(cli, "load_phase_b_config", lambda path: config)
+
+    def closed_gate(value):
+        events.append("preflight")
+        raise ValueError("Phase A gate is closed")
+
+    monkeypatch.setattr(cli, "_preflight_phase_b", closed_gate)
+    monkeypatch.setattr(
+        cli,
+        "_train_phase_b",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("trained")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_phase_b",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("evaluated")),
+    )
+
+    assert cli.main([command, "--config", "phase-b.yaml"]) != 0
+    assert events == ["preflight"]
+    assert not output.exists()
+
+
+def test_phase_b_run_orders_preflight_train_evaluate_then_deep_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    config = SimpleNamespace(output_dir=tmp_path / "outputs" / "sgrpn" / "phase_b")
+    events: list[str] = []
+    monkeypatch.setattr(cli, "load_phase_b_config", lambda path: config)
+    monkeypatch.setattr(cli, "_preflight_phase_b", lambda value: events.append("preflight") or object())
+    monkeypatch.setattr(cli, "_phase_b_evaluation_complete", lambda value: False)
+    monkeypatch.setattr(
+        cli,
+        "_train_phase_b",
+        lambda value, context, **kwargs: events.append("train"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_phase_b",
+        lambda value, context: events.append("evaluate"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "validate_phase_b_outputs",
+        lambda value: events.append("validate"),
+    )
+
+    assert cli.main(["run-phase-b", "--config", "phase-b.yaml", "--device", "cpu"]) == 0
+    assert events == ["preflight", "train", "evaluate", "validate"]
+
+
+def test_phase_b_resume_of_completed_evaluation_only_deep_validates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    config = SimpleNamespace(output_dir=tmp_path / "outputs" / "sgrpn" / "phase_b")
+    events: list[str] = []
+    monkeypatch.setattr(cli, "load_phase_b_config", lambda path: config)
+    monkeypatch.setattr(cli, "_preflight_phase_b", lambda value: events.append("preflight") or object())
+    monkeypatch.setattr(cli, "_phase_b_evaluation_complete", lambda value: True)
+    monkeypatch.setattr(
+        cli,
+        "_train_phase_b",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("trained")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_evaluate_phase_b",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("evaluated")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "validate_phase_b_outputs",
+        lambda value: events.append("validate"),
+    )
+
+    assert cli.main(["run-phase-b", "--config", "phase-b.yaml", "--resume"]) == 0
+    assert events == ["preflight", "validate"]

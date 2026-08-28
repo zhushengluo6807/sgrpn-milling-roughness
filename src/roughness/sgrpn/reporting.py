@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import platform
 import sys
-from typing import Any
+from typing import Any, Mapping
 import uuid
 
 _matplotlib_cache = Path.cwd() / ".cache" / "matplotlib"
@@ -36,6 +36,33 @@ from .evaluation import (
     paired_group_bootstrap,
     validate_prediction_cartesian,
     weighted_metrics,
+    assess_phase_b_claims,
+    paired_probability_bootstrap,
+    phase_b_gate_statistics,
+    phase_b_mean_bootstrap_table,
+    phase_b_mean_metric_table,
+    phase_b_negative_transfer_table,
+    probability_metric_table,
+    seed_uncertainty_summary,
+    validate_phase_b_prediction_cartesian,
+)
+from .config import (
+    PhaseAHandoff,
+    PhaseBConfig,
+    load_sgrpn_config,
+    validate_phase_b_handoff,
+    validate_phase_b_output_root,
+)
+from .data import DataBundle, load_data_bundle
+from .phase_b_training import (
+    CALIBRATION_SCORE_COLUMNS,
+    MEAN_MODELS,
+    PHASE_B_MEAN_COLUMNS,
+    PHASE_B_PROTOCOL,
+    PHASE_B_PREDICTION_COLUMNS,
+    SCALE_MODELS,
+    _load_completed_phase_b_fold,
+    _phase_b_fingerprint,
 )
 from .training import validate_phase_a_output_root
 
@@ -666,4 +693,740 @@ def write_phase_a_report(
     return written
 
 
-__all__ = ["write_phase_a_report"]
+_PHASE_B_QUANTILE_COLUMNS = (
+    "fold",
+    "seed",
+    "scale_model",
+    "alpha",
+    "group_count",
+    "order_index",
+    "quantile",
+)
+
+_PHASE_B_METHOD_NOTES = {
+    "three_readings_one_region": True,
+    "probability_loss_preserves_region_weight": True,
+    "sigma_interpretation": "sigma combines repeat dispersion and unmodeled error",
+    "variance_limitations": "no Gauge R&R or variance-source decomposition",
+    "seed_spread": "seed spread is descriptive instability only",
+    "version_input": "version is excluded from inputs",
+    "composite_domain_stress_test": "v3/v4 is a composite-domain stress test confounded with speed",
+    "orientation": "Ch9/Ch10 orientation is unresolved",
+    "coverage_scope": "coverage applies only to exchangeable new groups of existing type",
+    "practical_width_threshold_registered": False,
+    "outer_result_design_change": "no outer result changed the design",
+}
+
+
+def _phase_b_frame(path: Path, *, string_columns: tuple[str, ...]) -> pd.DataFrame:
+    if not path.is_file():
+        raise ValueError(f"Phase B report artifact is missing: {path}")
+    try:
+        return pd.read_csv(path, dtype={column: str for column in string_columns}, float_precision="round_trip")
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Phase B report artifact is unreadable: {path}") from error
+
+
+def _phase_b_json(path: Path, name: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Phase B {name} is missing or invalid") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"Phase B {name} must be a JSON object")
+    return payload
+
+
+def _phase_b_config_hash(config: PhaseBConfig) -> str:
+    payload = json.dumps(_jsonable(asdict(config)), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _phase_b_hash_tree(root: Path) -> dict[str, str]:
+    """Return a deterministic byte-level inventory without following links."""
+    resolved = root.resolve()
+    if not resolved.exists():
+        return {}
+    if not resolved.is_dir() or resolved.is_symlink():
+        raise ValueError(f"immutable input root is not a regular directory: {resolved}")
+    hashes: dict[str, str] = {}
+    for path in sorted(resolved.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"immutable input tree contains a link: {path}")
+        if path.is_file():
+            hashes[path.relative_to(resolved).as_posix()] = _sha256(path)
+    return hashes
+
+
+def _phase_b_immutable_roots(config: PhaseBConfig) -> dict[str, Path]:
+    phase_a_root = Path(config.phase_a_run_manifest_path).resolve().parent
+    project_root = Path(config.phase_a_config_path).resolve().parents[1]
+    return {
+        "phase_a": phase_a_root,
+        "scheme1": project_root / "outputs" / "scheme1",
+        "scheme1_physics": project_root / "outputs" / "scheme1_physics",
+    }
+
+
+def _phase_b_immutable_hashes(config: PhaseBConfig) -> dict[str, dict[str, str]]:
+    return {
+        name: _phase_b_hash_tree(path)
+        for name, path in _phase_b_immutable_roots(config).items()
+    }
+
+
+def _phase_b_quality_features(config: PhaseBConfig, bundle: DataBundle) -> pd.DataFrame:
+    provided = bundle.manifest.attrs.get("quality_features")
+    if isinstance(provided, pd.DataFrame):
+        return provided.copy()
+    from .order_spectrum import load_order_cache
+
+    phase_a = load_sgrpn_config(config.phase_a_config_path)
+    cache = load_order_cache(bundle, phase_a)
+    return pd.DataFrame(
+        {
+            "sample_id": tuple(cache.segment_ids),
+            **{
+                f"quality_{index}": cache.quality[:, index]
+                for index in range(cache.quality.shape[1])
+            },
+        }
+    )
+
+
+def _phase_b_group_predictions(mean_predictions: pd.DataFrame, bundle: DataBundle) -> pd.DataFrame:
+    manifest = bundle.manifest.loc[
+        :, ["sample_id", "group_id", "version", "n_rpm", "fz_mm_per_tooth", "ap_mm"]
+    ].copy()
+    manifest["sample_id"] = manifest["sample_id"].astype(str)
+    g1 = mean_predictions.loc[
+        mean_predictions["model"] == "G1",
+        ["sample_id", "group_id", "version", "fold", "seed", "target_mean", "prediction", "sample_weight", "gate"],
+    ].copy()
+    g1["weighted_target"] = g1["target_mean"] * g1["sample_weight"]
+    g1["weighted_prediction"] = g1["prediction"] * g1["sample_weight"]
+    g1["weighted_gate"] = g1["gate"] * g1["sample_weight"]
+    grouped = g1.groupby(
+        ["group_id", "version", "fold", "seed"], sort=True, observed=True, as_index=False
+    ).agg(
+        weighted_target=("weighted_target", "sum"),
+        weighted_prediction=("weighted_prediction", "sum"),
+        weighted_gate=("weighted_gate", "sum"),
+        sample_weight=("sample_weight", "sum"),
+        region_count=("sample_id", "size"),
+    )
+    grouped["target_mean"] = grouped["weighted_target"] / grouped["sample_weight"]
+    grouped["prediction"] = grouped["weighted_prediction"] / grouped["sample_weight"]
+    grouped["gate"] = grouped["weighted_gate"] / grouped["sample_weight"]
+    conditions = manifest.groupby(
+        ["group_id", "version"], sort=True, observed=True, as_index=False
+    ).agg(
+        n_rpm=("n_rpm", "first"),
+        fz_mm_per_tooth=("fz_mm_per_tooth", "first"),
+        ap_mm=("ap_mm", "first"),
+    )
+    return grouped.merge(conditions, on=["group_id", "version"], validate="many_to_one").loc[
+        :,
+        [
+            "group_id", "version", "fold", "seed", "target_mean", "prediction", "gate",
+            "sample_weight", "region_count", "n_rpm", "fz_mm_per_tooth", "ap_mm",
+        ],
+    ]
+
+
+def _phase_b_breakdowns(group_predictions: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    tables: dict[str, pd.DataFrame] = {}
+    for column in ("version", "n_rpm", "fz_mm_per_tooth", "ap_mm"):
+        values = group_predictions.copy()
+        values["weighted_absolute_error"] = (
+            np.abs(values["target_mean"] - values["prediction"]) * values["sample_weight"]
+        )
+        grouped = values.groupby([column, "seed"], sort=True, observed=True, as_index=False).agg(
+            weighted_error=("weighted_absolute_error", "sum"),
+            weight_sum=("sample_weight", "sum"),
+            group_count=("group_id", "nunique"),
+        )
+        grouped["weighted_mae"] = grouped["weighted_error"] / grouped["weight_sum"]
+        if column == "version":
+            grouped["interpretation"] = "v3/v4 composite-domain stress test is confounded with speed"
+        tables[column] = grouped
+    return tables
+
+
+def _phase_b_ablation_differences(probability_metrics: pd.DataFrame) -> pd.DataFrame:
+    selected = probability_metrics.loc[
+        probability_metrics["aggregation"].isin(("seed", "all_seed"))
+    ].copy()
+    identifiers = ["aggregation", "seed", "fold", "interval_type", "nominal_coverage", "metric"]
+    hetero = selected.loc[selected["scale_model"] == "heteroscedastic", identifiers + ["value"]].rename(
+        columns={"value": "heteroscedastic_value"}
+    )
+    homo = selected.loc[selected["scale_model"] == "homoscedastic", identifiers + ["value"]].rename(
+        columns={"value": "homoscedastic_value"}
+    )
+    merged = hetero.merge(homo, on=identifiers, validate="one_to_one")
+    merged["heteroscedastic_minus_homoscedastic"] = (
+        merged["heteroscedastic_value"] - merged["homoscedastic_value"]
+    )
+    return merged
+
+
+def _phase_b_paired_bootstrap(
+    probability_predictions: pd.DataFrame, mean_predictions: pd.DataFrame
+) -> pd.DataFrame:
+    rows = phase_b_mean_bootstrap_table(mean_predictions).to_dict(orient="records")
+    for metric, interval_type, coverage in (
+        ("gaussian_nll", None, None),
+        ("gaussian_crps", None, None),
+        ("mean_interval_width", "conformal", 0.90),
+        ("mean_interval_width", "conformal", 0.95),
+        ("winkler_score", "conformal", 0.90),
+        ("winkler_score", "conformal", 0.95),
+    ):
+        result = paired_probability_bootstrap(
+            probability_predictions,
+            metric=metric,
+            interval_type=interval_type,
+            nominal_coverage=coverage,
+        )
+        rows.append(
+            {
+                "baseline": "homoscedastic",
+                "candidate": "heteroscedastic",
+                "metric": metric,
+                "interval_type": interval_type,
+                "nominal_coverage": coverage,
+                **result.to_dict(),
+                "confidence_level": 0.95,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _phase_b_plot_bars(
+    path: Path, frame: pd.DataFrame, *, title: str, ylabel: str
+) -> Path:
+    figure, axis = plt.subplots(figsize=(8, 5))
+    if frame.empty:
+        raise ValueError(f"Phase B figure input is empty: {title}")
+    labels = [" / ".join(str(value) for value in row) for row in frame.iloc[:, :-1].itertuples(index=False, name=None)]
+    axis.bar(np.arange(len(frame)), frame.iloc[:, -1].to_numpy(dtype=np.float64), color="#4472C4")
+    axis.set_xticks(np.arange(len(frame)), labels, rotation=35, ha="right")
+    axis.set_title(title)
+    axis.set_ylabel(ylabel)
+    return _atomic_figure(path, figure)
+
+
+def _write_phase_b_figures_from_tables(output: Path) -> dict[str, Path]:
+    """Render figures solely from report CSVs already saved under ``output``."""
+    figures = output / "evaluation" / "figures"
+    probability_metrics = _phase_b_frame(
+        output / "evaluation" / "probability_metrics.csv",
+        string_columns=("aggregation", "scale_model", "interval_type", "metric"),
+    )
+    mean_metrics = _phase_b_frame(
+        output / "evaluation" / "mean_metrics.csv",
+        string_columns=("aggregation", "model", "metric"),
+    )
+    mean = _phase_b_frame(
+        output / "predictions" / "oof_mean_predictions.csv",
+        string_columns=("sample_id", "group_id", "version", "model", "fold", "seed"),
+    )
+    groups = _phase_b_frame(
+        output / "predictions" / "group_oof_predictions.csv",
+        string_columns=("group_id", "version", "fold", "seed"),
+    )
+    written: dict[str, Path] = {}
+    conformal = probability_metrics.loc[
+        (probability_metrics["aggregation"] == "all_seed")
+        & (probability_metrics["interval_type"] == "conformal")
+    ]
+    coverage = conformal.loc[conformal["metric"].eq("simultaneous_group_coverage"), ["scale_model", "nominal_coverage", "value"]]
+    written["figure_coverage_width"] = _phase_b_plot_bars(
+        figures / "coverage_width.png", coverage, title="Conformal simultaneous coverage", ylabel="Coverage"
+    )
+    interval = conformal.loc[conformal["metric"].eq("winkler_score"), ["scale_model", "nominal_coverage", "value"]]
+    written["figure_interval_score"] = _phase_b_plot_bars(
+        figures / "interval_score.png", interval, title="Conformal interval score", ylabel="Winkler score"
+    )
+    nll_crps = probability_metrics.loc[
+        (probability_metrics["aggregation"] == "seed")
+        & probability_metrics["metric"].isin(("gaussian_nll", "gaussian_crps")),
+        ["seed", "scale_model", "metric", "value"],
+    ]
+    written["figure_nll_crps_by_seed"] = _phase_b_plot_bars(
+        figures / "nll_crps_by_seed.png", nll_crps, title="NLL and CRPS by seed", ylabel="Metric value"
+    )
+    simultaneous = conformal.loc[
+        conformal["metric"].eq("simultaneous_group_coverage"), ["scale_model", "nominal_coverage", "value"]
+    ]
+    written["figure_group_simultaneous_coverage"] = _phase_b_plot_bars(
+        figures / "group_simultaneous_coverage.png", simultaneous, title="Group simultaneous coverage", ylabel="Coverage"
+    )
+
+    g1 = mean.loc[mean["model"] == "G1"].copy()
+    figure, axis = plt.subplots(figsize=(7, 6))
+    for seed, values in g1.groupby("seed", sort=True, observed=True):
+        axis.scatter(values["target_mean"], values["prediction"], s=8, alpha=0.45, label=str(seed))
+    low = float(min(g1["target_mean"].min(), g1["prediction"].min()))
+    high = float(max(g1["target_mean"].max(), g1["prediction"].max()))
+    axis.plot([low, high], [low, high], "k--", linewidth=1)
+    axis.set_title("G1 OOF predictions; v3/v4 stress test is confounded with speed")
+    axis.set_xlabel("Measured mean Ra (μm)")
+    axis.set_ylabel("G1 prediction (μm)")
+    axis.legend()
+    written["figure_prediction_scatter"] = _atomic_figure(figures / "prediction_scatter.png", figure)
+
+    figure, axis = plt.subplots(figsize=(7, 6))
+    for seed, values in g1.groupby("seed", sort=True, observed=True):
+        axis.scatter(values["prediction"], values["target_mean"] - values["prediction"], s=8, alpha=0.45, label=str(seed))
+    axis.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    axis.set_title("G1 residuals; v3/v4 stress test is confounded with speed")
+    axis.set_xlabel("G1 prediction (μm)")
+    axis.set_ylabel("Mean residual (μm)")
+    axis.legend()
+    written["figure_residual_plot"] = _atomic_figure(figures / "residual_plot.png", figure)
+
+    fold = mean_metrics.loc[
+        (mean_metrics["aggregation"] == "fold") & mean_metrics["metric"].eq("mean_mae")
+    ]
+    figure, axis = plt.subplots(figsize=(8, 5))
+    for model, values in fold.groupby("model", sort=True, observed=True):
+        aggregate = values.groupby("fold", sort=True)["value"].mean()
+        axis.plot(aggregate.index, aggregate.values, marker="o", label=model)
+    axis.set_xlabel("Outer fold")
+    axis.set_ylabel("Weighted MAE (μm)")
+    axis.legend()
+    written["figure_fold_stability"] = _atomic_figure(figures / "fold_stability.png", figure)
+
+    figure, axis = plt.subplots(figsize=(7, 5))
+    axis.hist(groups["gate"], bins=np.linspace(0.0, 1.0, 21), color="#4472C4", edgecolor="white")
+    axis.set_xlabel("G1 trust gate")
+    axis.set_ylabel("Group-seed count")
+    written["figure_gate_distribution"] = _atomic_figure(figures / "gate_distribution.png", figure)
+
+    heat = groups.pivot_table(index="n_rpm", columns="fz_mm_per_tooth", values="gate", aggfunc="mean").sort_index().sort_index(axis=1)
+    figure, axis = plt.subplots(figsize=(8, 5))
+    image = axis.imshow(heat.to_numpy(dtype=np.float64), aspect="auto", vmin=0.0, vmax=1.0, cmap="viridis")
+    axis.set_xticks(range(len(heat.columns)), [f"{value:g}" for value in heat.columns])
+    axis.set_yticks(range(len(heat.index)), [f"{value:g}" for value in heat.index])
+    axis.set_xlabel("fz (mm/tooth)")
+    axis.set_ylabel("n (rpm)")
+    figure.colorbar(image, ax=axis, label="Mean G1 trust gate")
+    written["figure_gate_condition_heatmap"] = _atomic_figure(figures / "gate_condition_heatmap.png", figure)
+    return written
+
+
+def _phase_b_completion_metadata(output: Path) -> tuple[dict[str, str], dict[str, str]]:
+    hashes: dict[str, str] = {}
+    devices: dict[str, str] = {}
+    for fold in range(5):
+        for seed in (20260723, 20260724, 20260725):
+            key = f"fold_{fold}/seed_{seed}"
+            marker = output / "folds" / f"fold_{fold}" / f"seed_{seed}" / "complete.json"
+            if marker.is_file():
+                hashes[key] = _sha256(marker)
+    return hashes, devices
+
+
+def _phase_b_existing_inner_folds(output: Path) -> pd.DataFrame:
+    paths = [
+        output / "folds" / f"fold_{fold}" / f"seed_{seed}" / "calibration" / "inner_folds.csv"
+        for fold in range(5)
+        for seed in (20260723, 20260724, 20260725)
+    ]
+    existing = [path for path in paths if path.is_file()]
+    if not existing:
+        return pd.DataFrame()
+    if len(existing) != len(paths):
+        raise ValueError("Phase B report requires every completed fold/seed inner-fold table")
+    return pd.concat(
+        [_phase_b_frame(path, string_columns=()) for path in existing], ignore_index=True
+    )
+
+
+def write_phase_b_report(
+    config: PhaseBConfig,
+    handoff: PhaseAHandoff,
+    bundle: DataBundle,
+    mean_predictions: pd.DataFrame,
+    probability_predictions: pd.DataFrame,
+    calibration_scores: pd.DataFrame,
+    quantiles: pd.DataFrame,
+) -> Mapping[str, Path]:
+    """Publish every Phase B report artifact from OOF CSV/JSON-derived inputs."""
+    if not isinstance(config, PhaseBConfig) or not isinstance(handoff, PhaseAHandoff):
+        raise ValueError("Phase B report requires validated configuration and handoff")
+    if not isinstance(bundle, DataBundle):
+        raise ValueError("Phase B report requires the canonical data bundle")
+    output = validate_phase_b_output_root(config.output_dir)
+    immutable_before = _phase_b_immutable_hashes(config)
+    output.mkdir(parents=True, exist_ok=True)
+    existing_run_manifest = (
+        _phase_b_json(output / "run_manifest.json", "run manifest")
+        if (output / "run_manifest.json").is_file()
+        else {}
+    )
+    probability = validate_phase_b_prediction_cartesian(
+        probability_predictions,
+        manifest=bundle.manifest,
+        folds=bundle.folds,
+        mean_predictions=mean_predictions,
+        calibration_scores=calibration_scores,
+        calibration_quantiles=quantiles,
+    )
+    mean = mean_predictions.loc[:, PHASE_B_MEAN_COLUMNS].copy()
+    scores = calibration_scores.loc[:, CALIBRATION_SCORE_COLUMNS].copy()
+    quantile_table = quantiles.loc[:, _PHASE_B_QUANTILE_COLUMNS].copy()
+    probability_metrics = probability_metric_table(probability)
+    mean_metrics = phase_b_mean_metric_table(mean)
+    seed_summary = seed_uncertainty_summary(probability)
+    paired_bootstrap = _phase_b_paired_bootstrap(probability, mean)
+    negative_transfer = phase_b_negative_transfer_table(mean)
+    quality = _phase_b_quality_features(config, bundle)
+    gate_statistics = phase_b_gate_statistics(mean, bundle.manifest, quality)
+    groups = _phase_b_group_predictions(mean, bundle)
+    breakdowns = _phase_b_breakdowns(groups)
+    decision = assess_phase_b_claims(probability_metrics)
+    fold_metrics = pd.concat(
+        [
+            mean_metrics.loc[mean_metrics["aggregation"] == "fold"].assign(metric_family="mean"),
+            probability_metrics.loc[probability_metrics["aggregation"] == "fold"].assign(metric_family="probability"),
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    seed_metrics = pd.concat(
+        [
+            mean_metrics.loc[mean_metrics["aggregation"].isin(("seed", "all_seed"))].assign(metric_family="mean"),
+            probability_metrics.loc[probability_metrics["aggregation"].isin(("seed", "all_seed"))].assign(metric_family="probability"),
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    written: dict[str, Path] = {}
+    written["handoff"] = _atomic_json(output / "handoff.json", asdict(handoff))
+    written["immutable_hashes_before"] = _atomic_json(output / "immutable_hashes_before.json", immutable_before)
+    written["outer_folds"] = _atomic_csv(output / "folds" / "outer_folds.csv", bundle.folds)
+    written["inner_folds"] = _atomic_csv(
+        output / "folds" / "inner_folds.csv", _phase_b_existing_inner_folds(output)
+    )
+    written["oof_probability_predictions"] = _atomic_csv(output / "predictions" / "oof_probability_predictions.csv", probability)
+    written["oof_mean_predictions"] = _atomic_csv(output / "predictions" / "oof_mean_predictions.csv", mean)
+    written["group_oof_predictions"] = _atomic_csv(output / "predictions" / "group_oof_predictions.csv", groups)
+    written["seed_uncertainty_summary"] = _atomic_csv(output / "predictions" / "seed_uncertainty_summary.csv", seed_summary)
+    written["group_scores"] = _atomic_csv(output / "calibration" / "group_scores.csv", scores)
+    written["quantiles"] = _atomic_csv(output / "calibration" / "quantiles.csv", quantile_table)
+    written["mean_metrics"] = _atomic_csv(output / "evaluation" / "mean_metrics.csv", mean_metrics)
+    written["probability_metrics"] = _atomic_csv(output / "evaluation" / "probability_metrics.csv", probability_metrics)
+    written["fold_metrics"] = _atomic_csv(output / "evaluation" / "fold_metrics.csv", fold_metrics)
+    written["seed_metrics"] = _atomic_csv(output / "evaluation" / "seed_metrics.csv", seed_metrics)
+    written["ablation_differences"] = _atomic_csv(output / "evaluation" / "ablation_differences.csv", _phase_b_ablation_differences(probability_metrics))
+    written["paired_bootstrap"] = _atomic_csv(output / "evaluation" / "paired_bootstrap.csv", paired_bootstrap)
+    written["negative_transfer"] = _atomic_csv(output / "evaluation" / "negative_transfer.csv", negative_transfer)
+    written["gate_statistics"] = _atomic_csv(output / "evaluation" / "gate_statistics.csv", gate_statistics)
+    written["claim_decision"] = _atomic_json(output / "evaluation" / "claim_decision.json", decision.to_dict())
+    written["method_notes"] = _atomic_json(output / "evaluation" / "method_notes.json", _PHASE_B_METHOD_NOTES)
+    for name, table in breakdowns.items():
+        written[f"breakdown_{name}"] = _atomic_csv(output / "evaluation" / "breakdowns" / f"by_{name}.csv", table)
+    written.update(_write_phase_b_figures_from_tables(output))
+    immutable_after = _phase_b_immutable_hashes(config)
+    if immutable_after != immutable_before:
+        raise RuntimeError("immutable Phase A or legacy input changed during Phase B reporting")
+    written["immutable_hashes_after"] = _atomic_json(output / "immutable_hashes_after.json", immutable_after)
+    completion_hashes, _ = _phase_b_completion_metadata(output)
+    recorded_devices = existing_run_manifest.get("selected_device_by_fold_seed", {})
+    devices = (
+        {str(key): str(value) for key, value in recorded_devices.items()}
+        if isinstance(recorded_devices, dict)
+        else {}
+    )
+    if any(device not in {"cpu", "cuda"} for device in devices.values()):
+        raise ValueError("Phase B recorded device is incompatible")
+    artifact_hashes = {
+        path.relative_to(output).as_posix(): _sha256(path)
+        for path in sorted(written.values())
+    }
+    manifest_payload = {
+        "schema_version": "sgrpn-phase-b-run-v1",
+        "phase_b_config": _jsonable(asdict(config)),
+        "phase_b_config_sha256": _phase_b_config_hash(config),
+        "phase_a_handoff": asdict(handoff),
+        "phase_a_handoff_sha256": _sha256(written["handoff"]),
+        "protocol": PHASE_B_PROTOCOL,
+        "seeds": list(config.seeds),
+        "alphas": list(config.alphas),
+        "input_fingerprints": dict(handoff.input_sha256),
+        "cache_sha256": handoff.cache_sha256,
+        "training_fingerprint": handoff.training_fingerprint,
+        "fold_completion_sha256": completion_hashes,
+        "selected_device_by_fold_seed": devices,
+        "bootstrap": {"repetitions": BOOTSTRAP_REPETITIONS, "seed": BOOTSTRAP_SEED, "resampling_unit": "group_id"},
+        "environment": {"python_version": platform.python_version(), "python_executable": sys.executable, "platform": platform.platform()},
+        "evaluation_status": "complete",
+        "artifacts": artifact_hashes,
+    }
+    written["run_manifest"] = _atomic_json(output / "run_manifest.json", manifest_payload)
+    return written
+
+
+def _phase_b_flatten_quantiles(output: Path) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for fold in range(5):
+        for seed in (20260723, 20260724, 20260725):
+            path = output / "folds" / f"fold_{fold}" / f"seed_{seed}" / "calibration" / "quantiles.json"
+            payload = _phase_b_json(path, "calibration quantiles")
+            if payload.get("fold") != fold or payload.get("seed") != seed or not isinstance(payload.get("quantiles"), dict):
+                raise ValueError("Phase B calibration quantile identity is incompatible")
+            for scale_model in SCALE_MODELS:
+                model_quantiles = payload["quantiles"].get(scale_model)
+                if not isinstance(model_quantiles, dict):
+                    raise ValueError("Phase B calibration quantile model is incompatible")
+                for alpha in (0.10, 0.05):
+                    value = model_quantiles.get(f"{alpha:.2f}")
+                    if not isinstance(value, dict):
+                        raise ValueError("Phase B calibration quantile alpha is incompatible")
+                    rows.append(
+                        {
+                            "fold": fold,
+                            "seed": seed,
+                            "scale_model": scale_model,
+                            "alpha": alpha,
+                            "group_count": value.get("group_count"),
+                            "order_index": value.get("order_index"),
+                            "quantile": value.get("quantile"),
+                        }
+                    )
+    return pd.DataFrame(rows, columns=_PHASE_B_QUANTILE_COLUMNS)
+
+
+def _phase_b_saved_fold_inputs(
+    config: PhaseBConfig, handoff: PhaseAHandoff, bundle: DataBundle
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    from .order_spectrum import load_order_cache
+
+    phase_a = load_sgrpn_config(config.phase_a_config_path)
+    cache = load_order_cache(bundle, phase_a)
+    output = validate_phase_b_output_root(config.output_dir)
+    probability_rows: list[pd.DataFrame] = []
+    mean_rows: list[pd.DataFrame] = []
+    score_rows: list[pd.DataFrame] = []
+    inner_rows: list[pd.DataFrame] = []
+    for fold in range(5):
+        for seed in (20260723, 20260724, 20260725):
+            fingerprint = _phase_b_fingerprint(config, handoff, bundle, cache, fold=fold, seed=seed)
+            fold_dir = output / "folds" / f"fold_{fold}" / f"seed_{seed}"
+            artifact = _load_completed_phase_b_fold(fold_dir, fingerprint, fold, seed)
+            probability_rows.append(artifact.predictions.copy())
+            mean_rows.append(artifact.predictions.attrs["mean_predictions"].copy())
+            score_rows.extend(item.group_scores.copy() for item in artifact.calibration.values())
+            inner_rows.append(_phase_b_frame(fold_dir / "calibration" / "inner_folds.csv", string_columns=()))
+    return (
+        pd.concat(probability_rows, ignore_index=True),
+        pd.concat(mean_rows, ignore_index=True),
+        pd.concat(score_rows, ignore_index=True),
+        pd.concat(inner_rows, ignore_index=True),
+    )
+
+
+def _phase_b_assert_same(actual: pd.DataFrame, expected: pd.DataFrame, label: str) -> None:
+    try:
+        pd.testing.assert_frame_equal(
+            actual.reset_index(drop=True), expected.reset_index(drop=True), check_dtype=False, check_exact=True
+        )
+    except AssertionError as error:
+        raise ValueError(f"Phase B persisted {label} does not match the reproducible source") from error
+
+
+def validate_phase_b_outputs(config: PhaseBConfig) -> None:
+    """Deeply validate report, folds, metrics, calibration, and immutable inputs without writing."""
+    handoff = validate_phase_b_handoff(config)
+    phase_a = load_sgrpn_config(config.phase_a_config_path)
+    bundle = load_data_bundle(phase_a)
+    output = validate_phase_b_output_root(config.output_dir)
+    if not output.is_dir():
+        raise ValueError("Phase B output root is missing")
+    before = _phase_b_json(output / "immutable_hashes_before.json", "immutable hashes before")
+    after = _phase_b_json(output / "immutable_hashes_after.json", "immutable hashes after")
+    current = _phase_b_immutable_hashes(config)
+    if before != current or after != current:
+        raise ValueError("Phase B immutable input hashes changed or are incompatible")
+    if _phase_b_json(output / "handoff.json", "handoff") != asdict(handoff):
+        raise ValueError("Phase B serialized handoff is incompatible")
+    probability, mean, scores, inner = _phase_b_saved_fold_inputs(config, handoff, bundle)
+    quantiles = _phase_b_flatten_quantiles(output)
+    persisted_probability = _phase_b_frame(output / "predictions" / "oof_probability_predictions.csv", string_columns=("sample_id", "group_id", "version", "scale_model"))
+    persisted_mean = _phase_b_frame(output / "predictions" / "oof_mean_predictions.csv", string_columns=("sample_id", "group_id", "version", "model"))
+    persisted_scores = _phase_b_frame(output / "calibration" / "group_scores.csv", string_columns=("group_id", "scale_model"))
+    persisted_quantiles = _phase_b_frame(output / "calibration" / "quantiles.csv", string_columns=("scale_model",))
+    _phase_b_assert_same(persisted_probability, probability, "probability OOF rows")
+    _phase_b_assert_same(persisted_mean, mean, "mean OOF rows")
+    _phase_b_assert_same(persisted_scores, scores, "calibration scores")
+    _phase_b_assert_same(persisted_quantiles, quantiles, "calibration quantiles")
+    _phase_b_assert_same(
+        _phase_b_frame(output / "folds" / "outer_folds.csv", string_columns=("sample_id", "group_id")),
+        bundle.folds,
+        "outer folds",
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(output / "folds" / "inner_folds.csv", string_columns=()), inner,
+        "inner folds",
+    )
+    validated = validate_phase_b_prediction_cartesian(
+        persisted_probability,
+        manifest=bundle.manifest,
+        folds=bundle.folds,
+        mean_predictions=persisted_mean,
+        calibration_scores=persisted_scores,
+        calibration_quantiles=persisted_quantiles,
+    )
+    expected_probability_metrics = probability_metric_table(validated)
+    expected_mean_metrics = phase_b_mean_metric_table(persisted_mean)
+    _phase_b_assert_same(
+        _phase_b_frame(output / "evaluation" / "probability_metrics.csv", string_columns=("aggregation", "scale_model", "interval_type", "metric")),
+        expected_probability_metrics,
+        "probability metrics",
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(output / "evaluation" / "mean_metrics.csv", string_columns=("aggregation", "model", "metric")),
+        expected_mean_metrics,
+        "mean metrics",
+    )
+    expected_groups = _phase_b_group_predictions(persisted_mean, bundle)
+    _phase_b_assert_same(
+        _phase_b_frame(
+            output / "predictions" / "group_oof_predictions.csv",
+            string_columns=("group_id", "version"),
+        ),
+        expected_groups,
+        "group OOF rows",
+    )
+    expected_breakdowns = _phase_b_breakdowns(expected_groups)
+    for name, expected_breakdown in expected_breakdowns.items():
+        _phase_b_assert_same(
+            _phase_b_frame(
+                output / "evaluation" / "breakdowns" / f"by_{name}.csv",
+                string_columns=("interpretation",) if name == "version" else (),
+            ),
+            expected_breakdown,
+            f"{name} breakdown",
+        )
+    quality = _phase_b_quality_features(config, bundle)
+    _phase_b_assert_same(
+        _phase_b_frame(output / "evaluation" / "gate_statistics.csv", string_columns=("dimension", "level")),
+        phase_b_gate_statistics(persisted_mean, bundle.manifest, quality),
+        "gate statistics",
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(output / "evaluation" / "negative_transfer.csv", string_columns=("aggregation", "baseline", "candidate")),
+        phase_b_negative_transfer_table(persisted_mean),
+        "negative-transfer table",
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(
+            output / "evaluation" / "ablation_differences.csv",
+            string_columns=("aggregation", "interval_type", "metric"),
+        ),
+        _phase_b_ablation_differences(expected_probability_metrics),
+        "ablation differences",
+    )
+    expected_fold_metrics = pd.concat(
+        [
+            expected_mean_metrics.loc[expected_mean_metrics["aggregation"] == "fold"].assign(metric_family="mean"),
+            expected_probability_metrics.loc[expected_probability_metrics["aggregation"] == "fold"].assign(metric_family="probability"),
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    expected_seed_metrics = pd.concat(
+        [
+            expected_mean_metrics.loc[expected_mean_metrics["aggregation"].isin(("seed", "all_seed"))].assign(metric_family="mean"),
+            expected_probability_metrics.loc[expected_probability_metrics["aggregation"].isin(("seed", "all_seed"))].assign(metric_family="probability"),
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(output / "evaluation" / "fold_metrics.csv", string_columns=("aggregation", "model", "scale_model", "interval_type", "metric", "metric_family")),
+        expected_fold_metrics,
+        "fold metrics",
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(output / "evaluation" / "seed_metrics.csv", string_columns=("aggregation", "model", "scale_model", "interval_type", "metric", "metric_family")),
+        expected_seed_metrics,
+        "seed metrics",
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(output / "predictions" / "seed_uncertainty_summary.csv", string_columns=("scale_model", "sample_id", "group_id", "version")),
+        seed_uncertainty_summary(validated),
+        "seed uncertainty summary",
+    )
+    _phase_b_assert_same(
+        _phase_b_frame(output / "evaluation" / "paired_bootstrap.csv", string_columns=("baseline", "candidate", "metric", "interval_type", "resampling_unit")),
+        _phase_b_paired_bootstrap(validated, persisted_mean),
+        "paired bootstrap",
+    )
+    if _phase_b_json(output / "evaluation" / "claim_decision.json", "claim decision") != assess_phase_b_claims(expected_probability_metrics).to_dict():
+        raise ValueError("Phase B claim decision is incompatible")
+    if _phase_b_json(output / "evaluation" / "method_notes.json", "method notes") != _PHASE_B_METHOD_NOTES:
+        raise ValueError("Phase B method notes are incompatible")
+    completion_hashes, _ = _phase_b_completion_metadata(output)
+    if len(completion_hashes) != 15:
+        raise ValueError("Phase B requires all fifteen completed fold/seed artifacts")
+    run_manifest = _phase_b_json(output / "run_manifest.json", "run manifest")
+    recorded_devices = run_manifest.get("selected_device_by_fold_seed")
+    if (
+        not isinstance(recorded_devices, dict)
+        or set(recorded_devices) != set(completion_hashes)
+        or any(value not in {"cpu", "cuda"} for value in recorded_devices.values())
+    ):
+        raise ValueError("Phase B selected device records are incomplete or incompatible")
+    if (
+        run_manifest.get("phase_b_config_sha256") != _phase_b_config_hash(config)
+        or run_manifest.get("phase_a_handoff") != asdict(handoff)
+        or run_manifest.get("fold_completion_sha256") != completion_hashes
+        or run_manifest.get("selected_device_by_fold_seed") != recorded_devices
+        or run_manifest.get("protocol") != PHASE_B_PROTOCOL
+        or run_manifest.get("evaluation_status") != "complete"
+    ):
+        raise ValueError("Phase B run manifest is incompatible")
+    artifacts = run_manifest.get("artifacts")
+    required_artifacts = {
+        "handoff.json",
+        "immutable_hashes_before.json",
+        "immutable_hashes_after.json",
+        "folds/outer_folds.csv",
+        "folds/inner_folds.csv",
+        "predictions/oof_probability_predictions.csv",
+        "predictions/oof_mean_predictions.csv",
+        "predictions/group_oof_predictions.csv",
+        "predictions/seed_uncertainty_summary.csv",
+        "calibration/group_scores.csv",
+        "calibration/quantiles.csv",
+        "evaluation/mean_metrics.csv",
+        "evaluation/probability_metrics.csv",
+        "evaluation/fold_metrics.csv",
+        "evaluation/seed_metrics.csv",
+        "evaluation/ablation_differences.csv",
+        "evaluation/paired_bootstrap.csv",
+        "evaluation/negative_transfer.csv",
+        "evaluation/gate_statistics.csv",
+        "evaluation/claim_decision.json",
+        "evaluation/method_notes.json",
+        "evaluation/breakdowns/by_version.csv",
+        "evaluation/breakdowns/by_n_rpm.csv",
+        "evaluation/breakdowns/by_fz_mm_per_tooth.csv",
+        "evaluation/breakdowns/by_ap_mm.csv",
+        *(f"evaluation/figures/{name}.png" for name in (
+            "coverage_width", "interval_score", "nll_crps_by_seed", "group_simultaneous_coverage",
+            "prediction_scatter", "residual_plot", "fold_stability", "gate_distribution", "gate_condition_heatmap",
+        )),
+    }
+    if not isinstance(artifacts, dict) or set(artifacts) != required_artifacts or any(
+        not (output / relative).is_file() or _sha256(output / relative) != digest
+        for relative, digest in artifacts.items()
+    ):
+        raise ValueError("Phase B report artifact hashes are incompatible")
+
+
+__all__ = ["validate_phase_b_outputs", "write_phase_a_report", "write_phase_b_report"]

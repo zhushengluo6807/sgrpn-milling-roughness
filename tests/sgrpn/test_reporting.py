@@ -6,7 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from roughness.sgrpn.reporting import write_phase_a_report
+from roughness.sgrpn.config import PhaseAHandoff, PhaseBConfig
+from roughness.sgrpn.data import DataBundle
+from roughness.sgrpn.reporting import write_phase_a_report, write_phase_b_report
 
 
 def _synthetic_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -234,3 +236,232 @@ def test_report_reconstructs_duration_from_current_canonical_data_when_registrat
     assert repaired["duration_audit"]["sha256"] == hashlib.sha256(
         duration_path.read_bytes()
     ).hexdigest()
+
+
+def _phase_b_report_fixture(tmp_path: Path) -> tuple[
+    PhaseBConfig,
+    PhaseAHandoff,
+    DataBundle,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    """Build the exact registered Phase B Cartesian product without checkpoints."""
+    groups = [f"g{index:03d}" for index in range(212)]
+    sample_rows: list[dict[str, object]] = []
+    for group_index, group_id in enumerate(groups):
+        count = 3 if group_index < 162 else 2
+        for region_index in range(count):
+            sample_index = len(sample_rows)
+            reading = 1.0 + sample_index / 1_000.0
+            sample_rows.append(
+                {
+                    "sample_id": f"s{sample_index:03d}",
+                    "group_id": group_id,
+                    "version": "v3" if group_index % 2 == 0 else "v4",
+                    "fold": group_index % 5,
+                    "ra_1": reading - 0.02,
+                    "ra_2": reading,
+                    "ra_3": reading + 0.02,
+                    "ra_mean": reading,
+                    "sample_weight": 1.0 / count,
+                    "split_count": count,
+                    "n_rpm": 4_000.0 + 1_000.0 * (group_index % 5),
+                    "fz_mm_per_tooth": 0.03 + 0.01 * (group_index % 4),
+                    "ap_mm": 0.5 + 0.25 * (group_index % 3),
+                }
+            )
+    manifest = pd.DataFrame(sample_rows)
+    folds = manifest.loc[:, ["sample_id", "group_id", "fold"]].copy()
+    bundle = DataBundle(
+        manifest=manifest.drop(columns="fold"),
+        folds=folds,
+        windows=pd.DataFrame(),
+        fold_audit={"n_folds": 5},
+        duration_audit=pd.DataFrame(),
+    )
+    bundle.manifest.attrs["quality_features"] = pd.DataFrame(
+        {
+            "sample_id": bundle.manifest["sample_id"],
+            **{
+                f"quality_{index}": np.full(len(bundle.manifest), float(index))
+                for index in range(7)
+            },
+        }
+    )
+
+    mean_rows: list[dict[str, object]] = []
+    probability_rows: list[dict[str, object]] = []
+    z_values = {90: 1.6448536269514722, 95: 1.959963984540054}
+    for row in manifest.itertuples(index=False):
+        for seed in (20260723, 20260724, 20260725):
+            process_mean = float(row.ra_mean) - 0.10
+            residual = 0.15
+            correction = 0.5 * residual
+            for model, prediction, gate, model_correction in (
+                ("P1", process_mean, 0.0, 0.0),
+                ("R1", process_mean + residual, 1.0, residual),
+                ("G1", process_mean + correction, 0.5, correction),
+            ):
+                mean_rows.append(
+                    {
+                        "sample_id": row.sample_id,
+                        "group_id": row.group_id,
+                        "version": row.version,
+                        "fold": row.fold,
+                        "seed": seed,
+                        "model": model,
+                        "target_mean": row.ra_mean,
+                        "prediction": prediction,
+                        "sample_weight": row.sample_weight,
+                        "process_mean": process_mean,
+                        "residual": residual,
+                        "gate": gate,
+                        "correction": model_correction,
+                    }
+                )
+            for scale_model, sigma in (("heteroscedastic", 0.10), ("homoscedastic", 0.12)):
+                probability_rows.append(
+                    {
+                        "sample_id": row.sample_id,
+                        "group_id": row.group_id,
+                        "version": row.version,
+                        "fold": row.fold,
+                        "seed": seed,
+                        "scale_model": scale_model,
+                        "target_mean": row.ra_mean,
+                        "ra_1": row.ra_1,
+                        "ra_2": row.ra_2,
+                        "ra_3": row.ra_3,
+                        "sample_weight": row.sample_weight,
+                        "mu": process_mean + correction,
+                        "sigma": sigma,
+                        "gate": 0.5,
+                        "correction": correction,
+                        "raw_lower_90": process_mean + correction - z_values[90] * sigma,
+                        "raw_upper_90": process_mean + correction + z_values[90] * sigma,
+                        "raw_lower_95": process_mean + correction - z_values[95] * sigma,
+                        "raw_upper_95": process_mean + correction + z_values[95] * sigma,
+                        "conformal_q_90": 1.0,
+                        "conformal_lower_90": process_mean + correction - sigma,
+                        "conformal_upper_90": process_mean + correction + sigma,
+                        "conformal_q_95": 1.0,
+                        "conformal_lower_95": process_mean + correction - sigma,
+                        "conformal_upper_95": process_mean + correction + sigma,
+                    }
+                )
+
+    scores: list[dict[str, object]] = []
+    quantiles: list[dict[str, object]] = []
+    group_folds = manifest.groupby("group_id", sort=True)["fold"].first()
+    group_counts = manifest.groupby("group_id", sort=True).size()
+    for outer_fold in range(5):
+        calibration_groups = group_folds.index[group_folds != outer_fold]
+        for seed in (20260723, 20260724, 20260725):
+            for scale_model in ("heteroscedastic", "homoscedastic"):
+                for group_id in calibration_groups:
+                    count = int(group_counts.loc[group_id])
+                    scores.append(
+                        {
+                            "group_id": group_id,
+                            "outer_fold": outer_fold,
+                            "inner_fold": int(int(group_id[1:]) % 4),
+                            "seed": seed,
+                            "scale_model": scale_model,
+                            "score": 1.0,
+                            "region_count": count,
+                            "reading_count": 3 * count,
+                        }
+                    )
+                for alpha in (0.10, 0.05):
+                    count = len(calibration_groups)
+                    quantiles.append(
+                        {
+                            "fold": outer_fold,
+                            "seed": seed,
+                            "scale_model": scale_model,
+                            "alpha": alpha,
+                            "group_count": count,
+                            "order_index": int(np.ceil((count + 1) * (1 - alpha))),
+                            "quantile": 1.0,
+                        }
+                    )
+
+    config_path = tmp_path / "configs" / "sgrpn_phase_a.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("phase-a fixture", encoding="utf-8")
+    phase_a_root = tmp_path / "outputs" / "sgrpn" / "phase_a"
+    phase_a_root.mkdir(parents=True)
+    (phase_a_root / "immutable.bin").write_bytes(b"phase-a")
+    for legacy in (tmp_path / "outputs" / "scheme1", tmp_path / "outputs" / "scheme1_physics"):
+        legacy.mkdir(parents=True)
+        (legacy / "immutable.bin").write_bytes(legacy.name.encode("utf-8"))
+    config = PhaseBConfig(
+        phase_a_config_path=config_path,
+        phase_a_config_file_sha256="a" * 64,
+        phase_a_acceptance_path=phase_a_root / "evaluation" / "acceptance.json",
+        phase_a_run_manifest_path=phase_a_root / "run_manifest.json",
+        output_dir=tmp_path / "outputs" / "sgrpn" / "phase_b",
+        seeds=(20260723, 20260724, 20260725),
+        alphas=(0.10, 0.05),
+        inner_splits=4,
+        max_epochs=200,
+        patience=20,
+        variance_learning_rate=1e-3,
+        weight_decay=1e-4,
+        bootstrap_repetitions=10_000,
+    )
+    handoff = PhaseAHandoff(
+        acceptance_sha256="b" * 64,
+        run_manifest_sha256="c" * 64,
+        phase_a_config_sha256="a" * 64,
+        training_fingerprint="fixture-training",
+        cache_sha256="d" * 64,
+        input_sha256={"manifest": "e" * 64},
+    )
+    return (
+        config,
+        handoff,
+        bundle,
+        pd.DataFrame(mean_rows),
+        pd.DataFrame(probability_rows),
+        pd.DataFrame(scores),
+        pd.DataFrame(quantiles),
+    )
+
+
+def test_phase_b_report_regenerates_tables_and_figures_without_checkpoints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    config, handoff, bundle, mean, probability, scores, quantiles = _phase_b_report_fixture(tmp_path)
+    import roughness.sgrpn.reporting as reporting
+
+    monkeypatch.setattr(reporting, "validate_phase_b_output_root", lambda path: Path(path))
+    immutable_roots = [
+        config.phase_a_run_manifest_path.parent,
+        tmp_path / "outputs" / "scheme1",
+        tmp_path / "outputs" / "scheme1_physics",
+    ]
+    before = {str(root): _hash_tree(root) for root in immutable_roots}
+    written = write_phase_b_report(config, handoff, bundle, mean, probability, scores, quantiles)
+    table_bytes = {
+        path.relative_to(config.output_dir).as_posix(): path.read_bytes()
+        for path in config.output_dir.rglob("*.csv")
+    }
+    assert len(table_bytes) > 10
+    assert all(path.is_file() for name, path in written.items() if name.startswith("figure_"))
+    assert json.loads((config.output_dir / "evaluation" / "method_notes.json").read_text(encoding="utf-8"))["three_readings_one_region"] is True
+
+    for path in list(config.output_dir.rglob("*.csv")) + list(
+        (config.output_dir / "evaluation" / "figures").glob("*.png")
+    ):
+        path.unlink()
+    write_phase_b_report(config, handoff, bundle, mean, probability, scores, quantiles)
+
+    assert {
+        path.relative_to(config.output_dir).as_posix(): path.read_bytes()
+        for path in config.output_dir.rglob("*.csv")
+    } == table_bytes
+    assert len(list((config.output_dir / "evaluation" / "figures").glob("*.png"))) == 9
+    assert {str(root): _hash_tree(root) for root in immutable_roots} == before
