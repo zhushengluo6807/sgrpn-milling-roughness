@@ -1,0 +1,74 @@
+{
+  "schema_version": "sgrpn-phase-b-test-evidence-v1",
+  "recorded_at": "2026-08-31T12:00:03.4320202+08:00",
+  "python": {
+    "executable": "E:\\CodeX\\机床项目\\.venv\\Scripts\\python.exe",
+    "version": "3.12.13 (main, Mar  3 2026, 15:01:35) [MSC v.1944 64 bit (AMD64)]"
+  },
+  "packages": {
+    "PyYAML": "6.0.3",
+    "matplotlib": "3.11.1",
+    "numpy": "2.5.1",
+    "pandas": "2.3.3",
+    "pytest": "9.1.1",
+    "scikit-learn": "1.9.0",
+    "torch": "2.11.0+cu128"
+  },
+  "commands": [
+    {
+      "command": "E:\\CodeX\\机床项目\\.venv\\Scripts\\python.exe -m compileall -q src/roughness/sgrpn tests/sgrpn",
+      "exit_code": 0,
+      "passed_count": 0,
+      "failed_count": 0,
+      "skipped_count": 0,
+      "elapsed_seconds": 0.296004
+    },
+    {
+      "command": "E:\\CodeX\\机床项目\\.venv\\Scripts\\python.exe -m pytest tests/sgrpn/test_config.py tests/sgrpn/test_models.py tests/sgrpn/test_probability.py tests/sgrpn/test_phase_b_training.py tests/sgrpn/test_evaluation.py tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -v",
+      "exit_code": 0,
+      "passed_count": 298,
+      "failed_count": 0,
+      "skipped_count": 2,
+      "elapsed_seconds": 148.0
+    },
+    {
+      "command": "E:\\CodeX\\机床项目\\.venv\\Scripts\\python.exe -m pytest tests/sgrpn -q",
+      "exit_code": 0,
+      "passed_count": 431,
+      "failed_count": 0,
+      "skipped_count": 2,
+      "elapsed_seconds": 190.56
+    },
+    {
+      "command": "E:\\CodeX\\机床项目\\.venv\\Scripts\\python.exe -m pytest -q",
+      "exit_code": 0,
+      "passed_count": 554,
+      "failed_count": 0,
+      "skipped_count": 2,
+      "elapsed_seconds": 248.93
+    },
+    {
+      "command": "E:\\CodeX\\机床项目\\.venv\\Scripts\\roughness-sgrpn.exe preflight-phase-b --config configs/sgrpn_phase_b.yaml",
+      "exit_code": 0,
+      "passed_count": 0,
+      "failed_count": 0,
+      "skipped_count": 0,
+      "elapsed_seconds": 79.716396
+    }
+  ],
+  "phase_a_handoff": {
+    "acceptance_path": "transfer_safety",
+    "acceptance_sha256": "9968b9f94f1a4f1e25530c660be507682191a50f14cfaa50ea172e8315e9a2c1",
+    "run_manifest_sha256": "4c5f5d4b2fcd89d2421c20790af936132b9db617f9b24231b238b25006e17040",
+    "phase_a_config_sha256": "53768589f6e2311bd3386997ef9295b441290b5607a16f7d688696709110d192",
+    "training_fingerprint": "a72c236bea4e51a1a921f4f7ad944a326aedf3957dd768ab6ad547097ea21339",
+    "cache_sha256": "010495c9e229271f2dd78302e9da74e9388f3297bfbb9012e09133f83ff45972",
+    "complete_folds": 5,
+    "groups": 212,
+    "segments": 586
+  },
+  "phase_b_output_root_absent": {
+    "before_preflight": true,
+    "after_preflight": true
+  }
+}
