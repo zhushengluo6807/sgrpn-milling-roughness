@@ -1263,6 +1263,54 @@ def test_phase_b_completion_deeply_reloads_registered_artifacts(
     )
 
 
+def test_phase_b_completion_rejects_oof_score_semantic_mismatch_after_hash_refresh(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    assert completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+    oof_path = marker_path.parent / "calibration/oof_predictions.csv"
+    oof = pd.read_csv(oof_path)
+    oof.loc[0, "mu"] = float(oof.loc[0, "mu"]) + 1_000.0
+    oof.to_csv(oof_path, index=False)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["artifacts"]["calibration/oof_predictions.csv"] = hashlib.sha256(
+        oof_path.read_bytes()
+    ).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+def test_phase_b_completion_rejects_score_quantile_semantic_mismatch_after_hash_refresh(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    assert completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+    quantiles_path = marker_path.parent / "calibration/quantiles.json"
+    quantiles = json.loads(quantiles_path.read_text(encoding="utf-8"))
+    forged = quantiles["quantiles"]["heteroscedastic"]["0.10"]
+    forged["order_index"] -= 1
+    forged["quantile"] = float(forged["quantile"]) + 1.0
+    quantiles_path.write_text(json.dumps(quantiles), encoding="utf-8")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["artifacts"]["calibration/quantiles.json"] = hashlib.sha256(
+        quantiles_path.read_bytes()
+    ).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
 def test_phase_b_publication_is_atomic_ordered_and_complete_marker_is_last(
     tmp_path, monkeypatch
 ):

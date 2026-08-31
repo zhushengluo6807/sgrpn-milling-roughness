@@ -1576,6 +1576,32 @@ def _validate_phase_b_calibration(
     ):
         raise ValueError("Phase B calibration group scores are incompatible")
 
+    canonical_scores: dict[str, pd.DataFrame] = {}
+    score_metadata_columns = tuple(
+        column for column in CALIBRATION_SCORE_COLUMNS if column != "score"
+    )
+    for model in SCALE_MODELS:
+        recomputed = _calibration_group_scores(
+            oof.loc[oof["scale_model"] == model].reset_index(drop=True)
+        )
+        persisted = scores.loc[
+            scores["scale_model"] == model, CALIBRATION_SCORE_COLUMNS
+        ].reset_index(drop=True)
+        if not persisted.loc[:, score_metadata_columns].equals(
+            recomputed.loc[:, score_metadata_columns]
+        ):
+            raise ValueError("Phase B calibration group score provenance is incompatible")
+        # CSV serialization can perturb the final decimal digit of a binary float;
+        # accept only that absolute round-trip noise and no relative drift.
+        if not np.allclose(
+            persisted["score"].to_numpy(dtype=np.float64),
+            recomputed["score"].to_numpy(dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("Phase B calibration group scores do not derive from OOF")
+        canonical_scores[model] = recomputed
+
     quantiles = _load_json_object(calibration_dir / "quantiles.json")
     if (
         quantiles.get("protocol") != PHASE_B_PROTOCOL
@@ -1593,21 +1619,32 @@ def _validate_phase_b_calibration(
         model_quantiles = quantiles["quantiles"][model]
         if not isinstance(model_quantiles, dict) or set(model_quantiles) != expected_alpha_keys:
             raise ValueError("Phase B calibration quantile coverage is incompatible")
-        group_count = len(scores.loc[scores["scale_model"] == model])
-        for alpha_key, raw in model_quantiles.items():
-            alpha = float(alpha_key)
+        for alpha in PHASE_B_ALPHAS:
+            alpha_key = f"{alpha:.2f}"
+            raw = model_quantiles[alpha_key]
+            recomputed = finite_sample_group_quantile(
+                canonical_scores[model]["score"].to_numpy(dtype=np.float64), alpha=alpha
+            )
             if (
                 not isinstance(raw, dict)
-                or raw.get("alpha") != alpha
-                or raw.get("group_count") != group_count
+                or raw.get("alpha") != recomputed.alpha
+                or raw.get("group_count") != recomputed.group_count
                 or type(raw.get("order_index")) is not int
-                or not 1 <= raw["order_index"] <= group_count
+                or raw["order_index"] != recomputed.order_index
                 or isinstance(raw.get("quantile"), bool)
                 or not isinstance(raw.get("quantile"), (int, float))
                 or not math.isfinite(float(raw["quantile"]))
                 or float(raw["quantile"]) < 0.0
+                # The same OOF CSV round trip can perturb its selected order
+                # statistic by a final decimal digit, but must not permit drift.
+                or not math.isclose(
+                    float(raw["quantile"]),
+                    recomputed.quantile,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
             ):
-                raise ValueError("Phase B calibration quantile values are incompatible")
+                raise ValueError("Phase B calibration quantiles do not derive from scores")
 
 
 def _validate_completed_phase_b_artifacts(
