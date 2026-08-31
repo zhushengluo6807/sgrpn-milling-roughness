@@ -634,6 +634,22 @@ def _train_phase_b(
     )
     if completed_before - set(recorded_before):
         raise ValueError("Phase B reused fold device provenance is incomplete")
+    if (
+        before_manifest.get("status") == "complete"
+        and set(trained_keys).issubset(completed_before)
+    ):
+        validate_phase_b_outputs(config)
+        print(
+            json.dumps(
+                {
+                    "training_status": "complete",
+                    "fold": fold,
+                    "seed": seed,
+                    "device": selected,
+                }
+            )
+        )
+        return
     if fold is None:
         run_phase_b(
             config,

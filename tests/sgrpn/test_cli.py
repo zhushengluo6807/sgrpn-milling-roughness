@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -660,3 +661,117 @@ def test_phase_b_train_resume_preserves_previously_recorded_device(
     recorded = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))["selected_device_by_fold_seed"]
     assert recorded[existing_key] == "cpu"
     assert all(recorded[key] == "cuda" for key in keys[1:])
+
+
+def test_phase_b_train_resume_preserves_final_manifest_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    from dataclasses import asdict
+
+    import roughness.sgrpn.reporting as reporting
+    from roughness.sgrpn.config import PhaseAHandoff, PhaseBConfig
+
+    output = tmp_path / "outputs" / "sgrpn" / "phase_b"
+    output.mkdir(parents=True)
+    config = PhaseBConfig(
+        phase_a_config_path=tmp_path / "phase-a.yaml",
+        phase_a_config_file_sha256="a" * 64,
+        phase_a_acceptance_path=tmp_path / "acceptance.json",
+        phase_a_run_manifest_path=tmp_path / "run-manifest.json",
+        output_dir=output,
+        seeds=(20260723, 20260724, 20260725),
+        alphas=(0.10, 0.05),
+        inner_splits=4,
+        max_epochs=200,
+        patience=20,
+        variance_learning_rate=0.001,
+        weight_decay=0.0001,
+        bootstrap_repetitions=10000,
+    )
+    handoff = PhaseAHandoff(
+        acceptance_sha256="b" * 64,
+        run_manifest_sha256="c" * 64,
+        phase_a_config_sha256="d" * 64,
+        training_fingerprint="fixture-training",
+        cache_sha256="e" * 64,
+        input_sha256={"manifest": "f" * 64},
+    )
+    keys = tuple(
+        f"fold_{fold}/seed_{seed}"
+        for fold in range(5)
+        for seed in config.seeds
+    )
+    fingerprints = {
+        key: hashlib.sha256(f"fingerprint/{key}".encode("ascii")).hexdigest()
+        for key in keys
+    }
+    completion_hashes = {
+        key: hashlib.sha256(f"completion/{key}".encode("ascii")).hexdigest()
+        for key in keys
+    }
+    devices = {key: "cpu" for key in keys}
+    handoff_file_sha256 = "1" * 64
+    manifest = {
+        "schema_version": "sgrpn-phase-b-run-v1",
+        "phase_b_config": reporting._jsonable(asdict(config)),
+        "phase_b_config_sha256": reporting._phase_b_config_hash(config),
+        "phase_a_handoff": asdict(handoff),
+        "handoff_file_sha256": handoff_file_sha256,
+        "protocol": reporting.PHASE_B_PROTOCOL,
+        "status": "complete",
+        "seeds": list(config.seeds),
+        "alphas": list(config.alphas),
+        "input_fingerprints": dict(handoff.input_sha256),
+        "cache_sha256": handoff.cache_sha256,
+        "training_fingerprint": handoff.training_fingerprint,
+        "fold_fingerprints": fingerprints,
+        "fold_completion_sha256": completion_hashes,
+        "selected_device_by_fold_seed": devices,
+        "device_provenance_sha256": reporting._phase_b_device_provenance_hash(
+            devices, fingerprints, completion_hashes
+        ),
+        "bootstrap": {
+            "repetitions": reporting.BOOTSTRAP_REPETITIONS,
+            "seed": reporting.BOOTSTRAP_SEED,
+            "resampling_unit": "group_id",
+        },
+        "environment": {
+            "python_version": "3.12.13",
+            "python_executable": "fixture-python",
+            "platform": "fixture-platform",
+        },
+        "artifacts": {},
+    }
+    assert set(manifest) == reporting._PHASE_B_MANIFEST_KEYS
+    manifest_path = output / "run_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    before = manifest_path.read_bytes()
+    validation_events: list[PhaseBConfig] = []
+
+    monkeypatch.setattr(cli, "load_phase_b_config", lambda path: config)
+    monkeypatch.setattr(
+        cli, "_preflight_phase_b", lambda value: (handoff, object(), object(), object())
+    )
+    monkeypatch.setattr(cli, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(cli, "_selected_device", lambda requested: "cpu")
+    monkeypatch.setattr(
+        cli, "_phase_b_existing_completed_keys", lambda *args, **kwargs: set(keys)
+    )
+    monkeypatch.setattr(cli, "run_phase_b", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli, "validate_phase_b_outputs", lambda value: validation_events.append(value)
+    )
+
+    assert cli.main(["train-phase-b", "--config", "phase-b.yaml", "--resume"]) == 0
+    assert manifest_path.read_bytes() == before
+    assert validation_events == [config]
+    reporting._phase_b_validate_manifest_contract(
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+        config=config,
+        handoff=handoff,
+        handoff_file_sha256=handoff_file_sha256,
+        fingerprints=fingerprints,
+        completion_hashes=completion_hashes,
+    )
