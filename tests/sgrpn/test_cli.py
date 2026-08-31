@@ -613,3 +613,50 @@ def test_phase_b_resume_of_completed_evaluation_only_deep_validates(
 
     assert cli.main(["run-phase-b", "--config", "phase-b.yaml", "--resume"]) == 0
     assert events == ["preflight", "validate"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["train-phase-b", "--config", "phase-b.yaml", "--fold", "5"],
+        ["train-phase-b", "--config", "phase-b.yaml", "--seed", "7"],
+    ),
+)
+def test_phase_b_parser_rejects_unregistered_fold_and_seed(arguments: list[str]):
+    with pytest.raises(SystemExit) as error:
+        cli.main(arguments)
+    assert error.value.code == 2
+
+
+def test_phase_b_train_resume_preserves_previously_recorded_device(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    output = tmp_path / "outputs" / "sgrpn" / "phase_b"
+    output.mkdir(parents=True)
+    keys = [
+        f"fold_{fold}/seed_{seed}"
+        for fold in range(5)
+        for seed in (20260723, 20260724, 20260725)
+    ]
+    existing_key = keys[0]
+    (output / "run_manifest.json").write_text(
+        json.dumps({"selected_device_by_fold_seed": {existing_key: "cpu"}}),
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(output_dir=output, seeds=(20260723, 20260724, 20260725))
+    context = (object(), object(), object(), object())
+    monkeypatch.setattr(cli, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(cli, "_selected_device", lambda requested: "cuda")
+    monkeypatch.setattr(cli, "run_phase_b", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        cli,
+        "_phase_b_existing_completed_keys",
+        lambda *args, **kwargs: {existing_key},
+        raising=False,
+    )
+
+    cli._train_phase_b(config, context, device="cuda", resume=True)
+
+    recorded = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))["selected_device_by_fold_seed"]
+    assert recorded[existing_key] == "cpu"
+    assert all(recorded[key] == "cuda" for key in keys[1:])

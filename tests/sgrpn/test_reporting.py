@@ -8,7 +8,11 @@ import pytest
 
 from roughness.sgrpn.config import PhaseAHandoff, PhaseBConfig
 from roughness.sgrpn.data import DataBundle
-from roughness.sgrpn.reporting import write_phase_a_report, write_phase_b_report
+from roughness.sgrpn.reporting import (
+    validate_phase_b_outputs,
+    write_phase_a_report,
+    write_phase_b_report,
+)
 
 
 def _synthetic_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -438,6 +442,7 @@ def test_phase_b_report_regenerates_tables_and_figures_without_checkpoints(
     import roughness.sgrpn.reporting as reporting
 
     monkeypatch.setattr(reporting, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(reporting, "_phase_b_fingerprint_map", lambda *args: {}, raising=False)
     immutable_roots = [
         config.phase_a_run_manifest_path.parent,
         tmp_path / "outputs" / "scheme1",
@@ -449,9 +454,13 @@ def test_phase_b_report_regenerates_tables_and_figures_without_checkpoints(
         path.relative_to(config.output_dir).as_posix(): path.read_bytes()
         for path in config.output_dir.rglob("*.csv")
     }
+    figure_bytes = {
+        path.relative_to(config.output_dir).as_posix(): path.read_bytes()
+        for path in (config.output_dir / "evaluation" / "figures").glob("*.png")
+    }
     assert len(table_bytes) > 10
     assert all(path.is_file() for name, path in written.items() if name.startswith("figure_"))
-    assert json.loads((config.output_dir / "evaluation" / "method_notes.json").read_text(encoding="utf-8"))["three_readings_one_region"] is True
+    assert json.loads((config.output_dir / "evaluation" / "method_notes.json").read_text(encoding="utf-8")) == reporting._PHASE_B_METHOD_NOTES
 
     for path in list(config.output_dir.rglob("*.csv")) + list(
         (config.output_dir / "evaluation" / "figures").glob("*.png")
@@ -463,5 +472,193 @@ def test_phase_b_report_regenerates_tables_and_figures_without_checkpoints(
         path.relative_to(config.output_dir).as_posix(): path.read_bytes()
         for path in config.output_dir.rglob("*.csv")
     } == table_bytes
-    assert len(list((config.output_dir / "evaluation" / "figures").glob("*.png"))) == 9
+    assert {
+        path.relative_to(config.output_dir).as_posix(): path.read_bytes()
+        for path in (config.output_dir / "evaluation" / "figures").glob("*.png")
+    } == figure_bytes
     assert {str(root): _hash_tree(root) for root in immutable_roots} == before
+
+
+def _phase_b_complete_report_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[PhaseBConfig, PhaseAHandoff, DataBundle, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    config, handoff, bundle, mean, probability, scores, quantiles = _phase_b_report_fixture(tmp_path)
+    import roughness.sgrpn.reporting as reporting
+
+    monkeypatch.setattr(reporting, "validate_phase_b_output_root", lambda path: Path(path))
+    fingerprints: dict[str, str] = {}
+    devices: dict[str, str] = {}
+    inner_frames: list[pd.DataFrame] = []
+    for fold in range(5):
+        for seed in config.seeds:
+            key = f"fold_{fold}/seed_{seed}"
+            fingerprints[key] = hashlib.sha256(key.encode("ascii")).hexdigest()
+            devices[key] = "cpu"
+            fold_dir = config.output_dir / "folds" / f"fold_{fold}" / f"seed_{seed}"
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            (fold_dir / "complete.json").write_text(
+                json.dumps({"fixture": key}), encoding="utf-8"
+            )
+            inner = pd.DataFrame(
+                {"record_type": ["fixture"], "fold": [fold], "seed": [seed]}
+            )
+            inner_path = fold_dir / "calibration" / "inner_folds.csv"
+            inner_path.parent.mkdir(parents=True, exist_ok=True)
+            inner.to_csv(inner_path, index=False)
+            inner_frames.append(inner)
+            nested = {"fold": fold, "seed": seed, "quantiles": {}}
+            for scale_model in ("heteroscedastic", "homoscedastic"):
+                nested["quantiles"][scale_model] = {}
+                for alpha in (0.10, 0.05):
+                    row = quantiles.loc[
+                        (quantiles["fold"] == fold)
+                        & (quantiles["seed"] == seed)
+                        & (quantiles["scale_model"] == scale_model)
+                        & (quantiles["alpha"] == alpha)
+                    ].iloc[0]
+                    nested["quantiles"][scale_model][f"{alpha:.2f}"] = {
+                        "group_count": int(row["group_count"]),
+                        "order_index": int(row["order_index"]),
+                        "quantile": float(row["quantile"]),
+                    }
+            (fold_dir / "calibration" / "quantiles.json").write_text(
+                json.dumps(nested), encoding="utf-8"
+            )
+    (config.output_dir / "run_manifest.json").write_text(
+        json.dumps({"selected_device_by_fold_seed": devices}), encoding="utf-8"
+    )
+    monkeypatch.setattr(reporting, "_phase_b_fingerprint_map", lambda *args: fingerprints, raising=False)
+    write_phase_b_report(config, handoff, bundle, mean, probability, scores, quantiles)
+    return config, handoff, bundle, mean, probability, scores, quantiles, fingerprints
+
+
+def test_phase_b_manifest_is_closed_and_deep_validation_rebuilds_nested_quantiles_and_pngs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    (
+        config,
+        handoff,
+        bundle,
+        mean,
+        probability,
+        scores,
+        quantiles,
+        fingerprints,
+    ) = _phase_b_complete_report_fixture(monkeypatch, tmp_path)
+    import roughness.sgrpn.reporting as reporting
+
+    inner = pd.concat(
+        [
+            pd.read_csv(
+                config.output_dir / "folds" / f"fold_{fold}" / f"seed_{seed}" / "calibration" / "inner_folds.csv"
+            )
+            for fold in range(5)
+            for seed in config.seeds
+        ],
+        ignore_index=True,
+    )
+    monkeypatch.setattr(reporting, "validate_phase_b_handoff", lambda value: handoff)
+    monkeypatch.setattr(reporting, "load_sgrpn_config", lambda path: object())
+    monkeypatch.setattr(reporting, "load_data_bundle", lambda value: bundle)
+    monkeypatch.setattr(
+        reporting,
+        "_phase_b_saved_fold_inputs",
+        lambda *args: (probability, mean, scores, inner),
+    )
+    monkeypatch.setattr(reporting, "_phase_b_fingerprint_map", lambda *args: fingerprints, raising=False)
+
+    manifest_path = config.output_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["fold_fingerprints"] == fingerprints
+    assert set(manifest["selected_device_by_fold_seed"]) == set(fingerprints)
+    assert manifest["environment"] and all(isinstance(value, str) and value for value in manifest["environment"].values())
+    validate_phase_b_outputs(config)
+
+    original_manifest = manifest_path.read_bytes()
+    original_png = (config.output_dir / "evaluation" / "figures" / "coverage_width.png").read_bytes()
+    original_quantiles = (
+        config.output_dir / "folds" / "fold_0" / "seed_20260723" / "calibration" / "quantiles.json"
+    ).read_bytes()
+    original_table = (config.output_dir / "evaluation" / "mean_metrics.csv").read_bytes()
+    original_marker = (config.output_dir / "folds" / "fold_0" / "seed_20260723" / "complete.json").read_bytes()
+
+    manifest["phase_b_config"]["max_epochs"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest|config"):
+        validate_phase_b_outputs(config)
+    manifest_path.write_bytes(original_manifest)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["fold_fingerprints"]["fold_0/seed_20260723"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="fingerprint"):
+        validate_phase_b_outputs(config)
+    manifest_path.write_bytes(original_manifest)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["selected_device_by_fold_seed"]["fold_0/seed_20260723"] = "cuda"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="device"):
+        validate_phase_b_outputs(config)
+    manifest_path.write_bytes(original_manifest)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["evaluation/mean_metrics.csv"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="hash"):
+        validate_phase_b_outputs(config)
+    manifest_path.write_bytes(original_manifest)
+
+    png_path = config.output_dir / "evaluation" / "figures" / "coverage_width.png"
+    png_path.write_bytes(b"replaced")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["evaluation/figures/coverage_width.png"] = hashlib.sha256(
+        png_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="figure|PNG"):
+        validate_phase_b_outputs(config)
+    png_path.write_bytes(original_png)
+    manifest_path.write_bytes(original_manifest)
+
+    quantile_path = config.output_dir / "folds" / "fold_0" / "seed_20260723" / "calibration" / "quantiles.json"
+    nested = json.loads(quantile_path.read_text(encoding="utf-8"))
+    nested["quantiles"]["heteroscedastic"]["0.10"]["quantile"] = 3.0
+    quantile_path.write_text(json.dumps(nested), encoding="utf-8")
+    with pytest.raises(ValueError, match="quantile"):
+        validate_phase_b_outputs(config)
+    quantile_path.write_bytes(original_quantiles)
+
+    table_path = config.output_dir / "evaluation" / "mean_metrics.csv"
+    table_path.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="metrics|unreadable"):
+        validate_phase_b_outputs(config)
+    table_path.write_bytes(original_table)
+
+    marker_path = config.output_dir / "folds" / "fold_0" / "seed_20260723" / "complete.json"
+    marker_path.write_text(json.dumps({"fixture": "tampered"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="completion"):
+        validate_phase_b_outputs(config)
+    marker_path.write_bytes(original_marker)
+
+
+def test_phase_b_coverage_width_figure_includes_width_series(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    config, handoff, bundle, mean, probability, scores, quantiles = _phase_b_report_fixture(tmp_path)
+    import roughness.sgrpn.reporting as reporting
+
+    monkeypatch.setattr(reporting, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(reporting, "_phase_b_fingerprint_map", lambda *args: {}, raising=False)
+    write_phase_b_report(config, handoff, bundle, mean, probability, scores, quantiles)
+    captured: dict[str, object] = {}
+    coverage_width_figure = reporting._phase_b_coverage_width_figure
+
+    def capture(coverage: pd.DataFrame, width: pd.DataFrame):
+        figure = coverage_width_figure(coverage, width)
+        captured["labels"] = [axis.get_ylabel() for axis in figure.axes]
+        return figure
+
+    monkeypatch.setattr(reporting, "_phase_b_coverage_width_figure", capture)
+    reporting._write_phase_b_figures_from_tables(config.output_dir)
+    assert captured["labels"] == ["Coverage", "Mean interval width (μm)"]

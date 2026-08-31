@@ -42,7 +42,12 @@ from .reporting import (
     write_phase_a_report,
     write_phase_b_report,
 )
-from .phase_b_training import run_phase_b, run_phase_b_fold
+from .phase_b_training import (
+    _phase_b_fingerprint,
+    completed_phase_b_fold_matches,
+    run_phase_b,
+    run_phase_b_fold,
+)
 from .training import (
     MODEL_SEQUENCE,
     RunFingerprint,
@@ -549,6 +554,46 @@ def _preflight_phase_b(config: PhaseBConfig) -> tuple[PhaseAHandoff, SGRPNConfig
     return handoff, phase_a_config, bundle, cache
 
 
+def _phase_b_training_keys(
+    config: PhaseBConfig, *, fold: int | None, seed: int | None
+) -> tuple[str, ...]:
+    if fold is None:
+        return tuple(
+            f"fold_{outer_fold}/seed_{outer_seed}"
+            for outer_fold in range(5)
+            for outer_seed in config.seeds
+        )
+    selected_seed = config.seeds[0] if seed is None else seed
+    return (f"fold_{fold}/seed_{selected_seed}",)
+
+
+def _phase_b_existing_completed_keys(
+    config: PhaseBConfig,
+    handoff: PhaseAHandoff,
+    bundle: Any,
+    cache: Any,
+    output: Path,
+    *,
+    fold: int | None,
+    seed: int | None,
+) -> set[str]:
+    """Identify units that were deeply complete before this invocation."""
+    existing: set[str] = set()
+    for key in _phase_b_training_keys(config, fold=fold, seed=seed):
+        fold_text, seed_text = key.split("/")
+        outer_fold = int(fold_text.removeprefix("fold_"))
+        outer_seed = int(seed_text.removeprefix("seed_"))
+        fingerprint = _phase_b_fingerprint(
+            config, handoff, bundle, cache, fold=outer_fold, seed=outer_seed
+        )
+        marker = output / "folds" / fold_text / seed_text / "complete.json"
+        if marker.is_file() and completed_phase_b_fold_matches(
+            marker, fingerprint, fold=outer_fold, seed=outer_seed
+        ):
+            existing.add(key)
+    return existing
+
+
 def _train_phase_b(
     config: PhaseBConfig,
     context: tuple[PhaseAHandoff, SGRPNConfig, Any, Any],
@@ -558,7 +603,7 @@ def _train_phase_b(
     device: str = "auto",
     resume: bool = False,
 ) -> None:
-    del resume  # The fold runner itself only reuses deeply valid completed artifacts.
+    del resume  # Exact completed artifacts are reusable for every invocation.
     handoff, phase_a_config, bundle, cache = context
     output = validate_phase_b_output_root(config.output_dir)
     if fold is not None and fold not in range(5):
@@ -567,6 +612,28 @@ def _train_phase_b(
         raise ValueError("Phase B seed must be one of the three registered seeds")
     selected = _selected_device(device)
     output.mkdir(parents=True, exist_ok=True)
+    manifest_path = output / "run_manifest.json"
+    before_manifest = (
+        _read_json(manifest_path, "Phase B run manifest") if manifest_path.is_file() else {}
+    )
+    recorded_before = before_manifest.get("selected_device_by_fold_seed", {})
+    if not isinstance(recorded_before, dict) or any(
+        str(value) not in {"cpu", "cuda"} for value in recorded_before.values()
+    ):
+        raise ValueError("Phase B run manifest device records are incompatible")
+    recorded_before = {str(key): str(value) for key, value in recorded_before.items()}
+    trained_keys = _phase_b_training_keys(config, fold=fold, seed=seed)
+    completed_before = _phase_b_existing_completed_keys(
+        config,
+        handoff,
+        bundle,
+        cache,
+        output,
+        fold=fold,
+        seed=seed,
+    )
+    if completed_before - set(recorded_before):
+        raise ValueError("Phase B reused fold device provenance is incomplete")
     if fold is None:
         run_phase_b(
             config,
@@ -589,24 +656,24 @@ def _train_phase_b(
             device=selected,
             output_root=output,
         )
-    manifest_path = output / "run_manifest.json"
     manifest = _read_json(manifest_path, "Phase B run manifest") if manifest_path.is_file() else {}
     recorded = manifest.get("selected_device_by_fold_seed", {})
     if not isinstance(recorded, dict):
         raise ValueError("Phase B run manifest device records are incompatible")
-    trained_keys = (
-        [f"fold_{outer_fold}/seed_{outer_seed}" for outer_fold in range(5) for outer_seed in config.seeds]
-        if fold is None
-        else [f"fold_{fold}/seed_{config.seeds[0] if seed is None else seed}"]
-    )
+    recorded = {str(key): str(value) for key, value in recorded.items()}
+    if any(value not in {"cpu", "cuda"} for value in recorded.values()):
+        raise ValueError("Phase B run manifest device records are incompatible")
+    for key in completed_before:
+        if recorded.get(key, recorded_before[key]) != recorded_before[key]:
+            raise ValueError("Phase B reused fold device provenance changed")
+        recorded[key] = recorded_before[key]
+    for key in set(trained_keys) - completed_before:
+        recorded[key] = selected
     manifest.update(
         {
             "schema_version": "sgrpn-phase-b-run-v1",
             "training_status": "complete" if fold is None else "partial",
-            "selected_device_by_fold_seed": {
-                **{str(key): str(value) for key, value in recorded.items()},
-                **{key: selected for key in trained_keys},
-            },
+            "selected_device_by_fold_seed": recorded,
         }
     )
     _atomic_json(manifest_path, manifest)
@@ -634,7 +701,7 @@ def _phase_b_evaluation_complete(config: PhaseBConfig) -> bool:
     if not path.is_file():
         return False
     try:
-        return _read_json(path, "Phase B run manifest").get("evaluation_status") == "complete"
+        return _read_json(path, "Phase B run manifest").get("status") == "complete"
     except ValueError:
         return False
 

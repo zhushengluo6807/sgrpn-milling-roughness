@@ -742,6 +742,141 @@ def _phase_b_config_hash(config: PhaseBConfig) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _phase_b_fold_key(fold: int, seed: int) -> str:
+    return f"fold_{fold}/seed_{seed}"
+
+
+def _phase_b_expected_fold_keys() -> tuple[str, ...]:
+    return tuple(
+        _phase_b_fold_key(fold, seed)
+        for fold in range(5)
+        for seed in (20260723, 20260724, 20260725)
+    )
+
+
+def _phase_b_fingerprint_map(
+    config: PhaseBConfig, handoff: PhaseAHandoff, bundle: DataBundle
+) -> dict[str, str]:
+    """Recompute every registered fold/seed fingerprint from immutable inputs."""
+    from .order_spectrum import load_order_cache
+
+    phase_a = load_sgrpn_config(config.phase_a_config_path)
+    cache = load_order_cache(bundle, phase_a)
+    return {
+        _phase_b_fold_key(fold, seed): _phase_b_fingerprint(
+            config, handoff, bundle, cache, fold=fold, seed=seed
+        ).value
+        for fold in range(5)
+        for seed in (20260723, 20260724, 20260725)
+    }
+
+
+def _phase_b_device_provenance_hash(
+    devices: Mapping[str, str],
+    fingerprints: Mapping[str, str],
+    completion_hashes: Mapping[str, str],
+) -> str:
+    payload = json.dumps(
+        {
+            "selected_device_by_fold_seed": dict(devices),
+            "fold_fingerprints": dict(fingerprints),
+            "fold_completion_sha256": dict(completion_hashes),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _phase_b_environment() -> dict[str, str]:
+    return {
+        "python_version": platform.python_version(),
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+    }
+
+
+_PHASE_B_MANIFEST_KEYS = {
+    "schema_version",
+    "phase_b_config",
+    "phase_b_config_sha256",
+    "phase_a_handoff",
+    "handoff_file_sha256",
+    "protocol",
+    "status",
+    "seeds",
+    "alphas",
+    "input_fingerprints",
+    "cache_sha256",
+    "training_fingerprint",
+    "fold_fingerprints",
+    "fold_completion_sha256",
+    "selected_device_by_fold_seed",
+    "device_provenance_sha256",
+    "bootstrap",
+    "environment",
+    "artifacts",
+}
+
+
+def _phase_b_validate_manifest_contract(
+    manifest: Mapping[str, Any],
+    *,
+    config: PhaseBConfig,
+    handoff: PhaseAHandoff,
+    handoff_file_sha256: str,
+    fingerprints: Mapping[str, str],
+    completion_hashes: Mapping[str, str],
+) -> None:
+    if set(manifest) != _PHASE_B_MANIFEST_KEYS:
+        raise ValueError("Phase B run manifest schema is incompatible")
+    expected_keys = set(_phase_b_expected_fold_keys())
+    devices = manifest["selected_device_by_fold_seed"]
+    environment = manifest["environment"]
+    if (
+        manifest["schema_version"] != "sgrpn-phase-b-run-v1"
+        or manifest["phase_b_config"] != _jsonable(asdict(config))
+        or manifest["phase_b_config_sha256"] != _phase_b_config_hash(config)
+    ):
+        raise ValueError("Phase B run manifest config is incompatible")
+    if (
+        manifest["phase_a_handoff"] != asdict(handoff)
+        or manifest["handoff_file_sha256"] != handoff_file_sha256
+        or manifest["protocol"] != PHASE_B_PROTOCOL
+        or manifest["status"] != "complete"
+        or manifest["seeds"] != list(config.seeds)
+        or manifest["alphas"] != list(config.alphas)
+        or manifest["input_fingerprints"] != dict(handoff.input_sha256)
+        or manifest["cache_sha256"] != handoff.cache_sha256
+        or manifest["training_fingerprint"] != handoff.training_fingerprint
+    ):
+        raise ValueError("Phase B run manifest provenance is incompatible")
+    if manifest["fold_fingerprints"] != dict(fingerprints):
+        raise ValueError("Phase B fold fingerprint provenance is incompatible")
+    if manifest["fold_completion_sha256"] != dict(completion_hashes):
+        raise ValueError("Phase B completion provenance is incompatible")
+    if (
+        manifest["bootstrap"]
+        != {"repetitions": BOOTSTRAP_REPETITIONS, "seed": BOOTSTRAP_SEED, "resampling_unit": "group_id"}
+        or not isinstance(environment, dict)
+        or set(environment) != {"python_version", "python_executable", "platform"}
+        or any(not isinstance(value, str) or not value for value in environment.values())
+        or not isinstance(manifest["artifacts"], dict)
+    ):
+        raise ValueError("Phase B run manifest metadata is incompatible")
+    if (
+        not isinstance(devices, dict)
+        or set(devices) != expected_keys
+        or any(value not in {"cpu", "cuda"} for value in devices.values())
+    ):
+        raise ValueError("Phase B selected device records are incomplete or incompatible")
+    if manifest["device_provenance_sha256"] != _phase_b_device_provenance_hash(
+        devices, fingerprints, completion_hashes
+    ):
+        raise ValueError("Phase B device provenance is incompatible")
+
+
 def _phase_b_hash_tree(root: Path) -> dict[str, str]:
     """Return a deterministic byte-level inventory without following links."""
     resolved = root.resolve()
@@ -904,22 +1039,81 @@ def _phase_b_paired_bootstrap(
 
 
 def _phase_b_plot_bars(
-    path: Path, frame: pd.DataFrame, *, title: str, ylabel: str
-) -> Path:
+    frame: pd.DataFrame, *, title: str, ylabel: str
+) -> plt.Figure:
     figure, axis = plt.subplots(figsize=(8, 5))
     if frame.empty:
+        plt.close(figure)
         raise ValueError(f"Phase B figure input is empty: {title}")
-    labels = [" / ".join(str(value) for value in row) for row in frame.iloc[:, :-1].itertuples(index=False, name=None)]
+    labels = [
+        " / ".join(str(value) for value in row)
+        for row in frame.iloc[:, :-1].itertuples(index=False, name=None)
+    ]
     axis.bar(np.arange(len(frame)), frame.iloc[:, -1].to_numpy(dtype=np.float64), color="#4472C4")
     axis.set_xticks(np.arange(len(frame)), labels, rotation=35, ha="right")
     axis.set_title(title)
     axis.set_ylabel(ylabel)
-    return _atomic_figure(path, figure)
+    return figure
 
 
-def _write_phase_b_figures_from_tables(output: Path) -> dict[str, Path]:
-    """Render figures solely from report CSVs already saved under ``output``."""
-    figures = output / "evaluation" / "figures"
+def _phase_b_coverage_width_figure(
+    coverage: pd.DataFrame, width: pd.DataFrame
+) -> plt.Figure:
+    if coverage.empty or width.empty:
+        raise ValueError("Phase B coverage/width figure input is empty")
+    identifiers = ["scale_model", "nominal_coverage"]
+    merged = coverage.merge(
+        width,
+        on=identifiers,
+        how="inner",
+        validate="one_to_one",
+        suffixes=("_coverage", "_width"),
+    ).sort_values(identifiers, kind="stable")
+    if len(merged) != len(coverage) or len(merged) != len(width):
+        raise ValueError("Phase B coverage/width figure inputs are incompatible")
+    figure, coverage_axis = plt.subplots(figsize=(8, 5))
+    positions = np.arange(len(merged), dtype=np.float64)
+    labels = [
+        f"{scale_model} / {float(nominal):.2f}"
+        for scale_model, nominal in merged.loc[:, identifiers].itertuples(index=False, name=None)
+    ]
+    coverage_axis.bar(
+        positions - 0.2,
+        merged["value_coverage"].to_numpy(dtype=np.float64),
+        width=0.4,
+        color="#4472C4",
+        label="Coverage",
+    )
+    coverage_axis.set_ylabel("Coverage")
+    coverage_axis.set_ylim(0.0, 1.05)
+    width_axis = coverage_axis.twinx()
+    width_axis.bar(
+        positions + 0.2,
+        merged["value_width"].to_numpy(dtype=np.float64),
+        width=0.4,
+        color="#ED7D31",
+        label="Mean interval width",
+    )
+    width_axis.set_ylabel("Mean interval width (μm)")
+    coverage_axis.set_xticks(positions, labels, rotation=35, ha="right")
+    coverage_axis.set_title("Conformal simultaneous coverage and interval width")
+    handles, labels = coverage_axis.get_legend_handles_labels()
+    width_handles, width_labels = width_axis.get_legend_handles_labels()
+    coverage_axis.legend(handles + width_handles, labels + width_labels, loc="best")
+    return figure
+
+
+def _phase_b_figure_bytes(figure: plt.Figure) -> bytes:
+    buffer = io.BytesIO()
+    try:
+        figure.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+        return buffer.getvalue()
+    finally:
+        plt.close(figure)
+
+
+def _render_phase_b_figures_from_tables(output: Path) -> dict[str, bytes]:
+    """Render deterministic Phase B PNG bytes from persisted report tables only."""
     probability_metrics = _phase_b_frame(
         output / "evaluation" / "probability_metrics.csv",
         string_columns=("aggregation", "scale_model", "interval_type", "metric"),
@@ -936,38 +1130,60 @@ def _write_phase_b_figures_from_tables(output: Path) -> dict[str, Path]:
         output / "predictions" / "group_oof_predictions.csv",
         string_columns=("group_id", "version", "fold", "seed"),
     )
-    written: dict[str, Path] = {}
+    rendered: dict[str, bytes] = {}
+
+    def render(name: str, figure: plt.Figure) -> None:
+        rendered[name] = _phase_b_figure_bytes(figure)
+
     conformal = probability_metrics.loc[
         (probability_metrics["aggregation"] == "all_seed")
         & (probability_metrics["interval_type"] == "conformal")
     ]
-    coverage = conformal.loc[conformal["metric"].eq("simultaneous_group_coverage"), ["scale_model", "nominal_coverage", "value"]]
-    written["figure_coverage_width"] = _phase_b_plot_bars(
-        figures / "coverage_width.png", coverage, title="Conformal simultaneous coverage", ylabel="Coverage"
-    )
-    interval = conformal.loc[conformal["metric"].eq("winkler_score"), ["scale_model", "nominal_coverage", "value"]]
-    written["figure_interval_score"] = _phase_b_plot_bars(
-        figures / "interval_score.png", interval, title="Conformal interval score", ylabel="Winkler score"
+    coverage = conformal.loc[
+        conformal["metric"].eq("simultaneous_group_coverage"),
+        ["scale_model", "nominal_coverage", "value"],
+    ]
+    width = conformal.loc[
+        conformal["metric"].eq("mean_interval_width"),
+        ["scale_model", "nominal_coverage", "value"],
+    ]
+    render("coverage_width", _phase_b_coverage_width_figure(coverage, width))
+    interval = conformal.loc[
+        conformal["metric"].eq("winkler_score"),
+        ["scale_model", "nominal_coverage", "value"],
+    ]
+    render(
+        "interval_score",
+        _phase_b_plot_bars(
+            interval, title="Conformal interval score", ylabel="Winkler score"
+        ),
     )
     nll_crps = probability_metrics.loc[
         (probability_metrics["aggregation"] == "seed")
         & probability_metrics["metric"].isin(("gaussian_nll", "gaussian_crps")),
         ["seed", "scale_model", "metric", "value"],
     ]
-    written["figure_nll_crps_by_seed"] = _phase_b_plot_bars(
-        figures / "nll_crps_by_seed.png", nll_crps, title="NLL and CRPS by seed", ylabel="Metric value"
+    render(
+        "nll_crps_by_seed",
+        _phase_b_plot_bars(
+            nll_crps, title="NLL and CRPS by seed", ylabel="Metric value"
+        ),
     )
-    simultaneous = conformal.loc[
-        conformal["metric"].eq("simultaneous_group_coverage"), ["scale_model", "nominal_coverage", "value"]
-    ]
-    written["figure_group_simultaneous_coverage"] = _phase_b_plot_bars(
-        figures / "group_simultaneous_coverage.png", simultaneous, title="Group simultaneous coverage", ylabel="Coverage"
+    render(
+        "group_simultaneous_coverage",
+        _phase_b_plot_bars(
+            coverage,
+            title="Group simultaneous coverage",
+            ylabel="Coverage",
+        ),
     )
 
     g1 = mean.loc[mean["model"] == "G1"].copy()
     figure, axis = plt.subplots(figsize=(7, 6))
     for seed, values in g1.groupby("seed", sort=True, observed=True):
-        axis.scatter(values["target_mean"], values["prediction"], s=8, alpha=0.45, label=str(seed))
+        axis.scatter(
+            values["target_mean"], values["prediction"], s=8, alpha=0.45, label=str(seed)
+        )
     low = float(min(g1["target_mean"].min(), g1["prediction"].min()))
     high = float(max(g1["target_mean"].max(), g1["prediction"].max()))
     axis.plot([low, high], [low, high], "k--", linewidth=1)
@@ -975,20 +1191,27 @@ def _write_phase_b_figures_from_tables(output: Path) -> dict[str, Path]:
     axis.set_xlabel("Measured mean Ra (μm)")
     axis.set_ylabel("G1 prediction (μm)")
     axis.legend()
-    written["figure_prediction_scatter"] = _atomic_figure(figures / "prediction_scatter.png", figure)
+    render("prediction_scatter", figure)
 
     figure, axis = plt.subplots(figsize=(7, 6))
     for seed, values in g1.groupby("seed", sort=True, observed=True):
-        axis.scatter(values["prediction"], values["target_mean"] - values["prediction"], s=8, alpha=0.45, label=str(seed))
+        axis.scatter(
+            values["prediction"],
+            values["target_mean"] - values["prediction"],
+            s=8,
+            alpha=0.45,
+            label=str(seed),
+        )
     axis.axhline(0.0, color="black", linestyle="--", linewidth=1)
     axis.set_title("G1 residuals; v3/v4 stress test is confounded with speed")
     axis.set_xlabel("G1 prediction (μm)")
     axis.set_ylabel("Mean residual (μm)")
     axis.legend()
-    written["figure_residual_plot"] = _atomic_figure(figures / "residual_plot.png", figure)
+    render("residual_plot", figure)
 
     fold = mean_metrics.loc[
-        (mean_metrics["aggregation"] == "fold") & mean_metrics["metric"].eq("mean_mae")
+        (mean_metrics["aggregation"] == "fold")
+        & mean_metrics["metric"].eq("mean_mae")
     ]
     figure, axis = plt.subplots(figsize=(8, 5))
     for model, values in fold.groupby("model", sort=True, observed=True):
@@ -997,24 +1220,47 @@ def _write_phase_b_figures_from_tables(output: Path) -> dict[str, Path]:
     axis.set_xlabel("Outer fold")
     axis.set_ylabel("Weighted MAE (μm)")
     axis.legend()
-    written["figure_fold_stability"] = _atomic_figure(figures / "fold_stability.png", figure)
+    render("fold_stability", figure)
 
     figure, axis = plt.subplots(figsize=(7, 5))
-    axis.hist(groups["gate"], bins=np.linspace(0.0, 1.0, 21), color="#4472C4", edgecolor="white")
+    axis.hist(
+        groups["gate"], bins=np.linspace(0.0, 1.0, 21), color="#4472C4", edgecolor="white"
+    )
     axis.set_xlabel("G1 trust gate")
     axis.set_ylabel("Group-seed count")
-    written["figure_gate_distribution"] = _atomic_figure(figures / "gate_distribution.png", figure)
+    render("gate_distribution", figure)
 
-    heat = groups.pivot_table(index="n_rpm", columns="fz_mm_per_tooth", values="gate", aggfunc="mean").sort_index().sort_index(axis=1)
+    heat = (
+        groups.pivot_table(
+            index="n_rpm", columns="fz_mm_per_tooth", values="gate", aggfunc="mean"
+        )
+        .sort_index()
+        .sort_index(axis=1)
+    )
     figure, axis = plt.subplots(figsize=(8, 5))
-    image = axis.imshow(heat.to_numpy(dtype=np.float64), aspect="auto", vmin=0.0, vmax=1.0, cmap="viridis")
+    image = axis.imshow(
+        heat.to_numpy(dtype=np.float64),
+        aspect="auto",
+        vmin=0.0,
+        vmax=1.0,
+        cmap="viridis",
+    )
     axis.set_xticks(range(len(heat.columns)), [f"{value:g}" for value in heat.columns])
     axis.set_yticks(range(len(heat.index)), [f"{value:g}" for value in heat.index])
     axis.set_xlabel("fz (mm/tooth)")
     axis.set_ylabel("n (rpm)")
     figure.colorbar(image, ax=axis, label="Mean G1 trust gate")
-    written["figure_gate_condition_heatmap"] = _atomic_figure(figures / "gate_condition_heatmap.png", figure)
-    return written
+    render("gate_condition_heatmap", figure)
+    return rendered
+
+
+def _write_phase_b_figures_from_tables(output: Path) -> dict[str, Path]:
+    """Render figures solely from report CSVs already saved under ``output``."""
+    figures = output / "evaluation" / "figures"
+    return {
+        f"figure_{name}": _atomic_bytes(figures / f"{name}.png", payload)
+        for name, payload in _render_phase_b_figures_from_tables(output).items()
+    }
 
 
 def _phase_b_completion_metadata(output: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -1135,6 +1381,7 @@ def write_phase_b_report(
         raise RuntimeError("immutable Phase A or legacy input changed during Phase B reporting")
     written["immutable_hashes_after"] = _atomic_json(output / "immutable_hashes_after.json", immutable_after)
     completion_hashes, _ = _phase_b_completion_metadata(output)
+    fingerprints = _phase_b_fingerprint_map(config, handoff, bundle)
     recorded_devices = existing_run_manifest.get("selected_device_by_fold_seed", {})
     devices = (
         {str(key): str(value) for key, value in recorded_devices.items()}
@@ -1143,6 +1390,8 @@ def write_phase_b_report(
     )
     if any(device not in {"cpu", "cuda"} for device in devices.values()):
         raise ValueError("Phase B recorded device is incompatible")
+    if completion_hashes and set(devices) != set(completion_hashes):
+        raise ValueError("Phase B completion/device provenance is incomplete")
     artifact_hashes = {
         path.relative_to(output).as_posix(): _sha256(path)
         for path in sorted(written.values())
@@ -1152,18 +1401,22 @@ def write_phase_b_report(
         "phase_b_config": _jsonable(asdict(config)),
         "phase_b_config_sha256": _phase_b_config_hash(config),
         "phase_a_handoff": asdict(handoff),
-        "phase_a_handoff_sha256": _sha256(written["handoff"]),
+        "handoff_file_sha256": _sha256(written["handoff"]),
         "protocol": PHASE_B_PROTOCOL,
+        "status": "complete",
         "seeds": list(config.seeds),
         "alphas": list(config.alphas),
         "input_fingerprints": dict(handoff.input_sha256),
         "cache_sha256": handoff.cache_sha256,
         "training_fingerprint": handoff.training_fingerprint,
+        "fold_fingerprints": fingerprints,
         "fold_completion_sha256": completion_hashes,
         "selected_device_by_fold_seed": devices,
+        "device_provenance_sha256": _phase_b_device_provenance_hash(
+            devices, fingerprints, completion_hashes
+        ),
         "bootstrap": {"repetitions": BOOTSTRAP_REPETITIONS, "seed": BOOTSTRAP_SEED, "resampling_unit": "group_id"},
-        "environment": {"python_version": platform.python_version(), "python_executable": sys.executable, "platform": platform.platform()},
-        "evaluation_status": "complete",
+        "environment": _phase_b_environment(),
         "artifacts": artifact_hashes,
     }
     written["run_manifest"] = _atomic_json(output / "run_manifest.json", manifest_payload)
@@ -1251,8 +1504,21 @@ def validate_phase_b_outputs(config: PhaseBConfig) -> None:
     current = _phase_b_immutable_hashes(config)
     if before != current or after != current:
         raise ValueError("Phase B immutable input hashes changed or are incompatible")
-    if _phase_b_json(output / "handoff.json", "handoff") != asdict(handoff):
+    handoff_path = output / "handoff.json"
+    if _phase_b_json(handoff_path, "handoff") != asdict(handoff):
         raise ValueError("Phase B serialized handoff is incompatible")
+    completion_hashes, _ = _phase_b_completion_metadata(output)
+    if len(completion_hashes) != 15:
+        raise ValueError("Phase B requires all fifteen completed fold/seed artifacts")
+    run_manifest = _phase_b_json(output / "run_manifest.json", "run manifest")
+    _phase_b_validate_manifest_contract(
+        run_manifest,
+        config=config,
+        handoff=handoff,
+        handoff_file_sha256=_sha256(handoff_path),
+        fingerprints=_phase_b_fingerprint_map(config, handoff, bundle),
+        completion_hashes=completion_hashes,
+    )
     probability, mean, scores, inner = _phase_b_saved_fold_inputs(config, handoff, bundle)
     quantiles = _phase_b_flatten_quantiles(output)
     persisted_probability = _phase_b_frame(output / "predictions" / "oof_probability_predictions.csv", string_columns=("sample_id", "group_id", "version", "scale_model"))
@@ -1366,30 +1632,12 @@ def validate_phase_b_outputs(config: PhaseBConfig) -> None:
         _phase_b_paired_bootstrap(validated, persisted_mean),
         "paired bootstrap",
     )
-    if _phase_b_json(output / "evaluation" / "claim_decision.json", "claim decision") != assess_phase_b_claims(expected_probability_metrics).to_dict():
+    if _phase_b_json(output / "evaluation" / "claim_decision.json", "claim decision") != _jsonable(
+        assess_phase_b_claims(expected_probability_metrics).to_dict()
+    ):
         raise ValueError("Phase B claim decision is incompatible")
     if _phase_b_json(output / "evaluation" / "method_notes.json", "method notes") != _PHASE_B_METHOD_NOTES:
         raise ValueError("Phase B method notes are incompatible")
-    completion_hashes, _ = _phase_b_completion_metadata(output)
-    if len(completion_hashes) != 15:
-        raise ValueError("Phase B requires all fifteen completed fold/seed artifacts")
-    run_manifest = _phase_b_json(output / "run_manifest.json", "run manifest")
-    recorded_devices = run_manifest.get("selected_device_by_fold_seed")
-    if (
-        not isinstance(recorded_devices, dict)
-        or set(recorded_devices) != set(completion_hashes)
-        or any(value not in {"cpu", "cuda"} for value in recorded_devices.values())
-    ):
-        raise ValueError("Phase B selected device records are incomplete or incompatible")
-    if (
-        run_manifest.get("phase_b_config_sha256") != _phase_b_config_hash(config)
-        or run_manifest.get("phase_a_handoff") != asdict(handoff)
-        or run_manifest.get("fold_completion_sha256") != completion_hashes
-        or run_manifest.get("selected_device_by_fold_seed") != recorded_devices
-        or run_manifest.get("protocol") != PHASE_B_PROTOCOL
-        or run_manifest.get("evaluation_status") != "complete"
-    ):
-        raise ValueError("Phase B run manifest is incompatible")
     artifacts = run_manifest.get("artifacts")
     required_artifacts = {
         "handoff.json",
@@ -1422,6 +1670,13 @@ def validate_phase_b_outputs(config: PhaseBConfig) -> None:
             "prediction_scatter", "residual_plot", "fold_stability", "gate_distribution", "gate_condition_heatmap",
         )),
     }
+    expected_figures = _render_phase_b_figures_from_tables(output)
+    if any(
+        not (output / "evaluation" / "figures" / f"{name}.png").is_file()
+        or (output / "evaluation" / "figures" / f"{name}.png").read_bytes() != payload
+        for name, payload in expected_figures.items()
+    ):
+        raise ValueError("Phase B persisted figure does not match deterministic reconstruction")
     if not isinstance(artifacts, dict) or set(artifacts) != required_artifacts or any(
         not (output / relative).is_file() or _sha256(output / relative) != digest
         for relative, digest in artifacts.items()
