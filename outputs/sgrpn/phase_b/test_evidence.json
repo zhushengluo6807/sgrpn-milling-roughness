@@ -63,6 +63,12 @@
     "phase_a_config_sha256": "53768589f6e2311bd3386997ef9295b441290b5607a16f7d688696709110d192",
     "training_fingerprint": "a72c236bea4e51a1a921f4f7ad944a326aedf3957dd768ab6ad547097ea21339",
     "cache_sha256": "010495c9e229271f2dd78302e9da74e9388f3297bfbb9012e09133f83ff45972",
+    "input_sha256": {
+      "folds": "b63563da3adbfb8eac4694e22e618b309dd9d6f093377768bbef103eceec8a69",
+      "m0_oof": "cc3d3a9a52f86245e395954fa24853ac200ded4ac89042a237f0e395f9934f95",
+      "manifest": "5cede1f02a97e13c025882037812988ff34e09e4899f896b57ceb3936ce643d0",
+      "window_index": "c92527b60c2ec7b2f8f510523c9068c11ce20588ae3445a6738879e699eaaa55"
+    },
     "complete_folds": 5,
     "groups": 212,
     "segments": 586
