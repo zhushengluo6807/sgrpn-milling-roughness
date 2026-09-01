@@ -1360,6 +1360,9 @@ def _validate_phase_b_history(
     }
     if history.empty or not metadata_columns.issubset(history.columns):
         raise ValueError(f"Phase B history {model} schema is incompatible")
+    is_mean_model = model in MEAN_MODELS
+    if is_mean_model and "is_best" not in history.columns:
+        raise ValueError(f"Phase B history {model} Boolean values are invalid")
     try:
         epochs = pd.to_numeric(history["epoch"], errors="raise").to_numpy(dtype=np.float64)
         folds = pd.to_numeric(history["fold"], errors="raise").to_numpy(dtype=np.float64)
@@ -1386,6 +1389,10 @@ def _validate_phase_b_history(
         raise ValueError(f"Phase B history {model} metadata is incompatible")
     for column in history.columns:
         if column in metadata_columns or column in {"phase"}:
+            continue
+        if column == "is_best":
+            if not is_mean_model or not history[column].isin({"True", "False"}).all():
+                raise ValueError(f"Phase B history {model} Boolean values are invalid")
             continue
         try:
             values = pd.to_numeric(history[column], errors="raise").to_numpy(dtype=np.float64)

@@ -522,7 +522,12 @@ def _fake_mean_path(
                 (process_scaler, spectrum_scaler, quality_scaler) for _ in range(4)
             ),
             best_epochs={"P1": (1,) * 4, "R1": (1,) * 4, "G1": (1,) * 4},
-            histories={name: pd.DataFrame({"epoch": [1]}) for name in ("P1", "R1", "G1")},
+            histories={
+                name: pd.DataFrame(
+                    {"epoch": [1, 2], "is_best": [True, False]}
+                )
+                for name in ("P1", "R1", "G1")
+            },
         )
 
     monkeypatch.setattr(phase_b_training, "fit_g1_mean_path", fake)
@@ -1303,6 +1308,37 @@ def test_phase_b_completion_rejects_score_quantile_semantic_mismatch_after_hash_
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     marker["artifacts"]["calibration/quantiles.json"] = hashlib.sha256(
         quantiles_path.read_bytes()
+    ).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
+def test_phase_b_completion_accepts_canonical_boolean_history_and_rejects_noncanonical_token(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+
+    assert completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+    for model in ("P1", "R1", "G1"):
+        history = pd.read_csv(
+            marker_path.parent / f"mean/history/{model}.csv",
+            dtype=str,
+            keep_default_na=False,
+        )
+        assert history["is_best"].tolist() == ["True", "False"]
+
+    history_path = marker_path.parent / "mean/history/P1.csv"
+    history = pd.read_csv(history_path, dtype=str, keep_default_na=False)
+    history.loc[0, "is_best"] = "not-a-boolean"
+    history.to_csv(history_path, index=False)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["artifacts"]["mean/history/P1.csv"] = hashlib.sha256(
+        history_path.read_bytes()
     ).hexdigest()
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
