@@ -1159,6 +1159,44 @@ def test_phase_b_completion_requires_exact_tree_and_every_registered_hash(
         path.write_bytes(original)
 
 
+def test_phase_b_completion_persists_and_validates_canonical_selected_device(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+
+    assert marker.get("selected_device") == "cpu"
+    assert completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+    marker["selected_device"] = "cuda"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    assert completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+    for invalid in (None, "", "auto", "CUDA", "cuda:0", "mps", True, 0):
+        marker["selected_device"] = invalid
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        assert not completed_phase_b_fold_matches(
+            marker_path, expected_fingerprint, fold=0, seed=20260723
+        )
+
+
+def test_phase_b_completion_rejects_legacy_marker_without_selected_device(
+    completed_fold_fixture,
+):
+    marker_path, expected_fingerprint = completed_fold_fixture
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker.pop("selected_device", None)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, expected_fingerprint, fold=0, seed=20260723
+    )
+
+
 @pytest.mark.parametrize("field", ("probability_rows", "mean_rows"))
 def test_phase_b_completion_requires_both_row_count_fields(
     completed_fold_fixture, field

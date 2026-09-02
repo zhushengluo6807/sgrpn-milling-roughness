@@ -44,7 +44,7 @@ from .reporting import (
 )
 from .phase_b_training import (
     _phase_b_fingerprint,
-    completed_phase_b_fold_matches,
+    completed_phase_b_fold_device,
     run_phase_b,
     run_phase_b_fold,
 )
@@ -567,7 +567,7 @@ def _phase_b_training_keys(
     return (f"fold_{fold}/seed_{selected_seed}",)
 
 
-def _phase_b_existing_completed_keys(
+def _phase_b_existing_completed_devices(
     config: PhaseBConfig,
     handoff: PhaseAHandoff,
     bundle: Any,
@@ -576,9 +576,9 @@ def _phase_b_existing_completed_keys(
     *,
     fold: int | None,
     seed: int | None,
-) -> set[str]:
-    """Identify units that were deeply complete before this invocation."""
-    existing: set[str] = set()
+) -> dict[str, str]:
+    """Return deeply validated completed units and their marker device provenance."""
+    existing: dict[str, str] = {}
     for key in _phase_b_training_keys(config, fold=fold, seed=seed):
         fold_text, seed_text = key.split("/")
         outer_fold = int(fold_text.removeprefix("fold_"))
@@ -587,10 +587,13 @@ def _phase_b_existing_completed_keys(
             config, handoff, bundle, cache, fold=outer_fold, seed=outer_seed
         )
         marker = output / "folds" / fold_text / seed_text / "complete.json"
-        if marker.is_file() and completed_phase_b_fold_matches(
-            marker, fingerprint, fold=outer_fold, seed=outer_seed
-        ):
-            existing.add(key)
+        if marker.is_file():
+            selected_device = completed_phase_b_fold_device(
+                marker, fingerprint, fold=outer_fold, seed=outer_seed
+            )
+            if selected_device is None:
+                raise ValueError("incompatible completed Phase B fold")
+            existing[key] = selected_device
     return existing
 
 
@@ -623,7 +626,7 @@ def _train_phase_b(
         raise ValueError("Phase B run manifest device records are incompatible")
     recorded_before = {str(key): str(value) for key, value in recorded_before.items()}
     trained_keys = _phase_b_training_keys(config, fold=fold, seed=seed)
-    completed_before = _phase_b_existing_completed_keys(
+    completed_devices = _phase_b_existing_completed_devices(
         config,
         handoff,
         bundle,
@@ -632,8 +635,15 @@ def _train_phase_b(
         fold=fold,
         seed=seed,
     )
-    if completed_before - set(recorded_before):
-        raise ValueError("Phase B reused fold device provenance is incomplete")
+    completed_before = set(completed_devices)
+    if any(
+        recorded_before[key] != selected_device
+        for key, selected_device in completed_devices.items()
+        if key in recorded_before
+    ):
+        raise ValueError(
+            "Phase B reused fold device provenance disagrees with completion marker"
+        )
     if (
         before_manifest.get("status") == "complete"
         and set(trained_keys).issubset(completed_before)
@@ -679,10 +689,10 @@ def _train_phase_b(
     recorded = {str(key): str(value) for key, value in recorded.items()}
     if any(value not in {"cpu", "cuda"} for value in recorded.values()):
         raise ValueError("Phase B run manifest device records are incompatible")
-    for key in completed_before:
-        if recorded.get(key, recorded_before[key]) != recorded_before[key]:
+    for key, selected_device in completed_devices.items():
+        if key in recorded and recorded[key] != selected_device:
             raise ValueError("Phase B reused fold device provenance changed")
-        recorded[key] = recorded_before[key]
+        recorded[key] = selected_device
     for key in set(trained_keys) - completed_before:
         recorded[key] = selected
     manifest.update(

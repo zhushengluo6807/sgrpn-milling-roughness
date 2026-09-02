@@ -629,38 +629,93 @@ def test_phase_b_parser_rejects_unregistered_fold_and_seed(arguments: list[str])
     assert error.value.code == 2
 
 
-def test_phase_b_train_resume_preserves_previously_recorded_device(
+def _persisted_cli_phase_b_fold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from tests.sgrpn.test_phase_b_training import _persisted_phase_b_fold
+
+    return _persisted_phase_b_fold(tmp_path, monkeypatch)
+
+
+def test_phase_b_train_resume_uses_marker_device_after_interruption(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
-    output = tmp_path / "outputs" / "sgrpn" / "phase_b"
-    output.mkdir(parents=True)
+    marker_path, _artifacts, config, phase_a, handoff, bundle, cache = (
+        _persisted_cli_phase_b_fold(tmp_path, monkeypatch)
+    )
+    output = marker_path.parents[3]
     keys = [
         f"fold_{fold}/seed_{seed}"
         for fold in range(5)
         for seed in (20260723, 20260724, 20260725)
     ]
     existing_key = keys[0]
-    (output / "run_manifest.json").write_text(
-        json.dumps({"selected_device_by_fold_seed": {existing_key: "cpu"}}),
-        encoding="utf-8",
-    )
-    config = SimpleNamespace(output_dir=output, seeds=(20260723, 20260724, 20260725))
-    context = (object(), object(), object(), object())
+    assert not (output / "run_manifest.json").exists()
+    calls: list[str] = []
     monkeypatch.setattr(cli, "validate_phase_b_output_root", lambda path: Path(path))
     monkeypatch.setattr(cli, "_selected_device", lambda requested: "cuda")
-    monkeypatch.setattr(cli, "run_phase_b", lambda *args, **kwargs: object())
     monkeypatch.setattr(
-        cli,
-        "_phase_b_existing_completed_keys",
-        lambda *args, **kwargs: {existing_key},
-        raising=False,
+        cli, "run_phase_b", lambda *args, **kwargs: calls.append(kwargs["device"])
     )
 
-    cli._train_phase_b(config, context, device="cuda", resume=True)
+    cli._train_phase_b(
+        config, (handoff, phase_a, bundle, cache), device="cuda", resume=True
+    )
 
-    recorded = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))["selected_device_by_fold_seed"]
+    recorded = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))[
+        "selected_device_by_fold_seed"
+    ]
     assert recorded[existing_key] == "cpu"
     assert all(recorded[key] == "cuda" for key in keys[1:])
+    assert calls == ["cuda"]
+
+
+def test_phase_b_train_rejects_manifest_device_that_disagrees_with_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    marker_path, _artifacts, config, phase_a, handoff, bundle, cache = (
+        _persisted_cli_phase_b_fold(tmp_path, monkeypatch)
+    )
+    output = marker_path.parents[3]
+    existing_key = "fold_0/seed_20260723"
+    (output / "run_manifest.json").write_text(
+        json.dumps({"selected_device_by_fold_seed": {existing_key: "cuda"}}),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(cli, "_selected_device", lambda requested: "cuda")
+    monkeypatch.setattr(
+        cli, "run_phase_b", lambda *args, **kwargs: calls.append(kwargs["device"])
+    )
+
+    with pytest.raises(ValueError, match="device provenance"):
+        cli._train_phase_b(
+            config, (handoff, phase_a, bundle, cache), device="cuda", resume=True
+        )
+    assert calls == []
+
+
+def test_phase_b_train_rejects_legacy_marker_without_labelling_it_from_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    marker_path, _artifacts, config, phase_a, handoff, bundle, cache = (
+        _persisted_cli_phase_b_fold(tmp_path, monkeypatch)
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker.pop("selected_device", None)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(cli, "_selected_device", lambda requested: "cuda")
+    monkeypatch.setattr(
+        cli, "run_phase_b", lambda *args, **kwargs: calls.append(kwargs["device"])
+    )
+
+    with pytest.raises(ValueError, match="incompatible completed Phase B fold"):
+        cli._train_phase_b(
+            config, (handoff, phase_a, bundle, cache), device="cuda", resume=True
+        )
+    assert calls == []
+    assert not (marker_path.parents[3] / "run_manifest.json").exists()
 
 
 def test_phase_b_train_resume_preserves_final_manifest_bytes(
@@ -757,7 +812,10 @@ def test_phase_b_train_resume_preserves_final_manifest_bytes(
     monkeypatch.setattr(cli, "validate_phase_b_output_root", lambda path: Path(path))
     monkeypatch.setattr(cli, "_selected_device", lambda requested: "cpu")
     monkeypatch.setattr(
-        cli, "_phase_b_existing_completed_keys", lambda *args, **kwargs: set(keys)
+        cli,
+        "_phase_b_existing_completed_devices",
+        lambda *args, **kwargs: {key: "cpu" for key in keys},
+        raising=False,
     )
     monkeypatch.setattr(cli, "run_phase_b", lambda *args, **kwargs: None)
     monkeypatch.setattr(

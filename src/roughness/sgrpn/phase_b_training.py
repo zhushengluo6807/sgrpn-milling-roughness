@@ -70,6 +70,7 @@ PHASE_B_COMPLETE_MARKER_KEYS = frozenset(
         "models",
         "completed_stages",
         "status",
+        "selected_device",
         "artifacts",
         "probability_rows",
         "mean_rows",
@@ -1247,6 +1248,18 @@ def _phase_b_state_payload(
     }
 
 
+def _canonical_phase_b_selected_device(device: str | torch.device | None) -> str:
+    if device is None:
+        return "cpu"
+    try:
+        selected = torch.device(device)
+    except (TypeError, RuntimeError) as error:
+        raise ValueError("Phase B device must resolve to cpu or cuda") from error
+    if selected.type not in {"cpu", "cuda"}:
+        raise ValueError("Phase B device must resolve to cpu or cuda")
+    return selected.type
+
+
 def _write_phase_b_state(
     fold_dir: Path,
     fingerprint: str,
@@ -1667,6 +1680,11 @@ def _validate_completed_phase_b_artifacts(
         raise ValueError("Phase B completion marker keys are incompatible")
     if not _phase_b_identity_matches(marker, fingerprint, fold, seed, complete=True):
         raise ValueError("Phase B completion identity is incompatible")
+    if type(marker.get("selected_device")) is not str or marker["selected_device"] not in {
+        "cpu",
+        "cuda",
+    }:
+        raise ValueError("Phase B completion device provenance is incompatible")
     expected = _phase_b_artifact_paths(fold_dir)
     hashes = marker.get("artifacts")
     if not isinstance(hashes, dict) or set(hashes) != set(expected):
@@ -1762,8 +1780,19 @@ def completed_phase_b_fold_matches(
     seed: int,
 ) -> bool:
     """Return true only for an exact, deeply valid completed Phase B unit."""
+    return completed_phase_b_fold_device(marker, fingerprint, fold=fold, seed=seed) is not None
+
+
+def completed_phase_b_fold_device(
+    marker: str | Path,
+    fingerprint: str | PhaseBRunFingerprint,
+    *,
+    fold: int,
+    seed: int,
+) -> str | None:
+    """Return a deeply validated completed unit's canonical device, if exact."""
     if type(fold) is not int or type(seed) is not int:
-        return False
+        return None
     expected_fingerprint = (
         fingerprint.value if isinstance(fingerprint, PhaseBRunFingerprint) else str(fingerprint)
     )
@@ -1779,8 +1808,9 @@ def completed_phase_b_fold_matches(
             marker_published=True,
         )
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return False
-    return True
+        return None
+    selected_device = payload.get("selected_device")
+    return selected_device if type(selected_device) is str else None
 
 
 def _validate_fold_predictions(
@@ -1892,6 +1922,7 @@ def _publish_phase_b_fold(
     fingerprint: PhaseBRunFingerprint,
     fold: int,
     seed: int,
+    selected_device: str,
     mean_path: MeanPathArtifacts,
     scale_models: Mapping[str, nn.Module],
     scale_histories: Mapping[str, pd.DataFrame],
@@ -1899,6 +1930,8 @@ def _publish_phase_b_fold(
     predictions: pd.DataFrame,
     mean_predictions: pd.DataFrame,
 ) -> None:
+    if selected_device not in {"cpu", "cuda"}:
+        raise ValueError("Phase B selected device is incompatible")
     if set(scale_models) != set(SCALE_MODELS) or set(scale_histories) != set(SCALE_MODELS):
         raise ValueError("Phase B final scale model set is incompatible")
     if set(calibration) != set(SCALE_MODELS):
@@ -2060,6 +2093,7 @@ def _publish_phase_b_fold(
         PHASE_B_STATE_ORDER,
         status="complete",
     )
+    marker["selected_device"] = selected_device
     marker["artifacts"] = {
         relative: _sha256_file(path)
         for relative, path in _phase_b_artifact_paths(fold_dir).items()
@@ -2176,7 +2210,7 @@ def run_phase_b_fold(
         raise ValueError("Phase B alphas must match the exact registered sequence")
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
-    selected_device: str | torch.device = "cpu" if device is None else device
+    selected_device = _canonical_phase_b_selected_device(device)
     root = validate_phase_b_output_root(config.output_dir, output_root=output_root)
     fingerprint = _phase_b_fingerprint(
         config, handoff, bundle, cache, fold=fold, seed=seed
@@ -2279,6 +2313,7 @@ def run_phase_b_fold(
         fingerprint=fingerprint,
         fold=fold,
         seed=seed,
+        selected_device=selected_device,
         mean_path=final_mean,
         scale_models=final_scales,
         scale_histories=scale_histories,
@@ -2453,6 +2488,7 @@ __all__ = [
     "PhaseBRunFingerprint",
     "ScaleFit",
     "build_nested_calibration",
+    "completed_phase_b_fold_device",
     "completed_phase_b_fold_matches",
     "fit_scale_model",
     "run_phase_b",
