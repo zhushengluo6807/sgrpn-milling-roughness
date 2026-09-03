@@ -1248,16 +1248,22 @@ def _phase_b_state_payload(
     }
 
 
-def _canonical_phase_b_selected_device(device: str | torch.device | None) -> str:
+def _resolve_phase_b_execution_device(
+    device: str | torch.device | None,
+) -> torch.device:
     if device is None:
-        return "cpu"
+        return torch.device("cpu")
     try:
         selected = torch.device(device)
     except (TypeError, RuntimeError) as error:
         raise ValueError("Phase B device must resolve to cpu or cuda") from error
     if selected.type not in {"cpu", "cuda"}:
         raise ValueError("Phase B device must resolve to cpu or cuda")
-    return selected.type
+    return selected
+
+
+def _canonical_phase_b_selected_device(device: str | torch.device | None) -> str:
+    return _resolve_phase_b_execution_device(device).type
 
 
 def _write_phase_b_state(
@@ -2210,7 +2216,8 @@ def run_phase_b_fold(
         raise ValueError("Phase B alphas must match the exact registered sequence")
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
-    selected_device = _canonical_phase_b_selected_device(device)
+    execution_device = _resolve_phase_b_execution_device(device)
+    selected_device = execution_device.type
     root = validate_phase_b_output_root(config.output_dir, output_root=output_root)
     fingerprint = _phase_b_fingerprint(
         config, handoff, bundle, cache, fold=fold, seed=seed
@@ -2239,7 +2246,7 @@ def run_phase_b_fold(
         cache,
         fold,
         seed,
-        device=selected_device,
+        device=execution_device,
         backend=backend,
         batch_size=batch_size,
     )
@@ -2250,7 +2257,7 @@ def run_phase_b_fold(
         fold,
         seed,
         tuple(outer_train["sample_id"]),
-        device=selected_device,
+        device=execution_device,
         backend=backend,
         batch_size=batch_size,
     )
@@ -2260,7 +2267,7 @@ def run_phase_b_fold(
         cache,
         final_mean,
         seed=seed,
-        device=selected_device,
+        device=execution_device,
         batch_size=batch_size,
     )
 
@@ -2278,7 +2285,7 @@ def run_phase_b_fold(
         calibration=calibration,
         fold=fold,
         seed=seed,
-        device=torch.device(selected_device),
+        device=execution_device,
     )
 
     # This is the sole outer-test readout.  It is joined after inference and

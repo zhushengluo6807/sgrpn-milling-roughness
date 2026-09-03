@@ -636,10 +636,9 @@ def _train_phase_b(
         seed=seed,
     )
     completed_before = set(completed_devices)
-    if any(
-        recorded_before[key] != selected_device
+    if manifest_path.is_file() and any(
+        recorded_before.get(key) != selected_device
         for key, selected_device in completed_devices.items()
-        if key in recorded_before
     ):
         raise ValueError(
             "Phase B reused fold device provenance disagrees with completion marker"

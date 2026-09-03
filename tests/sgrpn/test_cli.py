@@ -668,6 +668,35 @@ def test_phase_b_train_resume_uses_marker_device_after_interruption(
     assert calls == ["cuda"]
 
 
+def test_phase_b_train_rejects_manifest_missing_reused_marker_device(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    marker_path, _artifacts, config, phase_a, handoff, bundle, cache = (
+        _persisted_cli_phase_b_fold(tmp_path, monkeypatch)
+    )
+    manifest_path = marker_path.parents[3] / "run_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"selected_device_by_fold_seed": {}}), encoding="utf-8"
+    )
+    before = manifest_path.read_bytes()
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(cli, "_selected_device", lambda requested: "cuda")
+    monkeypatch.setattr(
+        cli, "run_phase_b", lambda *args, **kwargs: calls.append("all")
+    )
+    monkeypatch.setattr(
+        cli, "run_phase_b_fold", lambda *args, **kwargs: calls.append("one")
+    )
+
+    with pytest.raises(ValueError, match="device provenance"):
+        cli._train_phase_b(
+            config, (handoff, phase_a, bundle, cache), device="cuda", resume=True
+        )
+    assert calls == []
+    assert manifest_path.read_bytes() == before
+
+
 def test_phase_b_train_rejects_manifest_device_that_disagrees_with_marker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -954,6 +955,117 @@ def _persisted_phase_b_fold(tmp_path: Path, monkeypatch):
         / "complete.json"
     )
     return marker_path, artifacts, config, phase_a, handoff, bundle, cache
+
+
+def test_phase_b_fold_preserves_indexed_cuda_execution_device_and_canonicalizes_marker(
+    tmp_path, monkeypatch
+):
+    from roughness.sgrpn import phase_b_training
+
+    config, phase_a, handoff, bundle, cache = _fixture(tmp_path)
+    execution_devices: list[object] = []
+    marker_devices: list[str] = []
+    _, outer_test_index = outer_indices(bundle, 0)
+    outer_test = bundle.manifest.iloc[outer_test_index].reset_index(drop=True)
+
+    def fake_build(*args, **kwargs):
+        del args
+        execution_devices.append(kwargs["device"])
+        return {}
+
+    def fake_mean(*args, **kwargs):
+        del args
+        execution_devices.append(kwargs["device"])
+        return SimpleNamespace(model=object())
+
+    def fake_scales(*args, **kwargs):
+        del args
+        execution_devices.append(kwargs["device"])
+        return {}, {}
+
+    def fake_batches(*args, **kwargs):
+        del args, kwargs
+        return []
+
+    def fake_outer(*args, **kwargs):
+        del args
+        execution_devices.append(kwargs["device"])
+        prediction_rows = []
+        for scale_model in SCALE_MODELS:
+            for row in outer_test.itertuples(index=False):
+                prediction_rows.append(
+                    {
+                        "sample_id": str(row.sample_id),
+                        "group_id": str(row.group_id),
+                        "fold": 0,
+                        "seed": 20260723,
+                        "scale_model": scale_model,
+                        "sample_weight": 1.0,
+                        "mu": 0.5,
+                        "sigma": 0.2,
+                        "gate": 0.5,
+                        "correction": 0.1,
+                        "raw_lower_90": 0.1,
+                        "raw_upper_90": 0.9,
+                        "raw_lower_95": 0.0,
+                        "raw_upper_95": 1.0,
+                        "conformal_q_90": 2.0,
+                        "conformal_lower_90": 0.1,
+                        "conformal_upper_90": 0.9,
+                        "conformal_q_95": 2.5,
+                        "conformal_lower_95": 0.0,
+                        "conformal_upper_95": 1.0,
+                    }
+                )
+        mean_rows = []
+        for model in ("P1", "R1", "G1"):
+            for row in outer_test.itertuples(index=False):
+                mean_rows.append(
+                    {
+                        "sample_id": str(row.sample_id),
+                        "group_id": str(row.group_id),
+                        "fold": 0,
+                        "seed": 20260723,
+                        "model": model,
+                        "sample_weight": 1.0,
+                        "prediction": 0.5,
+                        "process_mean": 0.4,
+                        "residual": 0.2,
+                        "gate": 0.5,
+                        "correction": 0.1,
+                    }
+                )
+        return pd.DataFrame(prediction_rows), pd.DataFrame(mean_rows)
+
+    def fake_publish(*args, **kwargs):
+        del args
+        marker_devices.append(kwargs["selected_device"])
+
+    monkeypatch.setattr(phase_b_training, "build_nested_calibration", fake_build)
+    monkeypatch.setattr(phase_b_training, "fit_g1_mean_path", fake_mean)
+    monkeypatch.setattr(phase_b_training, "_select_and_refit_outer_scales", fake_scales)
+    monkeypatch.setattr(phase_b_training, "_inference_batches", fake_batches)
+    monkeypatch.setattr(phase_b_training, "_outer_inference", fake_outer)
+    monkeypatch.setattr(phase_b_training, "_publish_phase_b_fold", fake_publish)
+    monkeypatch.setattr(
+        phase_b_training, "_validate_fold_predictions", lambda *args, **kwargs: None
+    )
+
+    run_phase_b_fold(
+        config,
+        handoff,
+        phase_a,
+        bundle,
+        cache,
+        0,
+        20260723,
+        device=torch.device("cuda:1"),
+        batch_size=32,
+        output_root=config.output_dir,
+    )
+
+    assert [str(device) for device in execution_devices] == ["cuda:1"] * 4
+    assert marker_devices == ["cuda"]
 
 
 @pytest.fixture
