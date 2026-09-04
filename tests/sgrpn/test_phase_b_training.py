@@ -1441,6 +1441,136 @@ def test_phase_b_completion_rejects_oof_score_semantic_mismatch_after_hash_refre
     )
 
 
+def _persist_synthetic_reversible_calibration(marker_path, fingerprint):
+    from roughness.sgrpn import phase_b_training
+
+    fold_dir = marker_path.parent
+    calibration_dir = fold_dir / "calibration"
+    oof_path = calibration_dir / "oof_predictions.csv"
+    score_path = calibration_dir / "group_scores.csv"
+    quantiles_path = calibration_dir / "quantiles.json"
+    oof = pd.read_csv(
+        oof_path,
+        dtype={"sample_id": str, "group_id": str, "scale_model": str},
+        float_precision="round_trip",
+    )
+    group_ids = tuple(sorted(oof["group_id"].unique()))
+    group_values = dict(
+        zip(
+            group_ids,
+            np.nextafter(
+                np.linspace(0.2, 0.8, len(group_ids), dtype=np.float64), np.inf
+            ),
+            strict=True,
+        )
+    )
+    synthetic_oof = oof.copy()
+    synthetic_oof["target_mean"] = 0.0
+    synthetic_oof["ra_1"] = synthetic_oof["group_id"].map(group_values)
+    synthetic_oof["ra_2"] = 0.0
+    synthetic_oof["ra_3"] = 0.0
+    synthetic_oof["mu"] = 0.1
+    synthetic_oof["sigma"] = 1e-7
+
+    score_frames = {
+        model: phase_b_training._calibration_group_scores(
+            synthetic_oof.loc[synthetic_oof["scale_model"] == model].reset_index(drop=True)
+        )
+        for model in SCALE_MODELS
+    }
+    synthetic_scores = pd.concat(
+        [score_frames[model] for model in SCALE_MODELS], ignore_index=True
+    )
+    quantiles = {
+        "protocol": phase_b_training.PHASE_B_PROTOCOL,
+        "fingerprint": fingerprint,
+        "fold": 0,
+        "seed": 20260723,
+        "models": list(SCALE_MODELS),
+        "alphas": list(phase_b_training.PHASE_B_ALPHAS),
+        "quantiles": {
+            model: {
+                f"{alpha:.2f}": asdict(
+                    phase_b_training.finite_sample_group_quantile(
+                        score_frames[model]["score"].to_numpy(dtype=np.float64),
+                        alpha=alpha,
+                    )
+                )
+                for alpha in phase_b_training.PHASE_B_ALPHAS
+            }
+            for model in SCALE_MODELS
+        },
+    }
+    phase_b_training._atomic_write_frame(oof_path, synthetic_oof)
+    phase_b_training._atomic_write_frame(score_path, synthetic_scores)
+    phase_b_training._atomic_write_json(quantiles_path, quantiles)
+
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    for relative in (
+        "calibration/oof_predictions.csv",
+        "calibration/group_scores.csv",
+        "calibration/quantiles.json",
+    ):
+        marker["artifacts"][relative] = hashlib.sha256(
+            (fold_dir / relative).read_bytes()
+        ).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    return synthetic_oof, synthetic_scores
+
+
+def test_phase_b_completion_requires_reversible_calibration_csv_parsing(
+    tmp_path, monkeypatch
+):
+    from roughness.sgrpn import phase_b_training
+
+    marker_path, artifacts, *_ = _persisted_phase_b_fold(tmp_path, monkeypatch)
+    expected_oof, expected_scores = _persist_synthetic_reversible_calibration(
+        marker_path, artifacts.fingerprint.value
+    )
+
+    # Mutation caught: remove float_precision="round_trip" from any calibration
+    # OOF/group-score read in the deep validator or calibration reload path.
+    loaded = phase_b_training._load_completed_phase_b_fold(
+        marker_path.parent, artifacts.fingerprint, fold=0, seed=20260723
+    )
+
+    for model in SCALE_MODELS:
+        pd.testing.assert_frame_equal(
+            loaded.calibration[model].predictions,
+            expected_oof.loc[expected_oof["scale_model"] == model].reset_index(drop=True),
+        )
+        pd.testing.assert_frame_equal(
+            loaded.calibration[model].group_scores,
+            expected_scores.loc[expected_scores["scale_model"] == model].reset_index(drop=True),
+        )
+
+
+def test_phase_b_completion_rejects_synthetic_score_mutation_after_hash_refresh(
+    tmp_path, monkeypatch
+):
+    from roughness.sgrpn import phase_b_training
+
+    marker_path, artifacts, *_ = _persisted_phase_b_fold(tmp_path, monkeypatch)
+    _persist_synthetic_reversible_calibration(marker_path, artifacts.fingerprint.value)
+    assert completed_phase_b_fold_matches(
+        marker_path, artifacts.fingerprint, fold=0, seed=20260723
+    )
+
+    score_path = marker_path.parent / "calibration/group_scores.csv"
+    scores = pd.read_csv(score_path, float_precision="round_trip")
+    scores.loc[0, "score"] = float(scores.loc[0, "score"]) + 1e-3
+    phase_b_training._atomic_write_frame(score_path, scores)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["artifacts"]["calibration/group_scores.csv"] = hashlib.sha256(
+        score_path.read_bytes()
+    ).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert not completed_phase_b_fold_matches(
+        marker_path, artifacts.fingerprint, fold=0, seed=20260723
+    )
+
+
 def test_phase_b_completion_rejects_score_quantile_semantic_mismatch_after_hash_refresh(
     completed_fold_fixture,
 ):

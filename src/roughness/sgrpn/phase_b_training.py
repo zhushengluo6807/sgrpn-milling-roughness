@@ -1548,6 +1548,7 @@ def _validate_phase_b_calibration(
     oof = pd.read_csv(
         calibration_dir / "oof_predictions.csv",
         dtype={"sample_id": str, "group_id": str, "scale_model": str},
+        float_precision="round_trip",
     )
     expected_oof_columns = (
         "sample_id",
@@ -1586,6 +1587,7 @@ def _validate_phase_b_calibration(
     scores = pd.read_csv(
         calibration_dir / "group_scores.csv",
         dtype={"group_id": str, "scale_model": str},
+        float_precision="round_trip",
     )
     if (
         tuple(scores.columns) != CALIBRATION_SCORE_COLUMNS
@@ -2128,10 +2130,12 @@ def _load_phase_b_calibration(fold_dir: Path) -> dict[str, CalibrationArtifacts]
     oof = pd.read_csv(
         calibration_dir / "oof_predictions.csv",
         dtype={"sample_id": str, "group_id": str, "scale_model": str},
+        float_precision="round_trip",
     )
     scores = pd.read_csv(
         calibration_dir / "group_scores.csv",
         dtype={"group_id": str, "scale_model": str},
+        float_precision="round_trip",
     )
     raw_quantiles = _load_json_object(calibration_dir / "quantiles.json")["quantiles"]
     return {
