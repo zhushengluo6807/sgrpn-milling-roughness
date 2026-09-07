@@ -1470,7 +1470,9 @@ def _phase_b_saved_fold_inputs(
             fingerprint = _phase_b_fingerprint(config, handoff, bundle, cache, fold=fold, seed=seed)
             fold_dir = output / "folds" / f"fold_{fold}" / f"seed_{seed}"
             artifact = _load_completed_phase_b_fold(fold_dir, fingerprint, fold, seed)
-            probability_rows.append(artifact.predictions.copy())
+            block = artifact.predictions.copy()
+            block.attrs = {}
+            probability_rows.append(block)
             mean_rows.append(artifact.predictions.attrs["mean_predictions"].copy())
             score_rows.extend(item.group_scores.copy() for item in artifact.calibration.values())
             inner_rows.append(_phase_b_frame(fold_dir / "calibration" / "inner_folds.csv", string_columns=()))

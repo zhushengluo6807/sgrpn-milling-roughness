@@ -8,6 +8,11 @@ import pytest
 
 from roughness.sgrpn.config import PhaseAHandoff, PhaseBConfig
 from roughness.sgrpn.data import DataBundle
+from roughness.sgrpn.phase_b_training import (
+    CalibrationArtifacts,
+    PhaseBFoldArtifacts,
+    PhaseBRunFingerprint,
+)
 from roughness.sgrpn.reporting import (
     validate_phase_b_outputs,
     write_phase_a_report,
@@ -433,6 +438,97 @@ def _phase_b_report_fixture(tmp_path: Path) -> tuple[
         pd.DataFrame(scores),
         pd.DataFrame(quantiles),
     )
+
+
+def test_phase_b_saved_fold_inputs_discards_dataframe_transport_attrs_before_probability_concat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import roughness.sgrpn.order_spectrum as order_spectrum
+    import roughness.sgrpn.reporting as reporting
+
+    config = PhaseBConfig(
+        phase_a_config_path=tmp_path / "phase_a.yaml",
+        phase_a_config_file_sha256="a" * 64,
+        phase_a_acceptance_path=tmp_path / "phase_a_acceptance.json",
+        phase_a_run_manifest_path=tmp_path / "phase_a_run_manifest.json",
+        output_dir=tmp_path / "phase_b",
+        seeds=(20260723, 20260724, 20260725),
+        alphas=(0.10, 0.05),
+        inner_splits=4,
+        max_epochs=1,
+        patience=1,
+        variance_learning_rate=1e-3,
+        weight_decay=1e-4,
+        bootstrap_repetitions=1,
+    )
+    handoff = PhaseAHandoff(
+        acceptance_sha256="b" * 64,
+        run_manifest_sha256="c" * 64,
+        phase_a_config_sha256="a" * 64,
+        training_fingerprint="fixture-training",
+        cache_sha256="d" * 64,
+        input_sha256={"manifest": "e" * 64},
+    )
+    bundle = DataBundle(
+        manifest=pd.DataFrame(),
+        folds=pd.DataFrame(),
+        windows=pd.DataFrame(),
+        fold_audit={},
+        duration_audit=pd.DataFrame(),
+    )
+    expected_ids = [
+        f"{fold}:{seed}"
+        for fold in range(5)
+        for seed in (20260723, 20260724, 20260725)
+    ]
+    for fold in range(5):
+        for seed in (20260723, 20260724, 20260725):
+            inner_path = config.output_dir / "folds" / f"fold_{fold}" / f"seed_{seed}" / "calibration" / "inner_folds.csv"
+            inner_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"fold": [fold], "seed": [seed]}).to_csv(inner_path, index=False)
+
+    fingerprint = PhaseBRunFingerprint(
+        value="f" * 64,
+        config_sha256="a" * 64,
+        phase_a_acceptance_sha256="b" * 64,
+        phase_a_run_manifest_sha256="c" * 64,
+        phase_a_training_fingerprint="fixture-training",
+        manifest_sha256="d" * 64,
+        folds_sha256="e" * 64,
+        cache_sha256="f" * 64,
+    )
+
+    def fake_load_fold(
+        fold_dir: Path, loaded_fingerprint: PhaseBRunFingerprint, fold: int, seed: int
+    ) -> PhaseBFoldArtifacts:
+        artifact_id = f"{fold}:{seed}"
+        probability = pd.DataFrame({"artifact_id": [artifact_id]})
+        probability.attrs["mean_predictions"] = pd.DataFrame({"artifact_id": [artifact_id]})
+        calibration = CalibrationArtifacts(
+            predictions=pd.DataFrame({"artifact_id": [artifact_id]}),
+            group_scores=pd.DataFrame({"artifact_id": [artifact_id]}),
+            quantiles={},
+            inner_fold_definitions=pd.DataFrame({"artifact_id": [artifact_id]}),
+        )
+        return PhaseBFoldArtifacts(
+            predictions=probability,
+            calibration={"heteroscedastic": calibration},
+            checkpoint_paths={},
+            history_paths={},
+            fingerprint=loaded_fingerprint,
+        )
+
+    monkeypatch.setattr(reporting, "load_sgrpn_config", lambda path: object())
+    monkeypatch.setattr(reporting, "validate_phase_b_output_root", lambda path: Path(path))
+    monkeypatch.setattr(order_spectrum, "load_order_cache", lambda *args: object())
+    monkeypatch.setattr(reporting, "_phase_b_fingerprint", lambda *args, **kwargs: fingerprint)
+    monkeypatch.setattr(reporting, "_load_completed_phase_b_fold", fake_load_fold)
+
+    probability, mean, _, _ = reporting._phase_b_saved_fold_inputs(config, handoff, bundle)
+
+    assert probability["artifact_id"].tolist() == expected_ids
+    assert mean["artifact_id"].tolist() == expected_ids
+    assert probability.attrs == {}
 
 
 def test_phase_b_report_regenerates_tables_and_figures_without_checkpoints(
