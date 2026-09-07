@@ -1453,14 +1453,43 @@ def _phase_b_flatten_quantiles(output: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=_PHASE_B_QUANTILE_COLUMNS)
 
 
+def _phase_b_restore_canonical_sample_weights(
+    frame: pd.DataFrame, *, expected: pd.DataFrame, label: str
+) -> pd.DataFrame:
+    """Accept only the persisted float32 projection, then restore canonical weights."""
+    restored = frame.copy()
+    expected_by_sample = expected.set_index("sample_id", verify_integrity=True)
+    canonical = expected_by_sample.reindex(restored["sample_id"].astype(str))[
+        "sample_weight"
+    ]
+    if canonical.isna().any():
+        raise ValueError(f"Phase B {label} contains an unregistered sample")
+    try:
+        persisted = pd.to_numeric(restored["sample_weight"], errors="raise").to_numpy(
+            dtype=np.float64
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Phase B {label} persisted sample_weight is invalid") from error
+    canonical_values = canonical.to_numpy(dtype=np.float64)
+    projected = canonical_values.astype(np.float32).astype(np.float64)
+    if not np.isfinite(persisted).all() or not np.array_equal(persisted, projected):
+        raise ValueError(
+            f"Phase B {label} persisted sample_weight does not match the float32 canonical projection"
+        )
+    restored["sample_weight"] = canonical_values
+    return restored
+
+
 def _phase_b_saved_fold_inputs(
     config: PhaseBConfig, handoff: PhaseAHandoff, bundle: DataBundle
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    from .evaluation import _phase_b_expected_sample_metadata
     from .order_spectrum import load_order_cache
 
     phase_a = load_sgrpn_config(config.phase_a_config_path)
     cache = load_order_cache(bundle, phase_a)
     output = validate_phase_b_output_root(config.output_dir)
+    expected = _phase_b_expected_sample_metadata(bundle.manifest, bundle.folds)
     probability_rows: list[pd.DataFrame] = []
     mean_rows: list[pd.DataFrame] = []
     score_rows: list[pd.DataFrame] = []
@@ -1470,10 +1499,18 @@ def _phase_b_saved_fold_inputs(
             fingerprint = _phase_b_fingerprint(config, handoff, bundle, cache, fold=fold, seed=seed)
             fold_dir = output / "folds" / f"fold_{fold}" / f"seed_{seed}"
             artifact = _load_completed_phase_b_fold(fold_dir, fingerprint, fold, seed)
-            block = artifact.predictions.copy()
+            block = _phase_b_restore_canonical_sample_weights(
+                artifact.predictions, expected=expected, label="probability"
+            )
             block.attrs = {}
             probability_rows.append(block)
-            mean_rows.append(artifact.predictions.attrs["mean_predictions"].copy())
+            mean_rows.append(
+                _phase_b_restore_canonical_sample_weights(
+                    artifact.predictions.attrs["mean_predictions"],
+                    expected=expected,
+                    label="mean",
+                )
+            )
             score_rows.extend(item.group_scores.copy() for item in artifact.calibration.values())
             inner_rows.append(_phase_b_frame(fold_dir / "calibration" / "inner_folds.csv", string_columns=()))
     return (

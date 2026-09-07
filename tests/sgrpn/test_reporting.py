@@ -443,6 +443,7 @@ def _phase_b_report_fixture(tmp_path: Path) -> tuple[
 def test_phase_b_saved_fold_inputs_discards_dataframe_transport_attrs_before_probability_concat(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
+    import roughness.sgrpn.evaluation as evaluation
     import roughness.sgrpn.order_spectrum as order_spectrum
     import roughness.sgrpn.reporting as reporting
 
@@ -502,8 +503,12 @@ def test_phase_b_saved_fold_inputs_discards_dataframe_transport_attrs_before_pro
         fold_dir: Path, loaded_fingerprint: PhaseBRunFingerprint, fold: int, seed: int
     ) -> PhaseBFoldArtifacts:
         artifact_id = f"{fold}:{seed}"
-        probability = pd.DataFrame({"artifact_id": [artifact_id]})
-        probability.attrs["mean_predictions"] = pd.DataFrame({"artifact_id": [artifact_id]})
+        probability = pd.DataFrame(
+            {"artifact_id": [artifact_id], "sample_id": [artifact_id], "sample_weight": [1.0]}
+        )
+        probability.attrs["mean_predictions"] = pd.DataFrame(
+            {"artifact_id": [artifact_id], "sample_id": [artifact_id], "sample_weight": [1.0]}
+        )
         calibration = CalibrationArtifacts(
             predictions=pd.DataFrame({"artifact_id": [artifact_id]}),
             group_scores=pd.DataFrame({"artifact_id": [artifact_id]}),
@@ -523,6 +528,13 @@ def test_phase_b_saved_fold_inputs_discards_dataframe_transport_attrs_before_pro
     monkeypatch.setattr(order_spectrum, "load_order_cache", lambda *args: object())
     monkeypatch.setattr(reporting, "_phase_b_fingerprint", lambda *args, **kwargs: fingerprint)
     monkeypatch.setattr(reporting, "_load_completed_phase_b_fold", fake_load_fold)
+    monkeypatch.setattr(
+        evaluation,
+        "_phase_b_expected_sample_metadata",
+        lambda *args: pd.DataFrame(
+            {"sample_id": expected_ids, "sample_weight": np.ones(len(expected_ids))}
+        ),
+    )
 
     probability, mean, _, _ = reporting._phase_b_saved_fold_inputs(config, handoff, bundle)
 

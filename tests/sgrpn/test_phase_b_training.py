@@ -337,9 +337,11 @@ def test_public_phase_b_training_signatures_are_exactly_typed():
 
 
 def _fixture(
-    tmp_path: Path, *, group_count: int = 25
+    tmp_path: Path, *, group_count: int = 25, repeated_group_size: int = 2
 ) -> tuple[PhaseBConfig, SGRPNConfig, PhaseAHandoff, DataBundle, OrderSpectrumCache]:
-    group_numbers = np.concatenate((np.arange(group_count), np.array([1])))
+    group_numbers = np.concatenate(
+        (np.arange(group_count), np.full(repeated_group_size - 1, 1))
+    )
     sample_count = len(group_numbers)
     sample_ids = [f"s{index:02d}" for index in range(sample_count)]
     group_ids = [f"g{index:02d}" for index in group_numbers]
@@ -1816,6 +1818,171 @@ def _orchestration_fold_artifact(
         "7" * 64,
     )
     return PhaseBFoldArtifacts(predictions, {}, {}, {}, fingerprint)
+
+
+def _fast_phase_b_scale_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    from roughness.sgrpn import phase_b_training
+
+    def selected(*, scale_model: nn.Module, **kwargs):
+        del kwargs
+        return phase_b_training.ScaleFit(
+            model=scale_model,
+            best_epoch=1,
+            history=pd.DataFrame(
+                {"epoch": [1], "train_nll": [1.0], "validation_nll": [1.0]}
+            ),
+            mean_state_sha256="0" * 64,
+        )
+
+    def refit(*, scale_model: nn.Module, epochs: int, **kwargs):
+        del kwargs
+        return phase_b_training.ScaleFit(
+            model=scale_model,
+            best_epoch=epochs,
+            history=pd.DataFrame({"epoch": [epochs], "train_nll": [1.0]}),
+            mean_state_sha256="0" * 64,
+        )
+
+    monkeypatch.setattr(phase_b_training, "fit_scale_model", selected)
+    monkeypatch.setattr(phase_b_training, "_refit_scale_model_exact_epochs", refit)
+
+
+def _persist_nonbinary_phase_b_units(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config, phase_a, handoff, bundle, cache = _fixture(
+        tmp_path, group_count=584, repeated_group_size=3
+    )
+    _fake_mean_path(monkeypatch, [], mean_type=TinyNonzeroResidualMean)
+    _fast_phase_b_scale_fits(monkeypatch)
+    run_phase_b(
+        config,
+        handoff,
+        phase_a,
+        bundle,
+        cache,
+        device="cpu",
+        batch_size=64,
+        output_root=config.output_dir,
+    )
+    return config, phase_a, handoff, bundle, cache
+
+
+def _saved_nonbinary_phase_b_inputs(
+    config: PhaseBConfig,
+    phase_a: SGRPNConfig,
+    handoff: PhaseAHandoff,
+    bundle: DataBundle,
+    cache: OrderSpectrumCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    import roughness.sgrpn.order_spectrum as order_spectrum
+    import roughness.sgrpn.reporting as reporting
+
+    monkeypatch.setattr(reporting, "load_sgrpn_config", lambda path: phase_a)
+    monkeypatch.setattr(order_spectrum, "load_order_cache", lambda *args: cache)
+    monkeypatch.setattr(reporting, "validate_phase_b_output_root", lambda path: Path(path))
+    probability, mean, scores, _ = reporting._phase_b_saved_fold_inputs(
+        config, handoff, bundle
+    )
+    return probability, mean, scores
+
+
+def _canonical_nonbinary_weight(bundle: DataBundle) -> tuple[str, float, float]:
+    row = bundle.manifest.loc[bundle.manifest["split_count"] == 3].iloc[0]
+    canonical = float(row["sample_weight"])
+    projected = float(np.float64(np.float32(canonical)))
+    assert canonical == 1.0 / 3.0
+    assert projected != canonical
+    return str(row["sample_id"]), canonical, projected
+
+
+def _refresh_completed_artifact_hash(marker_path: Path, relative: str) -> None:
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    artifact = marker_path.parent / relative
+    marker["artifacts"][relative] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+
+def test_saved_fold_reconstruction_restores_canonical_nonbinary_weights_after_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from roughness.sgrpn import phase_b_training
+    from roughness.sgrpn.evaluation import validate_phase_b_prediction_cartesian
+    import roughness.sgrpn.reporting as reporting
+
+    config, phase_a, handoff, bundle, cache = _persist_nonbinary_phase_b_units(
+        tmp_path, monkeypatch
+    )
+    sample_id, canonical, projected = _canonical_nonbinary_weight(bundle)
+    fingerprint = phase_b_training._phase_b_fingerprint(
+        config, handoff, bundle, cache, fold=1, seed=20260723
+    )
+    artifact = phase_b_training._load_completed_phase_b_fold(
+        config.output_dir / "folds" / "fold_1" / "seed_20260723",
+        fingerprint,
+        fold=1,
+        seed=20260723,
+    )
+    for frame in (artifact.predictions, artifact.predictions.attrs["mean_predictions"]):
+        persisted = frame.loc[frame["sample_id"] == sample_id, "sample_weight"]
+        assert len(persisted) > 0
+        assert set(persisted) == {projected}
+
+    probability, mean, scores = _saved_nonbinary_phase_b_inputs(
+        config, phase_a, handoff, bundle, cache, monkeypatch
+    )
+    for frame in (probability, mean):
+        reconstructed = frame.loc[frame["sample_id"] == sample_id, "sample_weight"]
+        assert len(reconstructed) > 0
+        assert set(reconstructed) == {canonical}
+
+    validate_phase_b_prediction_cartesian(
+        probability,
+        manifest=bundle.manifest,
+        folds=bundle.folds,
+        mean_predictions=mean,
+        calibration_scores=scores,
+        calibration_quantiles=reporting._phase_b_flatten_quantiles(config.output_dir),
+    )
+
+
+def test_saved_fold_reconstruction_rejects_nonprojected_probability_and_mean_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config, phase_a, handoff, bundle, cache = _persist_nonbinary_phase_b_units(
+        tmp_path, monkeypatch
+    )
+    sample_id, _canonical, _projected = _canonical_nonbinary_weight(bundle)
+    fold_dir = config.output_dir / "folds" / "fold_1" / "seed_20260723"
+    marker_path = fold_dir / "complete.json"
+    prediction_path = fold_dir / "predictions.csv"
+    original_prediction = prediction_path.read_bytes()
+    original_marker = marker_path.read_bytes()
+
+    probability = pd.read_csv(prediction_path, float_precision="round_trip")
+    probability.loc[probability["sample_id"] == sample_id, "sample_weight"] = 0.125
+    probability.to_csv(prediction_path, index=False)
+    _refresh_completed_artifact_hash(marker_path, "predictions.csv")
+    with pytest.raises(ValueError, match="probability persisted sample_weight"):
+        _saved_nonbinary_phase_b_inputs(
+            config, phase_a, handoff, bundle, cache, monkeypatch
+        )
+
+    prediction_path.write_bytes(original_prediction)
+    marker_path.write_bytes(original_marker)
+
+    import torch
+
+    mean_path = fold_dir / "mean" / "checkpoints" / "G1.pt"
+    checkpoint = torch.load(mean_path, map_location="cpu", weights_only=False)
+    mean = pd.DataFrame(checkpoint["mean_predictions"])
+    mean.loc[mean["sample_id"] == sample_id, "sample_weight"] = 0.125
+    checkpoint["mean_predictions"] = mean.to_dict(orient="list")
+    torch.save(checkpoint, mean_path)
+    _refresh_completed_artifact_hash(marker_path, "mean/checkpoints/G1.pt")
+    with pytest.raises(ValueError, match="mean persisted sample_weight"):
+        _saved_nonbinary_phase_b_inputs(
+            config, phase_a, handoff, bundle, cache, monkeypatch
+        )
 
 
 def test_run_phase_b_executes_exact_five_fold_three_seed_cartesian_and_writes_oof(
