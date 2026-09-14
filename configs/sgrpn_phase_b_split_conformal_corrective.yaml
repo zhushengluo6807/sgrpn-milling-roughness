@@ -1,0 +1,9 @@
+phase_b_config_path: sgrpn_phase_b.yaml
+phase_b_config_file_sha256: 1dd97fb599dd737f57fb01cd31b0a55de3eba1c0a3c009bc8e6be71cd8f41d9b
+phase_b_run_manifest_path: ../outputs/sgrpn/phase_b/run_manifest.json
+phase_b_run_manifest_sha256: 4d827768b958d08e082b560e57af4d20ad432d621db3fec724db175c779e0309
+phase_b_immutable_after_path: ../outputs/sgrpn/phase_b/immutable_hashes_after.json
+phase_b_immutable_after_sha256: 7549da8915ac9818cf83ec0f411f30238e6ef0cf90063b176a66669ea4907bb3
+output_dir: ../outputs/sgrpn/phase_b_split_conformal_corrective
+split_seed: 20260723
+calibration_fold: 0
