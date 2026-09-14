@@ -116,6 +116,43 @@ def test_formal_corrective_splits_match_registered_real_group_counts():
     ]
 
 
+def test_source_replay_validator_rejects_nonregistered_group_counts(
+    tmp_path: Path, monkeypatch
+):
+    from roughness.sgrpn import corrective
+
+    manifest = _group_frame(100, rows_per_group=1)
+    folds = pd.DataFrame(
+        {
+            "sample_id": manifest["sample_id"],
+            "fold": [0] * 20 + [1] * 80,
+        }
+    )
+    bundle = SimpleNamespace(manifest=manifest, folds=folds)
+    monkeypatch.setattr(corrective, "corrective_fingerprint", lambda *args, **kwargs: "f" * 64)
+    monkeypatch.setattr(
+        corrective,
+        "load_validated_corrective_fold",
+        lambda *args, **kwargs: object(),
+    )
+
+    with pytest.raises(ValueError, match="frozen group counts"):
+        corrective.validate_corrective_fold_against_sources(
+            SimpleNamespace(
+                output_dir=tmp_path,
+                split_seed=20260723,
+                calibration_fold=0,
+            ),
+            object(),
+            object(),
+            bundle,
+            object(),
+            fold=0,
+            seed=20260723,
+            device="cpu",
+        )
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 from typing import Mapping
 import uuid
 
@@ -35,6 +36,33 @@ from .order_spectrum import OrderSpectrumCache
 
 
 _ANALYSIS_STATUS = "post_audit_corrective_reanalysis"
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_SOURCE_PATHS = {
+    "configs/sgrpn_phase_b_split_conformal_corrective.yaml": _PROJECT_ROOT
+    / "configs"
+    / "sgrpn_phase_b_split_conformal_corrective.yaml",
+    "docs/paper/2026-09-10-sgrpn-split-conformal-corrective-protocol.md": _PROJECT_ROOT
+    / "docs"
+    / "paper"
+    / "2026-09-10-sgrpn-split-conformal-corrective-protocol.md",
+    "src/roughness/sgrpn/corrective.py": Path(__file__).with_name("corrective.py"),
+    "src/roughness/sgrpn/corrective_cli.py": Path(__file__).with_name(
+        "corrective_cli.py"
+    ),
+    "src/roughness/sgrpn/corrective_evaluation.py": Path(__file__),
+    "tests/sgrpn/test_corrective.py": _PROJECT_ROOT
+    / "tests"
+    / "sgrpn"
+    / "test_corrective.py",
+    "tests/sgrpn/test_corrective_cli.py": _PROJECT_ROOT
+    / "tests"
+    / "sgrpn"
+    / "test_corrective_cli.py",
+    "tests/sgrpn/test_corrective_evaluation.py": _PROJECT_ROOT
+    / "tests"
+    / "sgrpn"
+    / "test_corrective_evaluation.py",
+}
 _METHOD_NOTES = {
     "analysis_status": _ANALYSIS_STATUS,
     "calibration": "group_split_conformal_with_locked_predictor",
@@ -118,17 +146,77 @@ def _load_training_seal(root: Path) -> dict[str, object]:
     ):
         raise ValueError("corrective training seal is incompatible")
     digest = str(seal["training_tree_sha256"])
-    if len(digest) != 64 or corrective_training_tree_digest(root) != digest:
+    actual_digest, file_count, total_bytes = _training_tree_inventory(root)
+    if (
+        len(digest) != 64
+        or actual_digest != digest
+        or seal.get("file_count") != file_count
+        or seal.get("total_bytes") != total_bytes
+    ):
         raise ValueError("corrective training tree hash does not match its seal")
+    expected_markers = {
+        f"folds/fold_{fold}/seed_{seed}/complete.json": (
+            root / "folds" / f"fold_{fold}" / f"seed_{seed}" / "complete.json"
+        )
+        for fold in range(5)
+        for seed in phase_b_training.PHASE_B_SEEDS
+    }
+    if set(seal["unit_completion_sha256"]) != set(expected_markers) or any(
+        not path.is_file()
+        or seal["unit_completion_sha256"][relative] != _sha256_file(path)
+        for relative, path in expected_markers.items()
+    ):
+        raise ValueError("corrective training seal unit marker hashes changed")
+    manifest = root / "run_manifest.json"
+    if not manifest.is_file() or seal.get("run_manifest_sha256") != _sha256_file(manifest):
+        raise ValueError("corrective training seal run manifest hash changed")
+    if seal.get("source_revision") != _current_source_revision():
+        raise ValueError("corrective training seal source revision changed")
+    if seal.get("source_files") != _source_file_hashes():
+        raise ValueError("corrective training seal source files changed")
     return seal
+
+
+def _current_source_revision() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(_PROJECT_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("corrective source revision cannot be resolved") from error
+    revision = completed.stdout.strip().lower()
+    if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
+        raise ValueError("corrective source revision is incompatible")
+    return revision
+
+
+def _source_file_hashes() -> dict[str, str]:
+    if not all(path.is_file() for path in _SOURCE_PATHS.values()):
+        raise ValueError("corrective registered source file set is incomplete")
+    revision = _current_source_revision()
+    current = {name: _sha256_file(path) for name, path in _SOURCE_PATHS.items()}
+    committed = {}
+    for name in _SOURCE_PATHS:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(_PROJECT_ROOT), "show", f"{revision}:{name}"],
+                check=True,
+                capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ValueError("corrective registered source is absent from revision") from error
+        committed[name] = hashlib.sha256(completed.stdout).hexdigest()
+    if current != committed:
+        raise ValueError("corrective registered source files differ from revision")
+    return current
 
 
 def create_corrective_training_seal(
     corrective_config: CorrectiveConfig,
     phase_b_config: PhaseBConfig,
-    *,
-    source_revision: str,
-    source_paths: Mapping[str, str | Path],
 ) -> Path:
     """Publish an exclusive root seal after the independently replayed 15/15 gate."""
     root = Path(corrective_config.output_dir).resolve()
@@ -137,11 +225,7 @@ def create_corrective_training_seal(
         raise ValueError("corrective training seal already exists")
     if (root / "evaluation").exists():
         raise ValueError("corrective training cannot be sealed after evaluation starts")
-    revision = str(source_revision)
-    if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
-        raise ValueError("corrective source revision must be a 40-character Git commit")
-    if not isinstance(source_paths, Mapping) or not source_paths:
-        raise ValueError("corrective source files must be provided")
+    revision = _current_source_revision()
     actual_phase_a_hash = _sha256_file(Path(phase_b_config.phase_a_config_path))
     if actual_phase_a_hash != phase_b_config.phase_a_config_file_sha256:
         raise ValueError("Phase A config hash does not match the frozen registration")
@@ -171,13 +255,7 @@ def create_corrective_training_seal(
         or run_manifest.get("completed_units") != 15
     ):
         raise ValueError("corrective training run manifest is incomplete")
-    source_hashes = {}
-    for name, source in source_paths.items():
-        label = str(name)
-        path = Path(source).resolve()
-        if not label or label in source_hashes or not path.is_file():
-            raise ValueError("corrective source file set is incompatible")
-        source_hashes[label] = _sha256_file(path)
+    source_hashes = _source_file_hashes()
     tree_hash, file_count, total_bytes = _training_tree_inventory(root)
     return _exclusive_json(
         seal_path,
@@ -516,6 +594,19 @@ def evaluate_corrective_once(
         raise ValueError("corrective evaluation directory is contaminated")
     seal = _load_training_seal(root)
     actual = str(seal["training_tree_sha256"])
+    if (
+        seal.get("phase_a_config_file_sha256")
+        != phase_b_config.phase_a_config_file_sha256
+        or _sha256_file(Path(phase_b_config.phase_a_config_path))
+        != phase_b_config.phase_a_config_file_sha256
+        or seal.get("phase_b_config_file_sha256")
+        != corrective_config.phase_b_config_file_sha256
+        or seal.get("phase_b_run_manifest_sha256")
+        != corrective_config.phase_b_run_manifest_sha256
+        or seal.get("phase_b_immutable_after_sha256")
+        != corrective_config.phase_b_immutable_after_sha256
+    ):
+        raise ValueError("corrective training seal frozen input hashes are incompatible")
     probability, mean = _load_training_predictions(
         corrective_config, phase_b_config, bundle, cache
     )

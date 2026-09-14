@@ -15,34 +15,64 @@ def _fake_artifacts() -> dict[str, object]:
     }
 
 
-def _write_training_seal(root: Path) -> str:
-    from roughness.sgrpn.corrective import CORRECTIVE_PROTOCOL
-    from roughness.sgrpn.corrective_evaluation import corrective_training_tree_digest
+def _write_training_seal(root: Path):
+    import hashlib
 
-    digest = corrective_training_tree_digest(root)
+    from roughness.sgrpn.corrective import CORRECTIVE_PROTOCOL
+    from roughness.sgrpn import corrective_evaluation as module
+
+    for fold in range(5):
+        for seed in (20260723, 20260724, 20260725):
+            marker = root / "folds" / f"fold_{fold}" / f"seed_{seed}" / "complete.json"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("{}", encoding="utf-8")
+    run_manifest = root / "run_manifest.json"
+    run_manifest.write_text(
+        json.dumps({"training_status": "complete", "completed_units": 15}),
+        encoding="utf-8",
+    )
+    phase_a = root.parent / f"{root.name}-phase-a.yaml"
+    phase_a.write_text("frozen: true\n", encoding="utf-8")
+    phase_a_hash = hashlib.sha256(phase_a.read_bytes()).hexdigest()
+    config = SimpleNamespace(
+        output_dir=root,
+        phase_b_config_file_sha256="e" * 64,
+        phase_b_run_manifest_sha256="f" * 64,
+        phase_b_immutable_after_sha256="1" * 64,
+    )
+    phase_b = SimpleNamespace(
+        phase_a_config_path=phase_a,
+        phase_a_config_file_sha256=phase_a_hash,
+    )
+
+    digest, file_count, total_bytes = module._training_tree_inventory(root)
+    markers = {
+        path.relative_to(root).as_posix(): module._sha256_file(path)
+        for path in sorted(root.rglob("complete.json"))
+    }
     (root / "training_seal.json").write_text(
         json.dumps(
             {
                 "protocol": CORRECTIVE_PROTOCOL,
                 "status": "sealed",
                 "training_tree_sha256": digest,
-                "file_count": 1,
-                "total_bytes": len(b"frozen-training"),
+                "file_count": file_count,
+                "total_bytes": total_bytes,
                 "completed_units": 15,
-                "phase_a_config_file_sha256": "a" * 64,
-                "phase_b_config_file_sha256": "e" * 64,
-                "phase_b_run_manifest_sha256": "f" * 64,
-                "phase_b_immutable_after_sha256": "1" * 64,
-                "source_revision": "test-revision",
-                "source_files": {"test.py": "b" * 64},
-                "unit_completion_sha256": {f"unit-{index}": "c" * 64 for index in range(15)},
-                "run_manifest_sha256": "d" * 64,
+                "phase_a_config_file_sha256": phase_a_hash,
+                "phase_b_config_file_sha256": config.phase_b_config_file_sha256,
+                "phase_b_run_manifest_sha256": config.phase_b_run_manifest_sha256,
+                "phase_b_immutable_after_sha256": config.phase_b_immutable_after_sha256,
+                "source_revision": module._current_source_revision(),
+                "source_files": module._source_file_hashes(),
+                "unit_completion_sha256": markers,
+                "run_manifest_sha256": module._sha256_file(run_manifest),
             },
             sort_keys=True,
         ),
         encoding="utf-8",
     )
-    return digest
+    return digest, config, phase_b
 
 
 def test_create_training_seal_is_exclusive_and_keeps_tree_digest(tmp_path: Path):
@@ -64,8 +94,6 @@ def test_create_training_seal_is_exclusive_and_keeps_tree_digest(tmp_path: Path)
         json.dumps({"training_status": "complete", "completed_units": 15}),
         encoding="utf-8",
     )
-    source = tmp_path / "source.py"
-    source.write_text("VALUE = 1\n", encoding="utf-8")
     before = corrective_training_tree_digest(root)
     config = SimpleNamespace(
         output_dir=root,
@@ -78,21 +106,11 @@ def test_create_training_seal_is_exclusive_and_keeps_tree_digest(tmp_path: Path)
         phase_a_config_file_sha256=phase_a_hash,
     )
 
-    seal = create_corrective_training_seal(
-        config,
-        phase_b,
-        source_revision="1" * 40,
-        source_paths={"source.py": source},
-    )
+    seal = create_corrective_training_seal(config, phase_b)
     assert seal.is_file()
     assert corrective_training_tree_digest(root) == before
     with pytest.raises(ValueError, match="already exists"):
-        create_corrective_training_seal(
-            config,
-            phase_b,
-            source_revision="1" * 40,
-            source_paths={"source.py": source},
-        )
+        create_corrective_training_seal(config, phase_b)
 
 
 def _claim_metrics(*, hetero_coverage_90: float = 0.90) -> pd.DataFrame:
@@ -145,7 +163,7 @@ def test_corrective_evaluation_is_one_shot_and_preserves_training_tree(
 
     training = tmp_path / "training.bin"
     training.write_bytes(b"frozen-training")
-    _write_training_seal(tmp_path)
+    _, config, phase_b = _write_training_seal(tmp_path)
     monkeypatch.setattr(
         module, "_load_training_predictions", lambda *args: (object(), object())
     )
@@ -155,8 +173,8 @@ def test_corrective_evaluation_is_one_shot_and_preserves_training_tree(
     )
 
     written = module.evaluate_corrective_once(
-        SimpleNamespace(output_dir=tmp_path),
-        object(),
+        config,
+        phase_b,
         object(),
         object(),
     )
@@ -167,8 +185,8 @@ def test_corrective_evaluation_is_one_shot_and_preserves_training_tree(
     assert written["claim_decision"].name == "claim_decision.json"
     with pytest.raises(ValueError, match="already been invoked"):
         module.evaluate_corrective_once(
-            SimpleNamespace(output_dir=tmp_path),
-            object(),
+            config,
+            phase_b,
             object(),
             object(),
         )
@@ -180,7 +198,7 @@ def test_corrective_evaluation_failure_consumes_the_single_invocation(
     from roughness.sgrpn import corrective_evaluation as module
 
     (tmp_path / "training.bin").write_bytes(b"frozen-training")
-    _write_training_seal(tmp_path)
+    _, config, phase_b = _write_training_seal(tmp_path)
     monkeypatch.setattr(
         module, "_load_training_predictions", lambda *args: (object(), object())
     )
@@ -192,8 +210,8 @@ def test_corrective_evaluation_failure_consumes_the_single_invocation(
     monkeypatch.setattr(module, "_build_claim_decision", lambda *args: {})
     with pytest.raises(RuntimeError, match="synthetic evaluation failure"):
         module.evaluate_corrective_once(
-            SimpleNamespace(output_dir=tmp_path),
-            object(),
+            config,
+            phase_b,
             object(),
             object(),
         )
@@ -206,8 +224,8 @@ def test_corrective_evaluation_failure_consumes_the_single_invocation(
     assert not (tmp_path / "evaluation" / "evaluation_complete.json").exists()
     with pytest.raises(ValueError, match="already been invoked"):
         module.evaluate_corrective_once(
-            SimpleNamespace(output_dir=tmp_path),
-            object(),
+            config,
+            phase_b,
             object(),
             object(),
         )
@@ -217,12 +235,12 @@ def test_corrective_evaluation_rejects_changed_training_tree(tmp_path: Path):
     from roughness.sgrpn import corrective_evaluation as module
 
     (tmp_path / "training.bin").write_bytes(b"before")
-    _write_training_seal(tmp_path)
+    _, config, phase_b = _write_training_seal(tmp_path)
     (tmp_path / "training.bin").write_bytes(b"changed")
     with pytest.raises(ValueError, match="training tree hash"):
         module.evaluate_corrective_once(
-            SimpleNamespace(output_dir=tmp_path),
-            object(),
+            config,
+            phase_b,
             object(),
             object(),
         )
@@ -233,7 +251,7 @@ def test_corrective_evaluation_loader_failure_consumes_invocation(tmp_path: Path
     from roughness.sgrpn import corrective_evaluation as module
 
     (tmp_path / "training.bin").write_bytes(b"frozen-training")
-    _write_training_seal(tmp_path)
+    _, config, phase_b = _write_training_seal(tmp_path)
 
     def fail(*args):
         raise RuntimeError("synthetic load failure")
@@ -241,8 +259,8 @@ def test_corrective_evaluation_loader_failure_consumes_invocation(tmp_path: Path
     monkeypatch.setattr(module, "_load_training_predictions", fail)
     with pytest.raises(RuntimeError, match="synthetic load failure"):
         module.evaluate_corrective_once(
-            SimpleNamespace(output_dir=tmp_path),
-            object(),
+            config,
+            phase_b,
             object(),
             object(),
         )
@@ -255,19 +273,18 @@ def test_corrective_evaluation_atomic_invocation_allows_one_concurrent_caller(
     from roughness.sgrpn import corrective_evaluation as module
 
     (tmp_path / "training.bin").write_bytes(b"frozen-training")
-    _write_training_seal(tmp_path)
+    _, config, phase_b = _write_training_seal(tmp_path)
     monkeypatch.setattr(
         module, "_load_training_predictions", lambda *args: (object(), object())
     )
     monkeypatch.setattr(module, "_build_non_claim_artifacts", lambda *args: _fake_artifacts())
     monkeypatch.setattr(module, "_build_claim_decision", lambda *args: {})
-    config = SimpleNamespace(output_dir=tmp_path)
 
     def invoke():
         try:
             module.evaluate_corrective_once(
                 config,
-                object(),
+                phase_b,
                 object(),
                 object(),
             )
@@ -287,23 +304,22 @@ def test_corrective_evaluation_validator_recomputes_and_rejects_tamper(
     from roughness.sgrpn import corrective_evaluation as module
 
     (tmp_path / "training.bin").write_bytes(b"frozen-training")
-    _write_training_seal(tmp_path)
+    _, config, phase_b = _write_training_seal(tmp_path)
     monkeypatch.setattr(
         module, "_load_training_predictions", lambda *args: (object(), object())
     )
     monkeypatch.setattr(module, "_build_non_claim_artifacts", lambda *args: _fake_artifacts())
     monkeypatch.setattr(module, "_build_claim_decision", lambda *args: {})
-    config = SimpleNamespace(output_dir=tmp_path)
     module.evaluate_corrective_once(
         config,
-        object(),
+        phase_b,
         object(),
         object(),
     )
 
     module.validate_corrective_evaluation_outputs(
         config,
-        object(),
+        phase_b,
         object(),
         object(),
     )
@@ -314,7 +330,7 @@ def test_corrective_evaluation_validator_recomputes_and_rejects_tamper(
     )
     module.validate_corrective_evaluation_outputs(
         config,
-        object(),
+        phase_b,
         object(),
         object(),
     )
@@ -324,7 +340,7 @@ def test_corrective_evaluation_validator_recomputes_and_rejects_tamper(
     with pytest.raises(ValueError, match="artifact hash closure"):
         module.validate_corrective_evaluation_outputs(
             config,
-            object(),
+            phase_b,
             object(),
             object(),
         )
