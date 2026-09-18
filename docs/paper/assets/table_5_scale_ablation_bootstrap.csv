@@ -1,0 +1,7 @@
+metric,nominal_coverage,heteroscedastic_minus_homoscedastic,ci95_lower,ci95_upper,ci_excludes_zero,preferred_direction,observed_direction,registered_interpretation
+Gaussian NLL,,16.0269598216,0.353873244167,46.2859369174,True,Lower is better,Heteroscedastic is worse,No heteroscedastic advantage
+Gaussian CRPS,,0.00249612851835,0.00103092127384,0.0039986456119,True,Lower is better,Heteroscedastic is worse,No heteroscedastic advantage
+Mean interval width,0.9,0.240198479917,0.195790630384,0.286234769368,True,Lower is better,Heteroscedastic is worse,No heteroscedastic advantage
+Mean interval width,0.95,0.61647495344,0.531795361295,0.70625019865,True,Lower is better,Heteroscedastic is worse,No heteroscedastic advantage
+Winkler score,0.9,0.209326931416,0.133686743625,0.280636762234,True,Lower is better,Heteroscedastic is worse,No heteroscedastic advantage
+Winkler score,0.95,0.588593430212,0.444886501549,0.724952967185,True,Lower is better,Heteroscedastic is worse,No heteroscedastic advantage

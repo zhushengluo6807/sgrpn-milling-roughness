@@ -1,0 +1,7 @@
+model,architecture,inputs,training_target,role
+M0,Quadratic process ridge regression,Process parameters and registered quadratic terms,Region-mean Ra,Strong classical process baseline
+P1,Process MLP,Nine scaled process features,Region-mean Ra,Neural process expert and safe fallback
+V1,Vibration-only CNN,Three-channel order spectra,Region-mean Ra,Tests vibration without process context
+F1,Direct process-vibration fusion,Process features and order-spectrum embedding,Region-mean Ra,Naive fusion comparator
+R1,Ungated residual fusion,P1 process mean and order-spectrum embedding,Group-safe P1 OOF residual,Tests the full learned vibration correction
+G1,Selective gated residual fusion,"P1 mean, residual embedding, process and seven quality features",Group-safe P1 OOF residual with gated correction,Proposed safe fusion model

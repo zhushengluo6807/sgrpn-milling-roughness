@@ -1,0 +1,349 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "SGRPN target-journal decision",
+    "description": "One primary journal, two backups, and explicit transfer gates for the frozen milling-roughness manuscript.",
+    "generatedAt": "2026-09-10T10:30:00+08:00",
+    "cards": [
+      {
+        "id": "primary-score",
+        "description": "Highest default fit under the current evidence and data-sharing constraints.",
+        "dataset": "journal_scores",
+        "filter": {"journal": "JIM"},
+        "sourceId": "selection-report",
+        "metrics": [
+          {"label": "Primary: JIM", "field": "score", "format": "number"}
+        ]
+      },
+      {
+        "id": "backup-one-score",
+        "description": "Manufacturing-centered fallback that does not require a new experiment.",
+        "dataset": "journal_scores",
+        "filter": {"journal": "IJAMT"},
+        "sourceId": "selection-report",
+        "metrics": [
+          {"label": "Backup 1: IJAMT", "field": "score", "format": "number"}
+        ]
+      },
+      {
+        "id": "backup-two-score",
+        "description": "Conditional AI-engineering backup; public-data validation is the gating issue.",
+        "dataset": "journal_scores",
+        "filter": {"journal": "EAAI"},
+        "sourceId": "selection-report",
+        "metrics": [
+          {"label": "Backup 2: EAAI", "field": "score", "format": "number"}
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "weighted-fit-chart",
+        "title": "Weighted manuscript fit under current constraints",
+        "subtitle": "Scores compare fit to this frozen manuscript, not journal quality or acceptance probability.",
+        "type": "horizontalBar",
+        "intent": "comparison",
+        "question": "Which journal best matches the paper without new experiments or assumed public-data availability?",
+        "rationale": "A horizontal bar chart makes the three ordered weighted scores directly comparable.",
+        "dataset": "journal_scores",
+        "sourceId": "selection-report",
+        "encodings": {
+          "x": {"field": "journal", "type": "nominal", "label": "Journal"},
+          "y": {"field": "score", "type": "quantitative", "label": "Weighted fit", "unit": "/5"},
+          "tooltip": [
+            {"field": "role", "type": "text", "label": "Role"},
+            {"field": "score", "type": "quantitative", "label": "Weighted fit", "unit": "/5"}
+          ]
+        },
+        "valueFormat": "number",
+        "unit": "/5",
+        "layout": "full",
+        "maxRows": 3,
+        "compatibleTypes": ["horizontalBar", "bar", "leaderboard"]
+      }
+    ],
+    "tables": [
+      {
+        "id": "criteria-table",
+        "title": "Decision matrix",
+        "subtitle": "1–5 analyst scores; novelty safety rises as collision risk falls; verified 10 September 2026.",
+        "dataset": "journal_scores",
+        "sourceId": "selection-report",
+        "layout": "full",
+        "density": "spacious",
+        "defaultSort": {"field": "score", "direction": "desc"},
+        "columns": [
+          {"field": "journal", "label": "Journal", "type": "text"},
+          {"field": "scope_fit", "label": "Scope", "type": "number"},
+          {"field": "method_fit", "label": "Method", "type": "number"},
+          {"field": "evidence_fit", "label": "Evidence", "type": "number"},
+          {"field": "novelty_safety", "label": "Novelty safety", "type": "number"},
+          {"field": "operational_fit", "label": "Operations", "type": "number"},
+          {"field": "score", "label": "Weighted /5", "type": "number"},
+          {"field": "role", "label": "Role", "type": "text"}
+        ]
+      },
+      {
+        "id": "submission-actions-table",
+        "title": "Primary-journal conversion checklist",
+        "subtitle": "Changes required to turn the current Markdown draft into a JIM-ready submission package.",
+        "dataset": "submission_actions",
+        "sourceId": "selection-report",
+        "layout": "full",
+        "density": "spacious",
+        "columns": [
+          {"field": "priority", "label": "Priority", "type": "number"},
+          {"field": "action", "label": "Required action", "type": "text"},
+          {"field": "current", "label": "Current state", "type": "text"},
+          {"field": "target", "label": "JIM target", "type": "text"}
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "selection-report",
+        "label": "SGRPN target-journal selection report",
+        "path": "2026-09-10-sgrpn-target-journal-selection.md",
+        "query": {
+          "engine": "analyst decision rubric",
+          "sql": "WITH scores(journal, scope_fit, method_fit, evidence_fit, novelty_safety, operational_fit) AS (VALUES ('JIM',5.0,4.8,4.6,3.6,4.4),('IJAMT',4.7,3.9,4.6,4.0,4.5),('EAAI',4.8,4.8,3.2,2.8,3.0)) SELECT journal, 0.30*scope_fit + 0.25*method_fit + 0.20*evidence_fit + 0.15*novelty_safety + 0.10*operational_fit AS score FROM scores ORDER BY score DESC;",
+          "description": "Reproducible weighted calculation of the source-attributed 1–5 journal-fit rubric.",
+          "executed_at": "2026-09-10T10:30:00+08:00",
+          "language": "sql"
+        }
+      },
+      {
+        "id": "jim-home",
+        "label": "Journal of Intelligent Manufacturing — official journal page",
+        "href": "https://link.springer.com/journal/10845",
+        "query": {"description": "Official scope, publishing model, and journal metrics; accessed 2026-09-10."}
+      },
+      {
+        "id": "jim-guide",
+        "label": "Journal of Intelligent Manufacturing — official submission guidelines",
+        "href": "https://link.springer.com/journal/10845/submission-guidelines",
+        "query": {"description": "Official abstract, keyword, reference, declarations, and research-data requirements; accessed 2026-09-10."}
+      },
+      {
+        "id": "ijamt-home",
+        "label": "International Journal of Advanced Manufacturing Technology — official journal page",
+        "href": "https://link.springer.com/journal/170",
+        "query": {"description": "Official scope, publishing model, and journal metrics; accessed 2026-09-10."}
+      },
+      {
+        "id": "ijamt-guide",
+        "label": "International Journal of Advanced Manufacturing Technology — official submission guidelines",
+        "href": "https://link.springer.com/journal/170/submission-guidelines",
+        "query": {"description": "Official manuscript-format, contribution-question, and Type 1 data-policy requirements; accessed 2026-09-10."}
+      },
+      {
+        "id": "eaai-home",
+        "label": "Engineering Applications of Artificial Intelligence — official journal page",
+        "href": "https://www.journals.elsevier.com/engineering-applications-of-artificial-intelligence",
+        "query": {"description": "Official scope, editorial screening, public-dataset expectation, and publishing-model information; accessed 2026-09-10."}
+      },
+      {
+        "id": "recent-jim-review",
+        "label": "Recent JIM review of AI for machining surface-quality prediction",
+        "href": "https://link.springer.com/article/10.1007/s10845-025-02571-y",
+        "query": {"description": "Recent topic-fit evidence covering process parameters, sensor signals, hybrid information, and data scarcity."}
+      },
+      {
+        "id": "recent-ijamt-paper",
+        "label": "Recent IJAMT paper on physics-based features for roughness prediction",
+        "href": "https://link.springer.com/article/10.1007/s00170-026-17731-4",
+        "query": {"description": "Recent topic-fit evidence for manufacturing-centered machine learning and surface-roughness prediction."}
+      },
+      {
+        "id": "recent-eaai-paper",
+        "label": "Recent EAAI paper on heterogeneous fusion for milling surface quality",
+        "href": "https://www.sciencedirect.com/science/article/pii/S095219762400201X",
+        "query": {"description": "Recent scope-fit and novelty-collision evidence for multisource deep fusion in milling."}
+      },
+      {
+        "id": "hybrid-fees",
+        "label": "Publisher policies for hybrid-journal publication charges",
+        "href": "https://support.springernature.com/en/support/solutions/articles/6000211135-article-processing-charges-apc-",
+        "query": {"description": "Springer Nature policy stating that the subscription route in hybrid journals carries no APC."}
+      }
+    ],
+    "blocks": [
+      {
+        "id": "answer-first",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "selection-report",
+        "body": "## Recommendation\n\nSubmit first to **Journal of Intelligent Manufacturing (JIM)**. Use **IJAMT** as the unconditional first backup. Keep **EAAI** as a conditional second backup, promoted ahead of IJAMT only if a legally shareable public replication dataset can be released.\n\nJIM is the best balance of manufacturing-AI scope, tolerance for rigorous applied evidence, and a data policy that requires a statement without universally requiring a public dataset. The paper should lead with harmful weak-sensor corrections, group-isolated validation, and simultaneous new-group coverage—not generic fusion or claimed mean-accuracy superiority."
+      },
+      {
+        "id": "score-cards",
+        "type": "metric-strip",
+        "layout": "full",
+        "cardIds": ["primary-score", "backup-one-score", "backup-two-score"]
+      },
+      {
+        "id": "fit-chart-block",
+        "type": "chart",
+        "layout": "full",
+        "chartId": "weighted-fit-chart"
+      },
+      {
+        "id": "chart-interpretation",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "selection-report",
+        "body": "The score gap is driven less by prestige than by evidence compatibility. EAAI's AI-method fit is strong, but its public-dataset expectation and a crowded 2024–2026 roughness-fusion literature reduce its default fit. If public data can be released, EAAI rises from 4.00 to about 4.34 and can move ahead of IJAMT in the transfer queue, while JIM remains the primary."
+      },
+      {
+        "id": "criteria-table-block",
+        "type": "table",
+        "layout": "full",
+        "tableId": "criteria-table"
+      },
+      {
+        "id": "evidence",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "selection-report",
+        "body": "## Evidence and editorial implications\n\n**JIM** explicitly focuses on artificial intelligence in manufacturing and has recently published reviews centered on AI-driven surface-quality prediction. Its original-research data policy requires a Data Availability Statement and strongly encourages public deposition, while allowing access conditions to be stated when public sharing is not possible.\n\n**IJAMT** emphasizes practical advanced-manufacturing applications. It is a credible fallback because recent articles cover neural prediction, physics-based features, and distributional roughness modeling, and its Type 1 data policy encourages rather than universally mandates public deposition.\n\n**EAAI** covers exactly the AI–engineering combination, but requires the abstract to identify both contributions and expects public-dataset validation. Multiple recent milling-roughness fusion papers also raise the differentiation bar. The manuscript must therefore avoid 'first fusion' or 'first conformal roughness' claims."
+      },
+      {
+        "id": "transfer-rule",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "selection-report",
+        "body": "## Transfer rule\n\nUse **JIM → IJAMT** by default. Use **JIM → EAAI → IJAMT** only after the public-data gate is satisfied and rechecked against the live EAAI guide. A request for new materials, tools, machines, or external validation should trigger transfer, not unregistered retraining or selective removal of seeds or folds."
+      },
+      {
+        "id": "actions-table-block",
+        "type": "table",
+        "layout": "full",
+        "tableId": "submission-actions-table"
+      },
+      {
+        "id": "caveats",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "selection-report",
+        "body": "## Caveats\n\nThis is a manuscript-fit screen as of 10 September 2026, not a journal-quality ranking or an acceptance forecast. Publisher metrics and decision times are contextual indicators only. The one unresolved operational fact is whether the archived experimental data can legally be released as a public replication dataset; that fact changes EAAI's position, but not the primary JIM recommendation."
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-09-10T10:30:00+08:00",
+    "status": "ready",
+    "datasets": {
+      "journal_scores": [
+        {
+          "journal": "JIM",
+          "scope_fit": 5.0,
+          "method_fit": 4.8,
+          "evidence_fit": 4.6,
+          "novelty_safety": 3.6,
+          "operational_fit": 4.4,
+          "score": 4.6,
+          "role": "Primary"
+        },
+        {
+          "journal": "IJAMT",
+          "scope_fit": 4.7,
+          "method_fit": 3.9,
+          "evidence_fit": 4.6,
+          "novelty_safety": 4.0,
+          "operational_fit": 4.5,
+          "score": 4.36,
+          "role": "Backup 1"
+        },
+        {
+          "journal": "EAAI",
+          "scope_fit": 4.8,
+          "method_fit": 4.8,
+          "evidence_fit": 3.2,
+          "novelty_safety": 2.8,
+          "operational_fit": 3.0,
+          "score": 4.0,
+          "role": "Backup 2 — conditional"
+        }
+      ],
+      "submission_actions": [
+        {"priority": 1, "action": "Shorten abstract", "current": "Approximately 270 words", "target": "230–245 words; must remain within 150–250"},
+        {"priority": 2, "action": "Reduce keywords", "current": "8 keywords", "target": "6 keywords"},
+        {"priority": 3, "action": "Convert citations", "current": "Numbered references", "target": "Author–year references"},
+        {"priority": 4, "action": "Create title page", "current": "Author metadata absent", "target": "Authors, affiliations, email, ORCID"},
+        {"priority": 5, "action": "Add declarations", "current": "Journal-neutral draft", "target": "Funding, interests, contributions, data availability"},
+        {"priority": 6, "action": "Package figures and sources", "current": "Markdown + PNG/SVG assets", "target": "Editable Word or LaTeX sources and journal-ready figures"}
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "selection-report",
+      "label": "SGRPN target-journal selection report",
+      "path": "2026-09-10-sgrpn-target-journal-selection.md",
+      "query": {
+        "engine": "analyst decision rubric",
+        "sql": "WITH scores(journal, scope_fit, method_fit, evidence_fit, novelty_safety, operational_fit) AS (VALUES ('JIM',5.0,4.8,4.6,3.6,4.4),('IJAMT',4.7,3.9,4.6,4.0,4.5),('EAAI',4.8,4.8,3.2,2.8,3.0)) SELECT journal, 0.30*scope_fit + 0.25*method_fit + 0.20*evidence_fit + 0.15*novelty_safety + 0.10*operational_fit AS score FROM scores ORDER BY score DESC;",
+        "description": "Reproducible weighted calculation of the source-attributed 1–5 journal-fit rubric.",
+        "executed_at": "2026-09-10T10:30:00+08:00",
+        "language": "sql"
+      }
+    },
+    {
+      "id": "jim-home",
+      "label": "Journal of Intelligent Manufacturing — official journal page",
+      "href": "https://link.springer.com/journal/10845",
+      "query": {"description": "Official scope, publishing model, and journal metrics; accessed 2026-09-10."}
+    },
+    {
+      "id": "jim-guide",
+      "label": "Journal of Intelligent Manufacturing — official submission guidelines",
+      "href": "https://link.springer.com/journal/10845/submission-guidelines",
+      "query": {"description": "Official abstract, keyword, reference, declarations, and research-data requirements; accessed 2026-09-10."}
+    },
+    {
+      "id": "ijamt-home",
+      "label": "International Journal of Advanced Manufacturing Technology — official journal page",
+      "href": "https://link.springer.com/journal/170",
+      "query": {"description": "Official scope, publishing model, and journal metrics; accessed 2026-09-10."}
+    },
+    {
+      "id": "ijamt-guide",
+      "label": "International Journal of Advanced Manufacturing Technology — official submission guidelines",
+      "href": "https://link.springer.com/journal/170/submission-guidelines",
+      "query": {"description": "Official manuscript-format, contribution-question, and Type 1 data-policy requirements; accessed 2026-09-10."}
+    },
+    {
+      "id": "eaai-home",
+      "label": "Engineering Applications of Artificial Intelligence — official journal page",
+      "href": "https://www.journals.elsevier.com/engineering-applications-of-artificial-intelligence",
+      "query": {"description": "Official scope, editorial screening, public-dataset expectation, and publishing-model information; accessed 2026-09-10."}
+    },
+    {
+      "id": "recent-jim-review",
+      "label": "Recent JIM review of AI for machining surface-quality prediction",
+      "href": "https://link.springer.com/article/10.1007/s10845-025-02571-y",
+      "query": {"description": "Recent topic-fit evidence covering process parameters, sensor signals, hybrid information, and data scarcity."}
+    },
+    {
+      "id": "recent-ijamt-paper",
+      "label": "Recent IJAMT paper on physics-based features for roughness prediction",
+      "href": "https://link.springer.com/article/10.1007/s00170-026-17731-4",
+      "query": {"description": "Recent topic-fit evidence for manufacturing-centered machine learning and surface-roughness prediction."}
+    },
+    {
+      "id": "recent-eaai-paper",
+      "label": "Recent EAAI paper on heterogeneous fusion for milling surface quality",
+      "href": "https://www.sciencedirect.com/science/article/pii/S095219762400201X",
+      "query": {"description": "Recent scope-fit and novelty-collision evidence for multisource deep fusion in milling."}
+    },
+    {
+      "id": "hybrid-fees",
+      "label": "Publisher policies for hybrid-journal publication charges",
+      "href": "https://support.springernature.com/en/support/solutions/articles/6000211135-article-processing-charges-apc-",
+      "query": {"description": "Springer Nature policy stating that the subscription route in hybrid journals carries no APC."}
+    }
+  ]
+}
