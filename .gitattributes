@@ -1,0 +1,18 @@
+# Binary assets — never apply line-ending or encoding conversion.
+# Rationale: two agents edit this worktree; a silently mangled .docx or .png
+# is unrecoverable in review. See W0.1 command list §4.
+*.docx  binary
+*.doc    binary
+*.xlsx  binary
+*.xls   binary
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.bmp   binary
+*.gif   binary
+*.pt    binary
+*.pth   binary
+*.npy   binary
+*.npz   binary
+*.pyc   binary
