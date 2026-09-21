@@ -12,12 +12,13 @@ type: software
 authors:
   - family-names: Zhu
     given-names: Shanlin
+    orcid: "https://orcid.org/0009-0003-4655-034X"
     affiliation: >-
       School of Mechanical Engineering, Sichuan University
-    # TODO(citation): confirm the exact name spelling, ORCID, and the full
-    # author list and order before the manuscript is submitted.
-repository-code: "https://github.com/zhushengluo/sgrpn-milling-roughness"
-url: "https://github.com/zhushengluo/sgrpn-milling-roughness"
+    # TODO(citation): confirm the full author list and order before the
+    # manuscript is submitted. (Name spelling confirmed 2026-09-21; ORCID added.)
+repository-code: "https://github.com/zhushengluo6807/sgrpn-milling-roughness"
+url: "https://github.com/zhushengluo6807/sgrpn-milling-roughness"
 license: MIT
 keywords:
   - surface roughness
