@@ -206,7 +206,7 @@ def _build_table_2() -> pd.DataFrame:
             "Process MLP",
             "Nine scaled process features",
             "Region-mean Ra",
-            "Neural process expert and safe fallback",
+            "Neural process expert and process-anchored fallback",
         ),
         (
             "V1",
@@ -234,7 +234,7 @@ def _build_table_2() -> pd.DataFrame:
             "Selective gated residual fusion",
             "P1 mean, residual embedding, process and seven quality features",
             "Group-safe P1 OOF residual with gated correction",
-            "Proposed safe fusion model",
+            "Proposed selective fusion model",
         ),
     ]
     return pd.DataFrame(
@@ -616,7 +616,7 @@ def _diagram_arrow(
 
 
 def _render_sgrpn_architecture(png: Path, svg: Path) -> None:
-    """Render the safe gated residual mean architecture as an editable diagram."""
+    """Render the selective gated residual mean architecture as an editable diagram."""
     with plt.rc_context(
         {
             "font.family": "DejaVu Sans",
@@ -627,7 +627,7 @@ def _render_sgrpn_architecture(png: Path, svg: Path) -> None:
         figure, axis = plt.subplots(figsize=(13.2, 6.8))
         axis.set_axis_off()
         figure.suptitle(
-            "SGRPN safe gated residual fusion architecture",
+            "SGRPN selective gated residual fusion architecture",
             fontsize=15,
             fontweight="bold",
             y=0.98,
@@ -709,7 +709,7 @@ def _render_sgrpn_architecture(png: Path, svg: Path) -> None:
             0.17,
             0.20,
             0.18,
-            "Trust gate\n[x, vibration embedding, q]\n80 → 16 → 1 + sigmoid\ng ∈ [0, 1]",
+            "Correction gate\n[x, vibration embedding, q]\n80 → 16 → 1 + sigmoid\ng ∈ [0, 1]",
             facecolor="#F2F4F6",
             fontweight="bold",
         )
@@ -755,7 +755,7 @@ def _render_sgrpn_architecture(png: Path, svg: Path) -> None:
             0.025,
             0.39,
             0.075,
-            "Safe fallback: g → 0  ⇒  μ̂ → μ_process; vibration can only supply a gated vibration correction",
+            "Process-anchored fallback: g → 0  ⇒  μ̂ → μ_process; vibration can only supply a gated vibration correction",
             facecolor="#E7F0F5",
             edgecolor=BLUE,
             fontsize=8.8,
@@ -1199,7 +1199,7 @@ def _render_negative_transfer(table: pd.DataFrame, png: Path, svg: Path) -> None
         figure.text(
             0.5,
             0.97,
-            "A group is counted when its weighted MAE exceeds P1 by more than 0.01 µm; lower is safer.",
+            "A group is counted when its weighted MAE exceeds P1 by more than 0.01 µm; lower indicates less harm.",
             ha="center",
             va="top",
             fontsize=9.2,
@@ -1515,7 +1515,7 @@ These paper-ready assets use the **{status}**. The supported mean-model result i
 
 ## Figure 4 contract and caption
 
-**Material negative-transfer rate relative to P1.** A group is materially harmed when candidate group MAE exceeds P1 by more than 0.01 µm. Phase A rates are {transfer('Phase A', 'F1'):.2%} for F1, {transfer('Phase A', 'R1'):.2%} for R1, and {transfer('Phase A', 'G1'):.2%} for G1. The {phase_label} rates are {transfer(phase_label, 'R1'):.2%} for R1 and {transfer(phase_label, 'G1'):.2%} for G1. Lower values indicate safer fusion; the result is not a claim of superior average accuracy.
+**Material negative-transfer rate relative to P1.** A group is materially harmed when candidate group MAE exceeds P1 by more than 0.01 µm. Phase A rates are {transfer('Phase A', 'F1'):.2%} for F1, {transfer('Phase A', 'R1'):.2%} for R1, and {transfer('Phase A', 'G1'):.2%} for G1. The {phase_label} rates are {transfer(phase_label, 'R1'):.2%} for R1 and {transfer(phase_label, 'G1'):.2%} for G1. Lower values indicate less harm; the result is not a claim of superior average accuracy.
 
 ## Figure 5 contract and caption
 

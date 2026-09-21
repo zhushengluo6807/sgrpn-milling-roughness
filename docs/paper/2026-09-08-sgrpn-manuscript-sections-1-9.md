@@ -1,4 +1,4 @@
-# Safe Gated Residual Neural Fusion with Group Split-Conformal Uncertainty Quantification for Milling Surface Roughness
+# Selective Gated Residual Neural Fusion with Group Split-Conformal Uncertainty Quantification for Milling Surface Roughness
 
 ## Abstract
 
@@ -16,7 +16,7 @@ This question is especially important for small, structured machining datasets. 
 
 Point accuracy alone also leaves an unresolved decision problem. A prediction error estimate averaged over historical runs does not state how uncertain a new prediction is, nor whether all regions and repeated readings in a future machining group are jointly covered. General approaches include approximate Bayesian dropout, deep ensembles, learned aleatoric scales, and distribution-free calibration (Gal & Ghahramani, 2016; Kendall & Gal, 2017; Lakshminarayanan et al., 2017; Lei et al., 2018). Manufacturing studies have also begun to address this limitation: Zhu et al. (2025) used non-parametric kernel density estimation to form prediction intervals for sensor-based hard-turning models, and He et al. (2026) combined a roughness predictor with adaptive conformal prediction in micro-milling. Consequently, the gap is not the absence of uncertainty quantification or conformal prediction in surface-roughness research. Rather, the unresolved issue addressed here is the combination of (i) potentially harmful weak sensor increments, (ii) end-to-end isolation of machining groups, and (iii) simultaneous prediction coverage for the correlated regions and repeated readings belonging to a new group.
 
-We address this combination with a selective gated residual probabilistic network (SGRPN). A process multilayer perceptron supplies the fallback mean prediction. A convolutional vibration branch learns only cross-fitted residuals of that process expert, and a bounded gate controls the admitted residual correction. The term *safe* is used in a narrow statistical sense: the architecture is designed and evaluated for reducing material negative transfer relative to the process expert under a pre-registered threshold. It does not denote machine functional safety or guarantee improvement for an individual future run. After the mean path is frozen, repeat-aware scale models are fitted and calibrated using one maximum nonconformity score per machining group. The resulting target is simultaneous coverage of all observed-type regions and repeats in an exchangeable new machining group, rather than marginal coverage of an arbitrarily selected row.
+We address this combination with a selective gated residual probabilistic network (SGRPN). A process multilayer perceptron supplies the fallback mean prediction. A convolutional vibration branch learns only cross-fitted residuals of that process expert, and a bounded gate controls the admitted residual correction. The term *selective* denotes a registered statistical criterion rather than machine functional safety: the architecture is designed and evaluated for reducing material negative transfer relative to the process expert under a pre-registered threshold, and it does not guarantee improvement for an individual future run. After the mean path is frozen, repeat-aware scale models are fitted and calibrated using one maximum nonconformity score per machining group. The resulting target is simultaneous coverage of all observed-type regions and repeats in an exchangeable new machining group, rather than marginal coverage of an arbitrarily selected row.
 
 The study uses an existing full-slot milling dataset containing 212 machining groups, 586 surface regions, and three Ra readings per region. No additional physical experiment was introduced. Evaluation used fixed five-fold group separation, three random seeds for the retained probability path, and 10,000 paired group-Bootstrap resamples. The main finding is deliberately two-sided: selective gating reduced material negative transfer without establishing a stable mean-accuracy advantage, while both scale variants achieved their empirical simultaneous-group coverage targets after valid split-conformal calibration. The heteroscedastic model was not emphasized because it failed the correction-specific efficiency rule frozen before corrective evaluation.
 
@@ -75,7 +75,24 @@ The dataset contains 212 independent machining groups, denoted by \(g=1,\ldots,G
 
 The machining inputs were spindle speed \(n\), feed per tooth \(f_z\), and axial depth of cut \(a_p\). The design grid comprised ten speed levels from 4,000 to 8,500 rpm in 500-rpm increments, five feed levels from 0.03 to 0.15 mm/tooth in 0.03-mm/tooth increments, and four depth levels from 0.5 to 2.0 mm in 0.5-mm increments. Of the 200 possible process combinations, 189 were observed. The archived data included two acquisition versions, v3 and v4. Because these versions used non-overlapping speed grids, version and speed were completely confounded. Version was therefore excluded from all model inputs and used only for a descriptive composite-domain stress test.
 
-Three spindle-vibration channels—Ch9, Ch10, and Ch11—were sampled at 25.6 kHz. Ch11 was confirmed as the axial direction. The physical X/Y assignment of Ch9 and Ch10 could not be recovered reliably, so the two horizontal channels were treated symmetrically rather than assigned unsupported directional labels. Each valid model window covered 1 s and therefore contained 25,600 samples. The core dataset and hierarchy are summarized in [Table 1](assets_corrective/tables.md#table-1-dataset-and-experimental-structure).
+Three spindle-vibration channels—Ch9, Ch10, and Ch11—were sampled at 25.6 kHz. Ch11 was confirmed as the axial direction. The physical X/Y assignment of Ch9 and Ch10 could not be recovered reliably, so the two horizontal channels were treated symmetrically rather than assigned unsupported directional labels. Each valid model window covered 1 s and therefore contained 25,600 samples. The core dataset and hierarchy are summarized in Table 1.
+
+**Table 1. Dataset and experimental structure.**
+
+| Item | Value | Definition or scope | Source |
+| --- | --- | --- | --- |
+| Independent machining groups | 212 | Outer splitting and Bootstrap resampling unit | Phase A run manifest |
+| Surface regions | 586 | Prediction unit; regions remain nested in machining groups | Phase A run manifest |
+| Ra readings per region | 3 | Repeated readings share one region-level mean and uncertainty model | Locked SGRPN protocol |
+| Vibration channels | 3 (Ch9, Ch10, Ch11) | Ch11 is axial; Ch9/Ch10 orientation is unresolved and symmetrized | Locked SGRPN protocol |
+| Vibration sampling rate | 25.6 kHz | Each retained model window contains 25,600 samples (1 s) | Locked SGRPN protocol |
+| Spindle-speed grid | 10 levels (4000, 4500, 5000, 5500, 6000, 6500, 7000, 7500, 8000, 8500 rpm) | Observed levels in the frozen Phase A breakdown | error_by_n_rpm.csv |
+| Feed-per-tooth grid | 5 levels (0.03, 0.06, 0.09, 0.12, 0.15 mm/tooth) | Observed levels in the frozen Phase A breakdown | error_by_fz_mm_per_tooth.csv |
+| Axial-depth grid | 4 levels (0.5, 1.0, 1.5, 2.0 mm) | Observed levels in the frozen Phase A breakdown | error_by_ap_mm.csv |
+| Observed process combinations | 189 / 200 | Observed combinations relative to the full 10×5×4 grid | Locked SGRPN data specification |
+| Acquisition versions | 2 (v3, v4) | Composite-domain stress test; version is excluded from model inputs | error_by_version.csv |
+| Outer cross-validation | 5 group-disjoint folds | Recorded group overlap count: 0 | Phase A run manifest |
+| Registered random seeds | 1 in Phase A; 3 in Phase B | Phase A feasibility followed by frozen three-seed replication | Phase A/Phase B protocols |
 
 ### 3.2 Group-balanced estimand
 
@@ -105,7 +122,7 @@ The second objective was probabilistic: construct prediction intervals for the i
 
 ### 4.1 Overview of SGRPN
 
-The proposed selective gated residual probabilistic network (SGRPN) separates the prediction problem into three roles: a process-only neural expert supplies the safe mean path, a vibration encoder proposes a residual correction, and a gate determines how much of that correction is admitted. Probability-scale models are trained only after the mean path is frozen. For the valid corrective uncertainty analysis, the same locked mean and scale predictor is then applied to a fixed, disjoint calibration set and to the outer-test set. Figure 1 shows the architecture.
+The proposed selective gated residual probabilistic network (SGRPN) separates the prediction problem into three roles: a process-only neural expert supplies the process-anchored mean path, a vibration encoder proposes a residual correction, and a gate determines how much of that correction is admitted. Probability-scale models are trained only after the mean path is frozen. For the valid corrective uncertainty analysis, the same locked mean and scale predictor is then applied to a fixed, disjoint calibration set and to the outer-test set. Figure 1 shows the architecture.
 
 ![SGRPN architecture](assets_corrective/fig_1_sgrpn_architecture.png)
 
@@ -215,7 +232,7 @@ Each calibration group contributed exactly one score,
 S_g=\max_{i\in g,\ r\in\{1,2,3\}}s_{gir},
 \]
 
-thereby retaining the dependence among regions and repeats. With \(G_{\mathrm{cal}}=43\) calibration groups and target miscoverage \(\alpha\), the finite-sample corrected rank was
+thereby retaining the dependence among regions and repeats. With \(G_{\mathrm{cal}}=43\) calibration groups and target miscoverage \(\alpha\), the rank adopted for the empirical intervals was
 
 \[
 k=\left\lceil(G_{\mathrm{cal}}+1)(1-\alpha)\right\rceil,
@@ -245,13 +262,24 @@ This group isolation was applied consistently to feature scaling, early stopping
 
 ### 5.1 Comparator matrix
 
-The pre-registered comparator set is summarized in [Table 2](assets_corrective/tables.md#table-2-registered-model-and-comparator-matrix). M0 was the quadratic process ridge baseline. P1 tested whether a compact neural process expert remained credible relative to M0. V1 used only the order-spectrum CNN and measured the standalone predictive content of vibration. F1 directly concatenated process features and the vibration embedding. R1 added the complete cross-fitted vibration residual to P1 without gating. G1 applied the selective gate to the same residual path. V1, F1, R1, and G1 used the same order-spectrum representation, CNN capacity, outer folds, and group-balanced region weights.
+The pre-registered comparator set is summarized in Table 2. M0 was the quadratic process ridge baseline. P1 tested whether a compact neural process expert remained credible relative to M0. V1 used only the order-spectrum CNN and measured the standalone predictive content of vibration. F1 directly concatenated process features and the vibration embedding. R1 added the complete cross-fitted vibration residual to P1 without gating. G1 applied the selective gate to the same residual path. V1, F1, R1, and G1 used the same order-spectrum representation, CNN capacity, outer folds, and group-balanced region weights.
+
+**Table 2. Registered model and comparator matrix.**
+
+| Model | Architecture | Inputs | Training target | Role |
+| --- | --- | --- | --- | --- |
+| M0 | Quadratic process ridge regression | Process parameters and registered quadratic terms | Region-mean Ra | Strong classical process baseline |
+| P1 | Process MLP | Nine scaled process features | Region-mean Ra | Neural process expert and process-anchored fallback |
+| V1 | Vibration-only CNN | Three-channel order spectra | Region-mean Ra | Tests vibration without process context |
+| F1 | Direct process-vibration fusion | Process features and order-spectrum embedding | Region-mean Ra | Naive fusion comparator |
+| R1 | Ungated residual fusion | P1 process mean and order-spectrum embedding | Group-safe P1 OOF residual | Tests the full learned vibration correction |
+| G1 | Selective gated residual fusion | P1 mean, residual embedding, process and seven quality features | Group-safe P1 OOF residual with gated correction | Proposed selective fusion model |
 
 ### 5.2 Two-phase registered protocol
 
 Phase A evaluated all six models with seed 20260723. The process expert was required to have no more than 5% worse weighted MAE than M0 and an \(R^2\) decrease no larger than 0.02. G1 was required to have no more than 1% worse MAE, no more than 3% worse RMSE, and no lower \(R^2\) than P1. Conditional on this noninferiority gate, Phase B could proceed through either of two pre-registered paths: (i) at least 1% MAE improvement over P1 with improvement in at least three of five outer folds, or (ii) a reduction of at least 10 percentage points in material negative-transfer rate relative to both F1 and R1.
 
-Phase B retained P1, R1, and G1 and repeated their mean fitting under all three registered seeds. No favorable Phase A initialization was selected. These original Phase B point results remain the historical primary evidence for mean prediction and negative transfer.
+Phase B is a same-data, multi-seed robustness replication: it retained P1, R1, and G1 and repeated their mean fitting under all three registered seeds on the same 212 groups and outer folds as Phase A. No favorable Phase A initialization was selected. These original Phase B point results remain the historical primary evidence for mean prediction and negative transfer.
 
 During an independent methodological audit, the initial cross-fitted conformal analysis was found to violate the identical-predictor requirement: its calibration predictions and outer-test predictions did not come from one locked predictor. Those interval results are not used in this manuscript. Before any corrective model was trained or any corrective outcome was inspected, a post-audit group split-conformal protocol fixed the proper-training/calibration roles, retained the five outer folds and all three seeds, prohibited result-driven rerunning, and required both scale variants to remain reported. This corrective analysis reuses the same dataset and is therefore described as corrective empirical evidence, not as an independent replication or publicly preregistered confirmation. Its reduced-proper-training mean results are reported separately as the cost of reserving independent calibration groups.
 
@@ -297,7 +325,7 @@ Table 3 separates the historical primary point-prediction evidence from the redu
 | Corrective Phase B | R1 | P1 | 0.117848 | 0.160213 | 0.781365 | 39.78% | -0.007786 [-0.014117, -0.002202] |
 | Corrective Phase B | G1 | P1 | 0.111377 | 0.152889 | 0.800881 | 16.51% | -0.001314 [-0.005814, 0.001927] |
 
-Positive MAE improvement denotes lower candidate MAE. Material negative transfer uses the frozen \(0.01~\mu\text{m}\) group-MAE excess threshold. In Phase A, M0 achieved MAE \(0.104619~\mu\text{m}\), RMSE \(0.142870~\mu\text{m}\), and \(R^2=0.826172\). P1 achieved MAE \(0.107735~\mu\text{m}\), RMSE \(0.147107~\mu\text{m}\), and \(R^2=0.815708\). Its MAE was 2.98% higher than M0 and its \(R^2\) was lower by 0.0105, satisfying the registered credibility limits but not supporting superiority over the classical baseline.
+Positive MAE improvement denotes lower candidate MAE. Material negative transfer uses the frozen \(0.01~\mu\text{m}\) group-MAE excess threshold. The fold-win column is intentionally omitted in Panel B because the registered replication summary treats the three seeds as the replicate unit rather than scoring wins per outer fold. In Phase A, M0 achieved MAE \(0.104619~\mu\text{m}\), RMSE \(0.142870~\mu\text{m}\), and \(R^2=0.826172\). P1 achieved MAE \(0.107735~\mu\text{m}\), RMSE \(0.147107~\mu\text{m}\), and \(R^2=0.815708\). Its MAE was 2.98% higher than M0 and its \(R^2\) was lower by 0.0105, satisfying the registered credibility limits but not supporting superiority over the classical baseline.
 
 G1 achieved the best Phase A neural MAE, \(0.106314~\mu\text{m}\), with RMSE \(0.145085~\mu\text{m}\) and \(R^2=0.820740\). However, it improved on P1 in only two of five outer folds. Its MAE improvement over P1 was \(0.001421~\mu\text{m}\), with a paired group-Bootstrap 95% interval of \([-0.002421,0.005166]~\mu\text{m}\). The interval included zero, and the fold criterion for the registered mean-improvement path was not met.
 
@@ -309,7 +337,7 @@ Reserving 43 calibration groups in the corrective protocol reduced the data avai
 
 *Figure 3. Corrective outer-held-out G1 predictions against measured region-mean Ra across the three registered seeds. The v3/v4 stress test remains confounded with speed; version is not used as a model input or visual grouping variable.*
 
-These results place the contribution of G1 in fusion safety rather than in a claim of higher average point accuracy.
+These results place the contribution of G1 in selective risk control rather than in a claim of higher average point accuracy.
 
 ### 6.2 Selective gating reduced material negative transfer
 
@@ -336,7 +364,7 @@ The all-seed corrective probability results are given in Table 4 and Figure 5.
 | Heteroscedastic | 90% | 96.07% | 93.87% | 1.084420 | 1.195896 | 209.745736 | 0.086009 |
 | Heteroscedastic | 95% | 97.86% | 96.70% | 1.919255 | 2.063692 | — | — |
 
-With the homoscedastic scale, the 90% interval attained 95.18% single-reading coverage and 92.45% simultaneous-group coverage, with mean width \(0.643449~\mu\text{m}\) and Winkler score 0.788720. At the 95% level, single-reading coverage was 97.46% and simultaneous-group coverage was 97.01%, with mean width \(0.902232~\mu\text{m}\) and Winkler score 1.047684.
+An em dash denotes a value identical to the row above: under a given scale model, Gaussian NLL and Gaussian CRPS do not vary with the nominal conformal level and are therefore not repeated. With the homoscedastic scale, the 90% interval attained 95.18% single-reading coverage and 92.45% simultaneous-group coverage, with mean width \(0.643449~\mu\text{m}\) and Winkler score 0.788720. At the 95% level, single-reading coverage was 97.46% and simultaneous-group coverage was 97.01%, with mean width \(0.902232~\mu\text{m}\) and Winkler score 1.047684.
 
 ![Group-conformal coverage and interval width](assets_corrective/fig_5_group_conformal_coverage_width.png)
 
@@ -404,7 +432,7 @@ This result has a practical methodological implication for manufacturing predict
 
 Average MAE compresses heterogeneous group outcomes into one number. Two models can have nearly identical overall MAE while one causes larger deterioration for many individual machining runs. The registered material negative-transfer measure exposed this difference: in Phase A, G1 reduced the rate from 47.64% for F1 and 35.85% for R1 to 19.81%; in the original Phase B analysis, it reduced the three-seed rate from 37.11% for R1 to 20.91%. Under the corrective proper-training/calibration split, the corresponding rates were 39.78% and 16.51%. The original Phase B average MAE remained essentially tied with P1, and the corrective G1–P1 difference also had an interval containing zero. These observations are compatible because the gate changes the distribution of group-level harm without guaranteeing a large shift in the global mean.
 
-The architecture implements this risk-control role in a direct way. The process prediction remains available as a fallback, the vibration branch learns only a cross-fitted residual, and the gate bounds the admitted correction. Freezing the two experts during gate fitting also prevents the correction magnitude and gate value from compensating for each other arbitrarily. In this sense, “safe” refers to a registered statistical criterion—reduced material negative transfer relative to ungated alternatives while satisfying mean-model noninferiority. It does not denote machine-tool functional safety, absence of all prediction failures, or compliance with an industrial safety standard.
+The architecture implements this risk-control role in a direct way. The process prediction remains available as a fallback, the vibration branch learns only a cross-fitted residual, and the gate bounds the admitted correction. Freezing the two experts during gate fitting also prevents the correction magnitude and gate value from compensating for each other arbitrarily. In this sense, “selective” refers to a registered statistical criterion—reduced material negative transfer relative to ungated alternatives while satisfying mean-model noninferiority. It does not denote machine-tool functional safety, absence of all prediction failures, or compliance with an industrial safety standard.
 
 The non-collapsed gate distribution is consistent with selective use rather than universal acceptance or rejection of vibration. Nevertheless, gate values cannot be read as calibrated probabilities of signal quality. The model was optimized for prediction loss and correction regularization, not supervised against a physical reliability label. Establishing a causal interpretation would require controlled changes in sensor quality, mounting, tool condition, or signal corruption that are not present in the dataset.
 

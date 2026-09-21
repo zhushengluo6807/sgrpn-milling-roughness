@@ -26,3 +26,7 @@ outputs/
 
 # Local review/build scratch
 tmp_*/
+
+# Office / WPS / LibreOffice lock files
+~$*
+.~lock.*#
