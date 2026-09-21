@@ -6,6 +6,8 @@ Reference implementation and analysis code for the manuscript:
 
 This repository contains the exact code that produced the frozen numerical results reported in the manuscript, together with the frozen analysis protocols used to generate them.
 
+**Repository:** <https://github.com/zhushengluo/sgrpn-milling-roughness>
+
 ---
 
 ## What this repository contains
