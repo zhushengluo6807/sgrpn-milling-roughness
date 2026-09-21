@@ -21,7 +21,7 @@
 - 门控输入固定为 `[n_rpm,fz_mm_per_tooth,ap_mm,Ra_physical]`，CNN嵌入不得进入门控。
 - 门控预测恒等式固定为 `physical + (1-gate) * residual`。
 - 当前工作区不是Git仓库。不得擅自初始化Git；每个任务末尾列出的提交命令仅在用户以后将目录置于Git仓库时执行。
-- 项目验证命令统一使用 `.\.venv\Scripts\python.exe`；该虚拟环境基于用户指定的 `D:\CodexPython\python.exe`。
+- 项目验证命令统一使用 `.\.venv\Scripts\python.exe`；该虚拟环境基于用户指定的 `python`。
 
 ---
 

@@ -10,9 +10,9 @@
 
 ## Global Constraints
 
-- 基础解释器固定为 `D:\CodexPython\python.exe`，虚拟环境固定为 `E:\CodeX\机床项目\.venv`。
-- 振动根目录固定为 `E:\CodeX\机床项目\切削实验\预处理并切分后实验数据_不扩展剔除\segments`。
-- 标签表固定为 `E:\CodeX\机床项目\切削实验\粗糙度测量记录表_按切分片段.xlsx`。
+- 基础解释器固定为 `python`，虚拟环境固定为 `<repo>\.venv`。
+- 振动根目录固定为 `<repo>\切削实验\预处理并切分后实验数据_不扩展剔除\segments`。
+- 标签表固定为 `<repo>\切削实验\粗糙度测量记录表_按切分片段.xlsx`。
 - v3/v4工艺参数分别来自 `实验记录表_改进版_v3.xlsx` 和 `实验记录表_改进版_v4.xlsx`。
 - 连接键固定为 `(版本, 执行顺序)`；`n/fz/ap` 固定读取 G/H/J 列对应字段。
 - 随机种子固定为 `20260723`；折数固定为5。
@@ -48,7 +48,7 @@
 - Create: `src/roughness/__init__.py`
 
 **Interfaces:**
-- Consumes: `D:\CodexPython\python.exe`、NVIDIA驱动572.47、CUDA 12.8兼容驱动。
+- Consumes: `python`、NVIDIA驱动572.47、CUDA 12.8兼容驱动。
 - Produces: `.venv\Scripts\python.exe`、可用CUDA PyTorch、可导入的 `roughness` 包。
 
 - [ ] **Step 1: 写依赖文件**
@@ -108,8 +108,8 @@ __version__ = "0.1.0"
 Run:
 
 ```powershell
-& 'D:\CodexPython\python.exe' -m venv 'E:\CodeX\机床项目\.venv'
-& 'E:\CodeX\机床项目\.venv\Scripts\python.exe' -m pip install --upgrade pip setuptools wheel
+& 'python' -m venv '<repo>\.venv'
+& 'python' -m pip install --upgrade pip setuptools wheel
 ```
 
 Expected: 两条命令退出码均为0，且 `.venv\Scripts\python.exe` 存在。

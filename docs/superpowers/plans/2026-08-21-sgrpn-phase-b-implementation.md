@@ -17,7 +17,7 @@
 - Treat `configs/sgrpn_phase_a.yaml`, `outputs/sgrpn/phase_a/**`, `outputs/scheme1/**`, and `outputs/scheme1_physics/**` as immutable inputs. Write Phase B runtime artifacts only under `outputs/sgrpn/phase_b/`.
 - Use only the 586 registered segments, 212 registered `group_id` values, three registered Ra readings per segment, fixed five outer folds, fixed four inner group folds, cached 3×361 order spectra, seven quality features, and `1/split_count` region weights. Do not acquire, create, remove, relabel, or substitute samples, groups, readings, windows, folds, or signal versions.
 - The formal run is the approved Phase B extension, not a new experiment: do not add machining, idle, shutdown, repeat-measurement, synthetic-label, hyperparameter-search, alternative-split, or post-result follow-up runs.
-- Run Python with `E:\CodeX\机床项目\.venv\Scripts\python.exe`; do not mutate `D:\CodexPython`, install packages, or change the frozen environment.
+- Run Python with `python`; do not mutate `python`, install packages, or change the frozen environment.
 - Phase B seeds are exactly `20260723`, `20260724`, and `20260725`. Retrain the fixed mean model independently for every seed; do not initialize from the Phase A seed checkpoint and do not select favorable seeds, folds, epochs, or results after outer evaluation.
 - Preserve the Phase A mean architecture, order grid, channel handling, process features, quality features, weighted Huber loss, optimizer settings, four-fold epoch selection, and no-joint-fine-tuning rule. Phase B does not reopen the Phase A model matrix, thresholds, gate architecture, order range, or hyperparameters.
 - Keep every `group_id` wholly within one side of each outer or inner split. No standardizer, early-stopping decision, residual target, variance fit, conformal score, conformal quantile, or report selector may read an outer-test label.
@@ -203,7 +203,7 @@ def test_phase_b_rejects_noncanonical_phase_a_config_file_sha256(tmp_path, value
 - [ ] **Step 3: Run the config tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_config.py -k phase_b -v
+python -m pytest tests/sgrpn/test_config.py -k phase_b -v
 ```
 
 Expected: FAIL because `PhaseBConfig` and `load_phase_b_config` do not exist.
@@ -367,7 +367,7 @@ For each of the five folds, require exact protocol `sgrpn-phase-a-v2` on both `c
 - [ ] **Step 8: Run config and handoff tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_config.py -v
+python -m pytest tests/sgrpn/test_config.py -v
 ```
 
 Expected: all config tests pass; the positive v2 fixture returns the recomputed fingerprint; category A reaches and fails the deep metadata validator after its outer registered hash has been repaired; category B fails at the unchanged outer hash barrier; every remaining missing/v1/identity mutation fails closed; and no success or failure case creates a `phase_b` directory.
@@ -421,7 +421,7 @@ def test_repeat_measure_batch_rejects_noncanonical_region_weight():
 - [ ] **Step 3: Run the targeted tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_data.py -k repeat_measure -v
+python -m pytest tests/sgrpn/test_data.py -k repeat_measure -v
 ```
 
 Expected: FAIL because the new dataclass/function is absent.
@@ -450,7 +450,7 @@ Return one row per input region. Never melt or repeat the frame. Reject missing/
 - [ ] **Step 5: Run data tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_data.py -v
+python -m pytest tests/sgrpn/test_data.py -v
 ```
 
 Expected: all data tests pass, including existing Phase A duration and split checks.
@@ -512,7 +512,7 @@ def test_repeated_nll_averages_reads_before_region_weighting():
 - [ ] **Step 3: Run model tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_models.py -k "scale or repeated_nll or mean_model" -v
+python -m pytest tests/sgrpn/test_models.py -k "scale or repeated_nll or mean_model" -v
 ```
 
 Expected: FAIL on missing scale interfaces.
@@ -555,7 +555,7 @@ Snapshot every `state_dict()` tensor with `detach().cpu().clone()`, set every me
 - [ ] **Step 7: Run all model tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_models.py -v
+python -m pytest tests/sgrpn/test_models.py -v
 ```
 
 Expected: all model tests pass, including Phase A swap invariance and gate fallback tests.
@@ -618,7 +618,7 @@ def test_conformal_quantile_uses_ceil_m_plus_one_without_interpolation():
 - [ ] **Step 3: Run probability tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_probability.py -v
+python -m pytest tests/sgrpn/test_probability.py -v
 ```
 
 Expected: collection FAIL because `roughness.sgrpn.probability` is absent.
@@ -656,7 +656,7 @@ For interval `[lower, upper]` and miscoverage `alpha`, implement per-reading Win
 - [ ] **Step 7: Run probability tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_probability.py -v
+python -m pytest tests/sgrpn/test_probability.py -v
 ```
 
 Expected: all tests pass, including exact boundary inclusion and order-statistic cases.
@@ -708,7 +708,7 @@ Instrument constructors and assert each call executes only `P1`, `R1`, then `G1`
 - [ ] **Step 3: Run targeted training tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_training.py -k "phase_b_mean or phase_a_regression" -v
+python -m pytest tests/sgrpn/test_training.py -k "phase_b_mean or phase_a_regression" -v
 ```
 
 Expected: FAIL because `MeanPathArtifacts` and `fit_g1_mean_path` are absent.
@@ -743,7 +743,7 @@ Leave `run_phase_a_fold`'s P1/V1/F1/R1/G1 order and seed `20260723` restriction 
 - [ ] **Step 7: Run all training tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_training.py -v
+python -m pytest tests/sgrpn/test_training.py -v
 ```
 
 Expected: all existing Phase A and new mean-path tests pass.
@@ -797,7 +797,7 @@ Use eight groups. Change every reading in one calibration-validation group and a
 - [ ] **Step 3: Run Phase B training tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_phase_b_training.py -v
+python -m pytest tests/sgrpn/test_phase_b_training.py -v
 ```
 
 Expected: collection FAIL because `phase_b_training` is absent.
@@ -877,7 +877,7 @@ With synthetic spectra, eight groups, `max_epochs=2`, and `patience=1`, run one 
 - [ ] **Step 11: Run Phase B training tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_phase_b_training.py -v
+python -m pytest tests/sgrpn/test_phase_b_training.py -v
 ```
 
 Expected: all unit and synthetic integration tests pass on CPU.
@@ -924,7 +924,7 @@ Require both scale checkpoints/histories, P1/R1/G1 mean checkpoints/histories, p
 - [ ] **Step 3: Run resume tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_phase_b_training.py -k "fingerprint or resume or completion" -v
+python -m pytest tests/sgrpn/test_phase_b_training.py -k "fingerprint or resume or completion" -v
 ```
 
 Expected: FAIL because Phase B completion validation is incomplete.
@@ -964,7 +964,7 @@ State order is `mean`, `heteroscedastic`, `homoscedastic`, `calibration`, `predi
 - [ ] **Step 8: Run resume and orchestration tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_phase_b_training.py -v
+python -m pytest tests/sgrpn/test_phase_b_training.py -v
 ```
 
 Expected: all tests pass; interrupted fixture resumes only exact completed units.
@@ -1024,7 +1024,7 @@ def test_probability_table_contains_every_registered_measure():
 - [ ] **Step 3: Run evaluation tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_evaluation.py -k phase_b -v
+python -m pytest tests/sgrpn/test_evaluation.py -k phase_b -v
 ```
 
 Expected: FAIL because Phase B evaluation interfaces are absent.
@@ -1086,7 +1086,7 @@ Set `emphasize_heteroscedasticity=true` only when the all-seed conformal Winkler
 - [ ] **Step 8: Run evaluation tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_evaluation.py -v
+python -m pytest tests/sgrpn/test_evaluation.py -v
 ```
 
 Expected: all Phase A and Phase B evaluation tests pass.
@@ -1123,7 +1123,7 @@ Assert `train-phase-b`, `evaluate-phase-b`, and `run-phase-b` call `validate_pha
 - [ ] **Step 3: Run reporting/CLI tests to verify RED**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -k phase_b -v
+python -m pytest tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -k phase_b -v
 ```
 
 Expected: FAIL because Phase B reporting and commands are absent.
@@ -1196,7 +1196,7 @@ roughness-sgrpn run-phase-b --config configs/sgrpn_phase_b.yaml [--device auto] 
 - [ ] **Step 9: Run reporting and CLI tests to verify GREEN**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -v
+python -m pytest tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -v
 ```
 
 Expected: all Phase A and Phase B reporting/CLI tests pass.
@@ -1223,7 +1223,7 @@ git commit -m "feat: report SGRPN phase B results"
 - [ ] **Step 1: Compile the package and tests**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m compileall -q src/roughness/sgrpn tests/sgrpn
+python -m compileall -q src/roughness/sgrpn tests/sgrpn
 ```
 
 Expected: exit 0.
@@ -1231,7 +1231,7 @@ Expected: exit 0.
 - [ ] **Step 2: Run focused Phase B tests**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_config.py tests/sgrpn/test_models.py tests/sgrpn/test_probability.py tests/sgrpn/test_phase_b_training.py tests/sgrpn/test_evaluation.py tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -v
+python -m pytest tests/sgrpn/test_config.py tests/sgrpn/test_models.py tests/sgrpn/test_probability.py tests/sgrpn/test_phase_b_training.py tests/sgrpn/test_evaluation.py tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -v
 ```
 
 Expected: zero failures.
@@ -1239,7 +1239,7 @@ Expected: zero failures.
 - [ ] **Step 3: Run the complete SGRPN suite**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn -q
+python -m pytest tests/sgrpn -q
 ```
 
 Expected: zero failures, including all Phase A regression tests.
@@ -1247,7 +1247,7 @@ Expected: zero failures, including all Phase A regression tests.
 - [ ] **Step 4: Run the entire project regression suite**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest -q
+python -m pytest -q
 ```
 
 Expected: zero failures.
@@ -1255,7 +1255,7 @@ Expected: zero failures.
 - [ ] **Step 5: Exercise only the read-only formal preflight**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe preflight-phase-b --config configs/sgrpn_phase_b.yaml
+roughness-sgrpn preflight-phase-b --config configs/sgrpn_phase_b.yaml
 ```
 
 Expected: exit 0 with Phase A acceptance path `transfer_safety`, matching hashes/fingerprints, five complete folds, 212 groups, and 586 segments. This command must not create `outputs/sgrpn/phase_b/`.
@@ -1293,7 +1293,7 @@ Do not add checkpoints, formal predictions, or large caches.
 - [ ] **Step 1: Re-run preflight and capture immutable hashes**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe preflight-phase-b --config configs/sgrpn_phase_b.yaml
+roughness-sgrpn preflight-phase-b --config configs/sgrpn_phase_b.yaml
 ```
 
 Then use the reporting hash helper to atomically write every file hash under the Phase A and both legacy roots to `outputs/sgrpn/phase_b/immutable_hashes_before.json`. Resolve junctions and require the exact intended roots before enumerating files.
@@ -1301,7 +1301,7 @@ Then use the reporting hash helper to atomically write every file hash under the
 - [ ] **Step 2: Run all formal Phase B training without intermediate metric inspection**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe train-phase-b --config configs/sgrpn_phase_b.yaml --device auto --resume
+roughness-sgrpn train-phase-b --config configs/sgrpn_phase_b.yaml --device auto --resume
 ```
 
 Expected: 15 exact `(fold,seed)` completion markers; each contains P1/R1/G1, both scale models, four inner calibration folds, 90%/95% quantiles, finite outer predictions, the selected device, and the Phase B/Phase A fingerprints. Monitor only state/completion fields, not metrics, predictions, scales, intervals, or comparisons.
@@ -1309,7 +1309,7 @@ Expected: 15 exact `(fold,seed)` completion markers; each contains P1/R1/G1, bot
 - [ ] **Step 3: Evaluate exactly once after all training is complete**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe evaluate-phase-b --config configs/sgrpn_phase_b.yaml
+roughness-sgrpn evaluate-phase-b --config configs/sgrpn_phase_b.yaml
 ```
 
 Expected: exit 0 and all registered region/group prediction, calibration, mean/probability metric, Bootstrap, negative-transfer, gate, ablation, composite-domain, plot, method-note, and claim-decision outputs. Do not alter or rerun the experiment based on observed seed/fold results.
@@ -1319,8 +1319,8 @@ Expected: exit 0 and all registered region/group prediction, calibration, mean/p
 Recompute hashes into `immutable_hashes_after.json`, require exact equality with `immutable_hashes_before.json`, then run:
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -c "from roughness.sgrpn.config import load_phase_b_config; from roughness.sgrpn.reporting import validate_phase_b_outputs; validate_phase_b_outputs(load_phase_b_config('configs/sgrpn_phase_b.yaml'))"
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn -q
+python -c "from roughness.sgrpn.config import load_phase_b_config; from roughness.sgrpn.reporting import validate_phase_b_outputs; validate_phase_b_outputs(load_phase_b_config('configs/sgrpn_phase_b.yaml'))"
+python -m pytest tests/sgrpn -q
 ```
 
 Expected: the read-only validator does not retrain, reevaluate, or rewrite predictions; tests have zero failures. Require 3516 exact probability OOF rows, 5274 exact mean OOF rows, 15 completions, positive finite scales, valid intervals, one calibration score per group per fold/seed/model, observed-order-statistic quantiles, group bootstrap unit, and exactly 10,000 repetitions.

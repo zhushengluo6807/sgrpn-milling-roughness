@@ -30,3 +30,7 @@ tmp_*/
 # Office / WPS / LibreOffice lock files
 ~$*
 .~lock.*#
+
+# Node/JS helper dependencies (docx prototyping only, not part of the Python toolchain)
+package.json
+package-lock.json

@@ -9,7 +9,7 @@ import pandas as pd
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-ROOT = Path(r"E:\CodeX\机床项目")
+ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "切削实验" / "预处理并切分后实验数据_不扩展剔除"
 SUMMARY = OUT_DIR / "preprocess_split_summary.csv"
 MANIFEST = OUT_DIR / "preprocessed_segments_manifest.csv"

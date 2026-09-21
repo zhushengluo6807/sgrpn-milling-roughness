@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the accompanying manuscript."
+title: >-
+  Selective Gated Residual Neural Fusion with Group Split-Conformal
+  Uncertainty Quantification for Milling Surface Roughness
+abstract: >-
+  Reference implementation and analysis code for selectively gated residual
+  neural fusion of process variables and vibration signals for milling surface
+  roughness prediction, with group split-conformal interval calibration at the
+  machining-group level and a post-audit corrective reanalysis.
+type: software
+authors:
+  - family-names: Zhu
+    given-names: Shanlin
+    affiliation: >-
+      School of Mechanical Engineering, Sichuan University
+    # TODO(citation): confirm the exact name spelling, ORCID, and the full
+    # author list and order before the manuscript is submitted.
+# TODO(citation): fill in the public repository URL once the repository is published.
+repository-code: "https://github.com/REPLACE_ME/REPLACE_ME"
+url: "https://github.com/REPLACE_ME/REPLACE_ME"
+license: MIT
+keywords:
+  - surface roughness
+  - milling
+  - vibration signal
+  - sensor fusion
+  - conformal prediction
+  - uncertainty quantification
+  - negative transfer

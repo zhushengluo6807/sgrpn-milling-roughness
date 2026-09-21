@@ -15,8 +15,8 @@
 
 ## 2. 环境设计
 
-- 基础解释器：`D:\CodexPython\python.exe`（Python 3.12）
-- 虚拟环境：`E:\CodeX\机床项目\.venv`
+- 基础解释器：`python`（Python 3.12）
+- 虚拟环境：`<repo>\.venv`
 - GPU：NVIDIA GeForce RTX 4060 Laptop GPU，8 GB 显存
 - PyTorch：稳定版 CUDA 12.8 构建
 - 基础依赖：PyTorch、NumPy、pandas、SciPy、scikit-learn、openpyxl
@@ -31,7 +31,7 @@
 
 固定使用：
 
-`E:\CodeX\机床项目\切削实验\预处理并切分后实验数据_不扩展剔除\segments`
+`<repo>\切削实验\预处理并切分后实验数据_不扩展剔除\segments`
 
 CSV 应包含 `Time_s、Ch9_g、Ch10_g、Ch11_g`。首轮基线不读取完整振动数组，但会验证标签表中的每个片段能唯一解析到一个CSV，为下一阶段做好准备。
 
@@ -39,14 +39,14 @@ CSV 应包含 `Time_s、Ch9_g、Ch10_g、Ch11_g`。首轮基线不读取完整�
 
 标签来源：
 
-`E:\CodeX\机床项目\切削实验\粗糙度测量记录表_按切分片段.xlsx`
+`<repo>\切削实验\粗糙度测量记录表_按切分片段.xlsx`
 
 关键字段为版本、执行顺序、原始实验组、切分数、区域编号、片段时长、三次Ra测量值及Ra平均值。
 
 ### 3.3 工艺参数
 
-- v3：`E:\CodeX\机床项目\切削实验\实验记录表_改进版_v3.xlsx`
-- v4：`E:\CodeX\机床项目\切削实验\实验记录表_改进版_v4.xlsx`
+- v3：`<repo>\切削实验\实验记录表_改进版_v3.xlsx`
+- v4：`<repo>\切削实验\实验记录表_改进版_v4.xlsx`
 
 使用 `(版本, 执行顺序)` 作为连接键：
 

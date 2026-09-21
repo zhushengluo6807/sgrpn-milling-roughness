@@ -11,7 +11,7 @@ import pandas as pd
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-ROOT = Path(r"E:\CodeX\机床项目")
+ROOT = Path(__file__).resolve().parents[1]
 INPUT_DIR = ROOT / "切削实验" / "截取后实验数据"
 OUTPUT_DIR = ROOT / "切削实验" / "预处理并切分后实验数据_不扩展剔除"
 

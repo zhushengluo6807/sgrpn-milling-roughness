@@ -8,7 +8,7 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
 
-ROOT = Path(r"E:\CodeX\机床项目")
+ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "切削实验" / "振动信号预处理理论依据与现实依据.docx"
 
 

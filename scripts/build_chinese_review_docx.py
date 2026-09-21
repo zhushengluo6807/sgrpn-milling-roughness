@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from PIL import Image
@@ -19,7 +20,7 @@ OUTPUT = ROOT / "docs/paper/2026-09-17-sgrpn-chinese-review.docx"
 CACHE = ROOT / ".cache/chinese_review_docx"
 EQUATION_CACHE = CACHE / "equations"
 MATH_RENDERER = ROOT / "scripts/render_math_png.py"
-MATH_PYTHON = Path(r"D:\CodexPython\python.exe")
+MATH_PYTHON = Path(sys.executable)
 
 
 def set_run_font(run, east_asia="宋体", latin="Times New Roman", size=10.5, bold=None, italic=None):

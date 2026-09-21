@@ -6,7 +6,7 @@
 
 **架构：** 在现有 `src/roughness` 第一轮基线旁新增隔离的 `src/roughness/scheme1` 包。数据层复用既有 manifest 和固定外层折，按片段构建 1 秒窗口袋；特征层生成最小物理代理；模型层统一输出片段级 Ra；评估层以原始实验 `group_id` 为独立单位完成固定五折、三随机种子和配对 Bootstrap。所有预处理参数、方向假设、`r_e` 候选、早停和模型选择只能在当前外层训练折内确定。
 
-**技术栈：** Python 3.11、NumPy、pandas、SciPy、scikit-learn、PyTorch、PyYAML、Matplotlib、pytest。项目命令使用 `.venv\Scripts\python.exe`；该虚拟环境的基础解释器来自 `D:\CodexPython\python.exe`。
+**技术栈：** Python 3.11、NumPy、pandas、SciPy、scikit-learn、PyTorch、PyYAML、Matplotlib、pytest。项目命令使用 `.venv\Scripts\python.exe`；该虚拟环境的基础解释器来自 `python`。
 
 **设计依据：** `docs/superpowers/specs/2026-07-27-two-route-roughness-model-design.md`
 

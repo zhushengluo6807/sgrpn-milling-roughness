@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Run Python with `E:\CodeX\机床项目\.venv\Scripts\python.exe`; do not mutate `D:\CodexPython` or install global packages.
+- Run Python with `python`; do not mutate `python` or install global packages.
 - Use the existing five outer folds from `outputs/first_round_baseline/folds.csv`; `group_id` must never cross train, validation, test, or calibration boundaries.
 - Phase A uses only seed `20260723`, four inner group folds, at most 200 epochs, patience 20, and `1/split_count` sample weights.
 - The order grid is exactly 0–90 order inclusive at 0.25 spacing, hence 361 bins; input windows are 25,600 samples at 25.6 kHz.
@@ -90,7 +90,7 @@ def test_rejects_phase_a_with_multiple_seeds(tmp_path):
 Run:
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_config.py -v
+python -m pytest tests/sgrpn/test_config.py -v
 ```
 
 Expected: collection fails because `roughness.sgrpn.config` does not exist.
@@ -229,7 +229,7 @@ def test_group_overlap_fails_fast():
 - [ ] **Step 2: Run the targeted tests and verify failure**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_data.py -v
+python -m pytest tests/sgrpn/test_data.py -v
 ```
 
 Expected: import fails because `roughness.sgrpn.data` is absent.
@@ -266,7 +266,7 @@ Create two three-channel CSV fixtures with 25,600 rows, a two-row manifest, a fo
 - [ ] **Step 5: Run Task 2 tests and the reused fold tests**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_data.py tests/scheme1/test_folds.py -v
+python -m pytest tests/sgrpn/test_data.py tests/scheme1/test_folds.py -v
 ```
 
 Expected: all selected tests pass.
@@ -344,7 +344,7 @@ def test_scaler_uses_only_requested_segments():
 - [ ] **Step 3: Run the tests and confirm missing imports**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_order_spectrum.py -v
+python -m pytest tests/sgrpn/test_order_spectrum.py -v
 ```
 
 - [ ] **Step 4: Implement the exact cache schema**
@@ -439,7 +439,7 @@ def test_horizontal_swap_moves_only_first_two_channels():
 - [ ] **Step 2: Run the targeted tests and verify failure**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_dataset.py -v
+python -m pytest tests/sgrpn/test_dataset.py -v
 ```
 
 - [ ] **Step 3: Implement the dataset contract**
@@ -473,7 +473,7 @@ Patch `torch.rand` to return 0.25 and 0.75 in separate tests. Assert swapping oc
 - [ ] **Step 5: Run dataset tests**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_dataset.py -v
+python -m pytest tests/sgrpn/test_dataset.py -v
 ```
 
 Expected: all tests pass.
@@ -546,7 +546,7 @@ def test_sgrpn_loss_matches_registered_formula():
 - [ ] **Step 3: Run tests and confirm missing implementation**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_models.py -v
+python -m pytest tests/sgrpn/test_models.py -v
 ```
 
 - [ ] **Step 4: Implement focused model units**
@@ -592,7 +592,7 @@ Add explicit tests for wrong process width, wrong quality width, zero-window mas
 - [ ] **Step 6: Run model tests**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_models.py -v
+python -m pytest tests/sgrpn/test_models.py -v
 ```
 
 Expected: all tests pass on CPU.
@@ -656,7 +656,7 @@ def test_scaler_fits_only_inner_train_rows():
 - [ ] **Step 2: Run tests and verify failure**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_crossfit.py -v
+python -m pytest tests/sgrpn/test_crossfit.py -v
 ```
 
 - [ ] **Step 3: Implement exact cross-fit result types**
@@ -699,7 +699,7 @@ Construct four groups with extreme labels. Change labels in one validation group
 - [ ] **Step 6: Run cross-fit tests**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_crossfit.py tests/scheme1/test_crossfit.py -v
+python -m pytest tests/sgrpn/test_crossfit.py tests/scheme1/test_crossfit.py -v
 ```
 
 Expected: all selected tests pass.
@@ -762,7 +762,7 @@ def test_fold_predictions_have_registered_schema():
 - [ ] **Step 3: Run tests and verify missing implementation**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_training.py -v
+python -m pytest tests/sgrpn/test_training.py -v
 ```
 
 - [ ] **Step 4: Implement run metadata and atomic checkpoints**
@@ -827,7 +827,7 @@ Run one outer fold with `max_epochs=2`, `patience=1`, four tiny groups per inner
 - [ ] **Step 9: Run training tests**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_training.py -v
+python -m pytest tests/sgrpn/test_training.py -v
 ```
 
 Expected: all tests pass on CPU; the integration fixture completes without reading formal signal files.
@@ -912,7 +912,7 @@ def test_phase_b_stops_when_gate_collapses_without_benefit():
 - [ ] **Step 3: Run evaluation tests and verify failure**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_evaluation.py -v
+python -m pytest tests/sgrpn/test_evaluation.py -v
 ```
 
 - [ ] **Step 4: Implement registered metrics and decision object**
@@ -1006,14 +1006,14 @@ roughness-sgrpn run-phase-a --config configs/sgrpn_phase_a.yaml [--device auto] 
 Refresh only the existing project virtual environment's editable package metadata; do not resolve or download dependencies:
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pip install -e . --no-deps
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe --help
+python -m pip install -e . --no-deps
+roughness-sgrpn --help
 ```
 
 Then run:
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn/test_evaluation.py tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -v
+python -m pytest tests/sgrpn/test_evaluation.py tests/sgrpn/test_reporting.py tests/sgrpn/test_cli.py -v
 ```
 
 Expected: all tests pass.
@@ -1021,7 +1021,7 @@ Expected: all tests pass.
 - [ ] **Step 9: Run the complete existing and new test suite**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest -q
+python -m pytest -q
 ```
 
 Expected: zero failures. Record test count and elapsed time in `outputs/sgrpn/phase_a/test_evidence.json`.
@@ -1053,8 +1053,8 @@ Use a read-only hashing helper from the new reporting module to write SHA-256 va
 - [ ] **Step 2: Run the formal audit and cache build**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe audit --config configs/sgrpn_phase_a.yaml
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe features --config configs/sgrpn_phase_a.yaml
+roughness-sgrpn audit --config configs/sgrpn_phase_a.yaml
+roughness-sgrpn features --config configs/sgrpn_phase_a.yaml
 ```
 
 Expected: 212 groups, 586 segments, five outer folds, three channels, 25.6 kHz, and a recorded count of duration mismatches; no source file is modified.
@@ -1062,7 +1062,7 @@ Expected: 212 groups, 586 segments, five outer folds, three channels, 25.6 kHz, 
 - [ ] **Step 3: Execute the five outer folds**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe train-phase-a --config configs/sgrpn_phase_a.yaml --device auto --resume
+roughness-sgrpn train-phase-a --config configs/sgrpn_phase_a.yaml --device auto --resume
 ```
 
 Expected: each fold completes P1/V1/F1/R1/G1 for seed 20260723, writes finite predictions, and records whether CUDA or CPU was used. Do not inspect an outer fold's metrics to alter later folds.
@@ -1070,7 +1070,7 @@ Expected: each fold completes P1/V1/F1/R1/G1 for seed 20260723, writes finite pr
 - [ ] **Step 4: Evaluate exactly once**
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\roughness-sgrpn.exe evaluate-phase-a --config configs/sgrpn_phase_a.yaml
+roughness-sgrpn evaluate-phase-a --config configs/sgrpn_phase_a.yaml
 ```
 
 Expected: `oof_predictions.csv` covers every segment exactly once per model; M0 is joined by `sample_id`; acceptance JSON contains every threshold, observed value, boolean result, reason, and `proceed_to_phase_b`.
@@ -1080,7 +1080,7 @@ Expected: `oof_predictions.csv` covers every segment exactly once per model; M0 
 Recompute legacy hashes into `legacy_hashes_after.json` and require byte-for-byte equality with the before file. Run:
 
 ```powershell
-E:\CodeX\机床项目\.venv\Scripts\python.exe -m pytest tests/sgrpn -q
+python -m pytest tests/sgrpn -q
 ```
 
 Expected: zero failures. Also require no missing OOF row, no duplicate `(sample_id, model)`, finite metrics, gates in `[0,1]`, and exactly 10,000 bootstrap repetitions for each registered comparison.
