@@ -16,3 +16,10 @@
 *.npy   binary
 *.npz   binary
 *.pyc   binary
+
+# Frozen protocol input — stored byte for byte.
+# The Phase A run manifest registers the SHA-256 of this file's CRLF raw bytes
+# (b63563da3adbfb8eac4694e22e618b309dd9d6f093377768bbef103eceec8a69). Any
+# line-ending normalisation would change that hash and break the fingerprint the
+# manuscript relies on, so git must not touch it on check-in or check-out.
+data/group_folds.csv  -text
