@@ -8,6 +8,10 @@ This repository contains the exact code that produced the frozen numerical resul
 
 **Repository:** <https://github.com/zhushengluo6807/sgrpn-milling-roughness>
 
+**Archived at Zenodo (version-independent DOI):** <https://doi.org/10.5281/zenodo.22893350>
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22893350.svg)](https://doi.org/10.5281/zenodo.22893350)
+
 ---
 
 ## What this repository contains
@@ -121,4 +125,10 @@ Released under the MIT License — see [`LICENSE`](LICENSE).
 
 ## Citation
 
-See [`CITATION.cff`](CITATION.cff).
+The archived copy of this software is permanently available at Zenodo. Cite the
+**version-independent DOI**, so that the reference stays valid if a new version is released:
+
+- **All versions (use this one in publications):** <https://doi.org/10.5281/zenodo.22893350>
+- **v1.0.0 snapshot (to reproduce this exact version):** <https://doi.org/10.5281/zenodo.22893351>
+
+Machine-readable citation metadata is in [`CITATION.cff`](CITATION.cff).

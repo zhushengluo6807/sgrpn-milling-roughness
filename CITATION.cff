@@ -15,6 +15,7 @@ authors:
     orcid: "https://orcid.org/0009-0003-4655-034X"
     affiliation: >-
       School of Mechanical Engineering, Sichuan University
+doi: "10.5281/zenodo.22893350"
 repository-code: "https://github.com/zhushengluo6807/sgrpn-milling-roughness"
 url: "https://github.com/zhushengluo6807/sgrpn-milling-roughness"
 license: MIT
